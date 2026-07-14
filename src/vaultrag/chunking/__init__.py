@@ -1,4 +1,22 @@
 """vaultrag.chunking — Heading-tree chunker: parent/child chunks + contextual prefix. Step 5.
 
-Empty at Step 0 — see ../Rag/projects/vaultrag/p0-step-plan.md.
+See ``chunker.py`` for the algorithm and ``../Rag/projects/vaultrag/p0-step-plan.md``.
 """
+
+from __future__ import annotations
+
+from vaultrag.chunking.chunker import (
+    HARD_MAX_TOKENS,
+    MERGE_MIN_TOKENS,
+    TARGET_TOKENS,
+    chunk_document,
+)
+from vaultrag.chunking.tokens import count_tokens
+
+__all__ = [
+    "HARD_MAX_TOKENS",
+    "MERGE_MIN_TOKENS",
+    "TARGET_TOKENS",
+    "chunk_document",
+    "count_tokens",
+]

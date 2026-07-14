@@ -9,33 +9,39 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 ## Current state
 
 - **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan)
-  + 4 (parsing) DONE.** Next up: **Step 5 (heading-tree chunker — `chunking/`)**.
+  + 4 (parsing) + 5 (chunking) DONE.** Next up: **Step 6 (Embedder interface + Ollama impl +
+  cache — `embedding/`)**.
 - **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag --help`
-  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (20 files),
-  and `pytest` (70 tests: 4 CLI + 7 models + 13 store + 13 scan + 33 parsing) are all green.
-  Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON logging wired.
-  `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block` / `Chunk`
-  shape, the `Snippet`/`SearchResult` return contract, and deterministic `chunk_point_id` +
-  `document_id`. `store/` has the `MetaStore` protocol + `SQLiteMetaStore` (WAL): P0 tables
-  `projects, documents, chunks, jobs, embed_cache, tags`, content-addressed idempotent upserts,
-  FK cascade delete, embed-cache keyed `(model, dims, chunk_hash)`. `indexer/` has the vault
-  scan: `scan.py` (walk → BLAKE3 → `.ragignore` + secret guard → `diff_manifest` →
-  `ScanDiff{creates,updates,deletes,renames,unchanged}`) and `secret_guard.py` (non-overridable
-  filename + content secret blocking). `parsing/` now turns one file's raw text into a
-  `Document`: `markdown.py` (`parse_document`, markdown-it-py `"default"` preset tokenizer walk
-  → source-ordered `Block`s; code/table/list/blockquote kept atomic; heading-trail
-  `heading_path`; file-relative `line_start`/`line_end`), `obsidian.py` (wikilink/embed regex,
-  inline-tag regex + nested `a/b` expansion, dataview `key:: value`, callout header parsing —
-  all the conventions markdown-it doesn't know about), `frontmatter.py` (YAML → typed fields,
-  malformed-YAML degrades to no-frontmatter rather than raising). Deps added: `blake3`,
-  `pathspec`, `markdown-it-py`, `python-frontmatter`, (`types-pyyaml` dev-only).
-- **What's next:** Step 5 — `chunking/`: heading-tree chunker turning each `Document.blocks`
-  into indexed `Chunk` children (~300 tok target, 512 hard max, no overlap, merge tiny siblings
-  ≥120 tok, never split atomic blocks, contextual prefix «Project ▸ folder/note ▸ H1 ▸ H2» +
-  tags line, `parent_id`/`prev_id`/`next_id` stitching). Refs:
-  `../Rag/projects/vaultrag/chunking-strategy.md`,
-  `../Rag/decisions/chunking-heading-tree-not-fixed-size.md`, arch §6. A token counter needs
-  picking (tiktoken vs. a cheap heuristic — not yet decided, check the vault first). Full
+  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (22 files),
+  and `pytest` (85 tests: 4 CLI + 7 models + 13 store + 13 scan + 33 parsing + 15 chunking) are
+  all green. Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
+  logging wired. `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block`
+  / `Chunk` shape, the `Snippet`/`SearchResult` return contract, and deterministic
+  `chunk_point_id` + `document_id`. `store/` has the `MetaStore` protocol + `SQLiteMetaStore`
+  (WAL): P0 tables `projects, documents, chunks, jobs, embed_cache, tags`, content-addressed
+  idempotent upserts, FK cascade delete, embed-cache keyed `(model, dims, chunk_hash)`.
+  `indexer/` has the vault scan: `scan.py` (walk → BLAKE3 → `.ragignore` + secret guard →
+  `diff_manifest` → `ScanDiff{creates,updates,deletes,renames,unchanged}`) and
+  `secret_guard.py` (non-overridable filename + content secret blocking). `parsing/` turns one
+  file's raw text into a `Document`: `markdown.py` (`parse_document`, markdown-it-py
+  `"default"` preset tokenizer walk → source-ordered `Block`s; code/table/list/blockquote kept
+  atomic; heading-trail `heading_path`; file-relative `line_start`/`line_end`), `obsidian.py`
+  (wikilink/embed regex, inline-tag regex + nested `a/b` expansion, dataview `key:: value`,
+  callout header parsing), `frontmatter.py` (YAML → typed fields, malformed-YAML degrades to
+  no-frontmatter rather than raising). `chunking/` turns a `Document` into its ordered
+  `Chunk` children: `chunker.py` (`chunk_document`: heading-path section grouping → greedy
+  ~300-tok-target/512-hard-max packing at block granularity → single-pass tiny-sibling merge
+  ≥120 tok → contextual prefix «Project ▸ folder/note ▸ H1 ▸ H2» + tags line → `prev_id`/
+  `next_id` stitching via deterministic `chunk_point_id`), `tokens.py` (`count_tokens`: ~4
+  chars/token heuristic — see decisions below). Deps added: `blake3`, `pathspec`,
+  `markdown-it-py`, `python-frontmatter`, (`types-pyyaml` dev-only). No new deps for chunking.
+- **What's next:** Step 6 — `embedding/`: `Embedder` protocol (shared by indexer + query path)
+  + an Ollama impl for Qwen3-Embedding-0.6B (1024d, batch 32–64) + `embed_cache` keyed
+  `(model, dims, chunk_hash)` (the SQLite table already exists from Step 2 — reuse it, don't
+  re-derive the schema). Refs: `../Rag/projects/vaultrag/embedding-pipeline.md`,
+  `../Rag/decisions/dense-embeddings-qwen3.md`, arch §8. Feed it `Chunk.embed_text` (contextual
+  prefix + body, already built in Step 5's `Chunk` model). Requires a running Ollama with the
+  Qwen3-Embedding-0.6B model pulled — verify that's available before writing the impl. Full
   11-step plan: `../Rag/projects/vaultrag/p0-step-plan.md`. Work in order; do not batch.
   Embedder backend for P0 = **Ollama** (behind the `Embedder` interface).
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
@@ -61,6 +67,76 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-15 — P0 Step 5: heading-tree chunker (`chunking/`)
+- **Did:** Completed Step 5. Added `chunking/tokens.py` (`count_tokens`: ~4-chars/token
+  heuristic, 0 for empty/whitespace text) and `chunking/chunker.py` (`chunk_document(document,
+  *, project_id) -> list[Chunk]`, three linear passes over `Document.blocks`: (1) `_sections` —
+  group contiguous non-heading blocks sharing the same `heading_path` into sections; heading
+  blocks are boundary markers only, never chunk body text; a heading with nothing directly
+  under it before the next heading contributes no standalone chunk; (2) `_pack_section` —
+  greedy packing at block granularity (never splits inside a block) toward `TARGET_TOKENS=300`,
+  cutting before a block that would exceed `HARD_MAX_TOKENS=512` unless the current piece is
+  still empty, in which case an oversized atomic block becomes its own oversized chunk; (3)
+  `_merge_tiny_siblings` — single forward pass folding a piece under `MERGE_MIN_TOKENS=120`
+  into its immediate predecessor when they share the same parent heading
+  (`heading_path[:-1]`, depth-guarded) and the merge still fits the hard max). Contextual
+  prefix and `prev_id`/`next_id` (via deterministic `chunk_point_id`) are built per chunk;
+  `parent_id` is left `None` (see decisions). Exported `chunk_document`/`count_tokens`/the
+  three size constants from `chunking/__init__.py`.
+- **Why:** Step 5 of `../Rag/projects/vaultrag/p0-step-plan.md`
+  (`../Rag/projects/vaultrag/chunking-strategy.md`,
+  `../Rag/decisions/chunking-heading-tree-not-fixed-size.md`, arch §6) — turns a parsed
+  `Document` into the indexed unit every later stage (embed, upsert, retrieve) works with.
+- **Files:** `src/vaultrag/chunking/{chunker,tokens,__init__}.py`, `tests/test_chunking.py`
+  (new, 15 tests), `MEMORY.md`. No `pyproject.toml` changes.
+- **Decisions (impl-level, consistent with the vault — no write-back needed):**
+  (1) **Token counting is a ~4-chars/token heuristic, not `tiktoken`.** The vault's
+  `chunking-strategy.md` doesn't specify a counter, and P0's embedder (Step 6) is Ollama/Qwen3
+  — a BPE vocabulary `tiktoken` doesn't model — so a model-specific tokenizer would be false
+  precision against the wrong vocabulary. Matches the class of approximation the arch doc
+  already accepts for `budget_tokens` ("simple truncation for P0", §13). Revisit once Step 6's
+  real tokenizer exists to validate against, if eval data says the heuristic is off.
+  (2) **A heading block's own text never becomes chunk body text.** Only non-heading blocks are
+  packed into chunks; a heading's text is already carried in descendants' `heading_path` and
+  surfaces via the contextual prefix, so duplicating it into the body would be redundant. A
+  side effect: a heading with no direct content before the next heading (e.g. an H1 that's
+  purely an umbrella for H2 subsections) yields no chunk of its own — it's ancestor context
+  only. (3) **A merged chunk (tiny-sibling case) inherits the *earlier* piece's `heading_path`**
+  — the `Chunk` model (fixed at Step 1) has one `heading_path` field, not a list, so a chunk
+  spanning two sibling sections (e.g. "TermOne" + "TermTwo" under a "Glossary" H2) must pick
+  one. The later section's content is still present in `text`, just not separately labeled;
+  this only affects the tiny-stub case the merge rule targets in the first place.
+  (4) **Same-parent check for merging is depth-guarded, not just `heading_path[:-1]`
+  equality** — root-level content (`heading_path == []`) and a top-level H1 section
+  (`heading_path == ["H1"]`) both have an empty `[:-1]`, so a naive comparison would treat
+  unrelated root prose as a "sibling" of the first real section and wrongly merge them;
+  requiring equal length first closes that gap
+  (`test_root_content_does_not_merge_with_first_top_level_heading`). (5) **`parent_id` is left
+  `None` in P0.** The plan lists `parent_id` as a `Chunk` field Step 5 emits, but no parent
+  *record* exists to point at yet — parent-swap is explicitly deferred to P1 in
+  `p0-step-plan.md`. Wiring a pointer to a section that isn't materialized anywhere would dangle
+  or invent scope the plan doesn't ask for; revisit when P1 actually builds parent chunks.
+  Locked in by `test_parent_id_is_none_in_p0` so it's a deliberate choice, not an oversight, if
+  a future session finds it unset. (6) **`chunk_hash` hashes `Chunk.text` (the raw body), not
+  `embed_text` (prefix + body)** — the model docstring says "BLAKE3 of text"; keeping the hash
+  off the contextual prefix means a chunk's identity/dedupe key doesn't change if the note's
+  path or project changes without the body changing (prefix embeds `path`/`project_id`), and
+  the Step 2 `embed_cache` key `(model, dims, chunk_hash)` still keys correctly on the actual
+  embedded content since `embed_text` is derived from `text` deterministically at embed time.
+- **Verify (Step 5 gate, all green):** `uv run pytest` 85 passed (4 CLI + 7 models + 13 store +
+  13 scan + 33 parsing + 15 chunking); `uv run ruff check .` clean; `uv run mypy src` clean (22
+  files). Token bounds (oversized atomic block exceeds hard max but isn't split; a large section
+  splits into multiple chunks all ≤ hard max), contextual-prefix format (with/without a tags
+  line), stable `chunk_hash` across reruns (byte-identical `model_dump` twice), correct
+  `prev_id`/`next_id` sibling stitching (`None` at both ends, chained point-ids in between), and
+  the tiny-sibling-merge + depth-guard edge case are all covered.
+- **Next / handoff:** Start **Step 6 — Embedder interface + Ollama impl + cache
+  (`embedding/`)**. Feed it `Chunk.embed_text` (already built). Reuse Step 2's `embed_cache`
+  table/methods rather than re-deriving the schema. Confirm an Ollama instance with
+  Qwen3-Embedding-0.6B pulled is actually reachable before writing the impl — that's an external
+  dependency this repo doesn't control. Nothing committed yet (still on `main`; branch +
+  `agent(claude-code): …` commit when Anik asks).
 
 ### 2026-07-15 — P0 Step 4: markdown parsing → `Document` (`parsing/`)
 - **Did:** Completed Step 4. Added `parsing/obsidian.py` (wikilink/embed regex covering all
