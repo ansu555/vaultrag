@@ -1,0 +1,18 @@
+# VaultRAG — derived / local state (the vault is the source of truth; this is a cache)
+state/            # sqlite db + embed cache — rebuildable via `vaultrag reindex`
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS / editor
+.DS_Store

@@ -8,11 +8,17 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** P0 (see `CLAUDE.md` §4) — *planned, not started*. Next up: **Step 0 (scaffold)**.
-- **What works:** nothing yet. Repo is orientation-only (`CLAUDE.md`, `MEMORY.md`).
-- **What's next:** P0 is broken into 11 one-at-a-time steps — durable plan lives in the vault
-  at `../Rag/projects/vaultrag/p0-step-plan.md` (linked from `build-roadmap.md`). Work them in
-  order; do not batch. Embedder backend for P0 = **Ollama** (behind the `Embedder` interface).
+- **Phase:** P0 (see `CLAUDE.md` §4). **Step 0 (scaffold) DONE.** Next up: **Step 1 (core
+  data models, `models.py`)**.
+- **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag --help`
+  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src`, and
+  `pytest` (4 CLI smoke tests) are all green. Env-driven `config.py` (pydantic-settings,
+  `VAULTRAG_` prefix) + structlog JSON logging wired.
+- **What's next:** Step 1 — Pydantic `Document{blocks, metadata, links}`, `Block`, `Chunk`,
+  and the `Snippet`/`SearchResult` return shape, in `src/vaultrag/models.py`. Refs:
+  `../Rag/reference/reference-metadata-schema.md`, arch §5–§7. Full 11-step plan:
+  `../Rag/projects/vaultrag/p0-step-plan.md`. Work in order; do not batch. Embedder backend
+  for P0 = **Ollama** (behind the `Embedder` interface).
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
   `CLAUDE.md` §1.
 - **Open questions / blockers:** `search`/`open` response JSON shapes are unspecified in
@@ -36,6 +42,29 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-14 — P0 Step 0: project scaffold
+- **Did:** Scaffolded the Python project. `pyproject.toml` (uv-managed, hatchling, src
+  layout, entrypoint `vaultrag → vaultrag.cli:main`); deps `pydantic-settings`, `structlog`,
+  `typer` + dev group `ruff/mypy/pytest`. Added `config.py` (env-driven `Settings`,
+  `VAULTRAG_` prefix: vault path, project_id, state dir, qdrant/ollama urls, embed model/dims,
+  retrieval defaults, log level), `logging.py` (structlog JSON, idempotent `configure_logging`),
+  `cli.py` (Typer app with stubbed `reindex`/`mcp` + `--version`). Created the 8 empty module
+  packages (`parsing chunking embedding index store indexer retrieval mcp`), each with a
+  docstring + step pointer. Shipped `.gitignore` (`state/`, `.venv/`, tool caches), `.ragignore`
+  (secret-deny + Obsidian/media globs), `README.md`, and 4 CLI smoke tests.
+- **Why:** Step 0 of `../Rag/projects/vaultrag/p0-step-plan.md`. Establishes the role/interface
+  skeleton so later steps drop into fixed module homes (arch §4–§11 ordering).
+- **Files:** `pyproject.toml`, `uv.lock`, `.gitignore`, `.ragignore`, `README.md`,
+  `src/vaultrag/{__init__,config,logging,cli}.py`, `src/vaultrag/{parsing,chunking,embedding,index,store,indexer,retrieval,mcp}/__init__.py`,
+  `tests/{__init__,test_cli}.py`.
+- **Decisions:** CLI framework = **Typer** (type-first, pairs with FastAPI/pydantic; not named
+  in the vault stack — flag for `../Rag/agent-inbox/` if it hardens). uv resolved a **Python
+  3.12** interpreter (`requires-python >=3.12`, ruff/mypy `target-version = py312`).
+- **Verify (Step 0 gate, all green):** `uv run vaultrag --help` lists `reindex` + `mcp`;
+  `uv run ruff check .` clean; `uv run mypy src` clean (12 files); `uv run pytest` 4 passed.
+- **Next / handoff:** Start **Step 1 — core data models (`models.py`)**. Nothing committed yet
+  (still on `main`; branch + `agent(claude-code): …` commit when Anik asks).
 
 ### 2026-07-14 — P0 broken into steps + plan locked in vault
 - **Did:** Gathered P0 design from the vault (arch doc + subsystem + reference + decisions

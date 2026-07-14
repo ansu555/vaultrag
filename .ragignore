@@ -1,0 +1,43 @@
+# .ragignore — files VaultRAG must never index, gitignore-style globs.
+# Ship this in a vault root and edit to taste.
+#
+# NOTE: the secret-deny patterns below are ALSO hard-enforced in code at parse
+# time regardless of this file (repo CLAUDE.md §6). Listing them here documents
+# intent and lets you extend the set — you can never *widen* what is indexable
+# past the built-in guard, only narrow it further.
+
+# --- secrets (also hard-blocked in code; do not rely on this file alone) ---
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*credentials*
+*secret*
+
+# --- Obsidian internals & caches ---
+.obsidian/
+.trash/
+.git/
+.smart-env/
+workspace.json
+
+# --- non-markdown media (P0 indexes markdown only) ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.mp3
+*.mp4
+*.mov
+*.zip
+*.tar
+*.gz
+
+# --- agent scratch you may not want retrievable ---
+# agent-inbox/    # uncomment to keep the write-back inbox out of the index

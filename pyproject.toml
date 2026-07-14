@@ -1,0 +1,52 @@
+[project]
+name = "vaultrag"
+version = "0.0.0"
+description = "Self-hosted, MCP-first RAG backend over Obsidian vaults."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Anik" }]
+dependencies = [
+    "pydantic-settings>=2.5",
+    "structlog>=24.4",
+    "typer>=0.12",
+]
+
+[project.scripts]
+vaultrag = "vaultrag.cli:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vaultrag"]
+
+# --- lint / format -----------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# start strict-ish; expand as the codebase grows.
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+# --- type checking -----------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+plugins = ["pydantic.mypy"]
+
+# --- tests -------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
