@@ -79,6 +79,81 @@ Prepend newest first. Template:
 
 ## Session log
 
+### 2026-07-15 — P0 Step 6: Embedder interface + Ollama impl + cache (`embedding/`)
+- **Did:** Completed Step 6. Added `embedding/base.py` (`Embedder` `Protocol`
+  [`model`/`dims`/`embed(texts) -> list[Vector]`, `runtime_checkable`], `Vector = list[float]`,
+  `EmbeddingError`, `l2_normalize`, `fit_dims` = Matryoshka truncate-to-`dims` + re-normalize,
+  and float32 `serialize_vector`/`deserialize_vector` for the `embed_cache` BLOB),
+  `embedding/ollama.py` (`OllamaEmbedder`: **sync** httpx `POST /api/embed` batch endpoint,
+  internal batching at 64, per-vector `fit_dims`, validates dim + returned count, typed
+  `EmbeddingError` on unreachable Ollama / non-200 / model-not-found with the server's message,
+  injectable `httpx.Client` so tests use `httpx.MockTransport`, owns/closes its client only if it
+  made it, `from_settings`), and `embedding/cache.py` (`embed_chunks(embedder, store, chunks)` →
+  `chunk_hash -> Vector`: de-dupe by hash, read the Step 2 `embed_cache` for
+  `(model, dims, hash)`, call the model only for misses, write those back → **0 model calls on an
+  unchanged re-embed**; `QueryEmbedder` = `functools.lru_cache` over single-query embeds, returns
+  a fresh list each call so a caller can't corrupt the cache). Exported the surface from
+  `embedding/__init__.py`.
+- **Why:** Step 6 of `../Rag/projects/vaultrag/p0-step-plan.md`
+  (`../Rag/projects/vaultrag/embedding-pipeline.md`, `../Rag/decisions/dense-embeddings-qwen3.md`,
+  arch §8) — turns each `Chunk.embed_text` (contextual prefix + body, built at Step 5) into the
+  dense vector Step 7 upserts to Qdrant. The `Embedder` protocol is the "interfaces over vendors"
+  seam (CLAUDE.md §5): ONNX int8 / Voyage are future impls behind it, a config change not a rewrite.
+- **Files:** `src/vaultrag/embedding/{base,ollama,cache,__init__}.py`, `tests/test_embedding.py`
+  (new, 22 tests), `pyproject.toml`/`uv.lock` (+`httpx`), `MEMORY.md`.
+- **Decisions (impl-level, consistent with the vault — no write-back needed):**
+  (1) **Sync `Embedder`, not async.** The store + embed cache are sync and Step 8's job runner
+  isn't async yet; the model call is I/O to a local server, so async callers (the FastAPI query
+  path, Step 9) run it in a worker thread — the "keep CPU-bound work off the event loop" pattern
+  CLAUDE.md §5 already prescribes. Keeps the protocol trivially testable. (2) **Vectors cached as
+  packed float32** (`array('f')`), not float64/JSON: half the BLOB size, the precision Qdrant
+  stores anyway, native byte order because the cache is a local derived file always read on the
+  machine that wrote it (DR = reindex). (3) **`fit_dims` always L2-normalizes** the (possibly
+  truncated) vector, so every stored vector is unit-length regardless of whether the backend
+  pre-normalized — a clean invariant for Qdrant cosine and future dot-product; a zero vector is
+  passed through (no div-by-zero); a backend returning **fewer** than `dims` components raises
+  (misconfig, never pad up). (4) **Cache-through lives in `embed_chunks`, not the indexer.**
+  Keyed `(model, dims, chunk_hash)` = the exact Step 2 table key, so an edited note re-embeds only
+  changed chunks and a rename re-embeds nothing; de-duping by `chunk_hash` means identical bodies
+  embed once and share a point vector (intended). Step 8 maps chunk→vector via `chunk.chunk_hash`.
+  (5) **Used `/api/embed` (batch `input` list), not legacy `/api/embeddings` (single `prompt`)** —
+  one round-trip per 32–64 chunks per the pipeline note. (6) **Errors surface, never fake success**
+  (CLAUDE.md §5): a fabricated/zero vector would silently poison the index, so every failure path
+  raises `EmbeddingError`; logs carry only shape/timing, never the texts.
+- **Token counter — deliberately NOT bundled here (deferral stands).** The Step-5 handoff floated
+  landing the `TokenCounter` seam + a Qwen3 tokenizer at Step 6, but the swap that would change the
+  live counter's numbers is a **chunking-param change**, and CLAUDE.md §6 gates those on the eval
+  harness — which doesn't exist until P2. Swapping now would be exactly the unmeasurable change the
+  gate exists to stop (also the conclusion of `../Rag/agent-inbox/token-counter-interface-defer-to-step6.md`,
+  which gates the *default* swap on eval). Kept Step 6 to its plan definition (the embedder) —
+  "work in order, don't batch". Revisit with the eval harness (P2), or sooner if Anik approves the
+  agent-inbox note and wants the behavior-preserving seam landed on its own.
+- **Verify (Step 6 gate, all green):** `uv run pytest` **107 passed** (4 CLI + 7 models + 13 store
+  + 13 scan + 33 parsing + 15 chunking + 22 embedding); `uv run ruff check .` clean; `uv run mypy
+  src` clean (25 files). The plan's verify criteria are met by tests: sample chunks embed to
+  `dims`-wide unit vectors, and **re-embed makes 0 model calls** (`test_embed_chunks_caches_and_
+  reembeds_nothing`, counting `FakeEmbedder`). Also covered: float32 codec round-trip, `fit_dims`
+  truncate+normalize / too-few-dims raise, Ollama success/order/payload + multi-batch splitting +
+  empty-input-no-request via `MockTransport`, dim-mismatch / HTTP-404-model-not-found /
+  connection-refused / count-mismatch / missing-`embeddings`-key all raising `EmbeddingError`,
+  cache dims-scoping, hash de-dupe, and query-LRU memoization + fresh-list-per-call.
+- **Live-integration: VERIFIED (gap closed 2026-07-15).** Anik installed Ollama (v0.32.0) and
+  `ollama pull qwen3-embedding:0.6b` (595.78M params, 639 MB) succeeded. Smoke-tested the real
+  path through our own code: `OllamaEmbedder.from_settings(Settings())` on the P0 default config
+  → native model dims = **1024** (matches `embed_dims`), a 3-text batch returns three **unit-norm**
+  1024-d vectors (`fit_dims`/normalize confirmed live), re-embedding the same text is deterministic
+  (max abs diff < 1e-5), and `fit_dims(...,512)` truncation stays unit-norm. `embed_chunks` against
+  a real `SQLiteMetaStore` + a call-counting wrapper over the live embedder proved the **0-model-
+  calls-on-re-embed** property live (run-2 delta = 0). The only run-1-vs-run-2 vector difference is
+  float32 storage rounding (cache round-trip diff 3.67e-9 == a pure `serialize→deserialize` diff),
+  not a bug — exactly what `test_embed_chunks_caches_and_reembeds_nothing` tolerates with
+  `pytest.approx(abs=1e-6)`. Ollama's `/api/embed` contract our impl targets is now confirmed real.
+- **Next / handoff:** Start **Step 7 — Qdrant vector store (`index/`)**. Feed it the vectors
+  `embed_chunks` returns (map chunk→vector by `chunk.chunk_hash`); point id is `Chunk.point_id`.
+  Unit tests must not require a live Qdrant (mirror the Step-6 mock-transport approach); the live
+  verify needs `docker compose up -d qdrant`. Nothing committed yet (still on `main`; branch +
+  `agent(claude-code): …` commit when Anik asks).
+
 ### 2026-07-15 — Reviewed external "token counting" proposal; captured decision, deferred code
 - **Did:** Vetted an external expert doc ("Production Token Counting Strategy for VaultRAG",
   PDF + `.md` in the impl repo root) that flagged `chunking/tokens.py`'s ~4-chars/token
