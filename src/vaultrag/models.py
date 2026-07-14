@@ -1,14 +1,14 @@
 """Core data models — the one normalized shape every stage shares.
 
 Parsing (Step 4) produces a :class:`Document`; chunking (Step 5) turns it into
-:class:`Chunk` children; embedding/indexing (Steps 6–8) persist those; retrieval
+:class:`Chunk` children; embedding/indexing (Steps 6-8) persist those; retrieval
 (Step 9) and MCP (Step 10) return :class:`SearchResult` / :class:`Snippet`. Keeping
 this shape fixed is ordering constraint #1 (arch §5): every later stage depends on it.
 
 Field provenance:
 * Qdrant payload per point — ``../Rag/reference/reference-metadata-schema.md`` (arch §7)
 * SQLite tables (documents, chunks, links, tags) — ``../Rag/reference/reference-database-schema.md``
-* Block/Chunk semantics — ``../Rag/projects/vaultrag/{parsing,chunking}-*.md`` (arch §5–§6)
+* Block/Chunk semantics — ``../Rag/projects/vaultrag/{parsing,chunking}-*.md`` (arch §5-§6)
 """
 
 from __future__ import annotations
@@ -26,12 +26,22 @@ from pydantic import BaseModel, ConfigDict, Field
 # contain ':' can't collide.
 # ---------------------------------------------------------------------------
 _POINT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "vaultrag://chunks")
+_DOC_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "vaultrag://documents")
 _SEP = "\x1f"
 
 
 def chunk_point_id(project_id: str, path: str, chunk_ix: int) -> str:
     """Deterministic chunk/point id for ``(project, path, chunk_ix)``."""
     return str(uuid.uuid5(_POINT_NAMESPACE, f"{project_id}{_SEP}{path}{_SEP}{chunk_ix}"))
+
+
+def document_id(project_id: str, path: str) -> str:
+    """Deterministic document id (SQLite ``documents.id`` == payload ``doc_id``).
+
+    Derived from ``(project, path)`` so the manifest row, every child chunk's
+    ``doc_id``, and delete-by-doc filters all agree without a DB round-trip.
+    """
+    return str(uuid.uuid5(_DOC_NAMESPACE, f"{project_id}{_SEP}{path}"))
 
 
 class _Base(BaseModel):
@@ -43,7 +53,7 @@ class _Base(BaseModel):
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-class DocType(str, Enum):
+class DocType(StrEnum):
     """Document kind (Qdrant payload ``type``). P0 handles ``note`` only."""
 
     note = "note"
@@ -52,7 +62,7 @@ class DocType(str, Enum):
     image = "image"
 
 
-class BlockType(str, Enum):
+class BlockType(StrEnum):
     """A parsed structural unit of a document."""
 
     heading = "heading"
@@ -65,7 +75,7 @@ class BlockType(str, Enum):
     other = "other"
 
 
-class LinkKind(str, Enum):
+class LinkKind(StrEnum):
     """Edge kind in the wikilink graph (SQLite ``links.kind``)."""
 
     wikilink = "wikilink"  # [[Note]] / [[Note#Heading]] / [[Note#^block]]
