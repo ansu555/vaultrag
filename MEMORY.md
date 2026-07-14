@@ -8,22 +8,26 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (metadata store) DONE.**
-  Next up: **Step 3 (vault scan + manifest diff + secret guard — `indexer/scan.py`)**.
+- **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan) DONE.**
+  Next up: **Step 4 (markdown parsing → `Document` — `parsing/`)**.
 - **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag --help`
-  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (15 files),
-  and `pytest` (24 tests: 4 CLI + 7 models + 13 store) are all green. Env-driven `config.py`
-  (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON logging wired. `models.py` holds
-  the normalized `Document{metadata, blocks, links}` / `Block` / `Chunk` shape, the
-  `Snippet`/`SearchResult` return contract, and deterministic `chunk_point_id` + `document_id`.
-  `store/` now has the `MetaStore` protocol + `SQLiteMetaStore` (WAL): P0 tables
+  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (17 files),
+  and `pytest` (37 tests: 4 CLI + 7 models + 13 store + 13 scan) are all green. Env-driven
+  `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON logging wired.
+  `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block` / `Chunk`
+  shape, the `Snippet`/`SearchResult` return contract, and deterministic `chunk_point_id` +
+  `document_id`. `store/` has the `MetaStore` protocol + `SQLiteMetaStore` (WAL): P0 tables
   `projects, documents, chunks, jobs, embed_cache, tags`, content-addressed idempotent upserts,
-  FK cascade delete, embed-cache keyed `(model, dims, chunk_hash)`.
-- **What's next:** Step 3 — `indexer/scan.py`: walk the vault, BLAKE3 per file, apply
-  `.ragignore` **and built-in secret-deny patterns at this boundary**, diff vs the
-  `documents` manifest (`store.document_manifest(project)`) → creates/updates/deletes. Ref:
-  `../Rag/projects/vaultrag/ingestion-pipeline.md`; `CLAUDE.md` §6 (secrets guardrail —
-  **planted-fake-secret test is a required first-class gate**). Full 11-step plan:
+  FK cascade delete, embed-cache keyed `(model, dims, chunk_hash)`. `indexer/` now has the
+  vault scan: `scan.py` (walk → BLAKE3 → `.ragignore` + secret guard → `diff_manifest` →
+  `ScanDiff{creates,updates,deletes,renames,unchanged}`) and `secret_guard.py` (non-overridable
+  filename + content secret blocking). Deps added: `blake3`, `pathspec`.
+- **What's next:** Step 4 — `parsing/`: markdown-it-py + python-frontmatter + custom Obsidian
+  rules (wikilinks/embeds/callouts/dataview) → the normalized `Document{metadata, blocks, links}`
+  from `models.py`. Refs: `../Rag/projects/vaultrag/` chunking/parsing notes + arch §5. The
+  scan feeds Step 4/8: `scan_vault(vault, store.document_manifest(project))` returns the diff;
+  **enqueuing jobs + applying renames as metadata-only updates is deferred to Step 8** (needs the
+  job runner + parser) — scan only *produces* the diff. Full 11-step plan:
   `../Rag/projects/vaultrag/p0-step-plan.md`. Work in order; do not batch. Embedder backend
   for P0 = **Ollama** (behind the `Embedder` interface).
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
@@ -49,6 +53,49 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-15 — P0 Step 3: vault scan + manifest diff + secret guard (`indexer/`)
+- **Did:** Completed Step 3. Added `indexer/secret_guard.py` (the non-overridable half of
+  the secrets barrier: `is_secret_filename` — `.env*`/`id_rsa*`/`*.pem`/`*credentials*` +
+  key-material globs; `scan_for_secrets` — high-precision content scan: PEM private-key
+  blocks, AWS/GitHub/Slack/Google/Stripe/JWT tokens, plus a keyword-anchored high-entropy
+  assignment rule gated on Shannon entropy so git SHAs/UUIDs/placeholders don't trip it;
+  **returns only the rule name, never the secret**). Added `indexer/scan.py`: `walk_vault`
+  (os.walk, symlinks off, prunes `.git/.obsidian/.trash/.smart-env/node_modules` + `.ragignore`
+  dirs, markdown-only, both secret gates, BLAKE3 per file) → `ScannedFile`; `diff_manifest`
+  (pure) → `ScanDiff{creates,updates,deletes,renames,unchanged}` with rename recovery (a create
+  whose hash matches a delete becomes a `Rename`, one-to-one/greedy); `scan_vault` wrapper
+  Step 8 will call with `store.document_manifest(project)`. Exported the API from
+  `indexer/__init__.py`.
+- **Why:** Step 3 of `../Rag/projects/vaultrag/p0-step-plan.md`; boot-reconcile front of the
+  indexer (`../Rag/projects/vaultrag/ingestion-pipeline.md`, arch §4). Secret guardrail is
+  `CLAUDE.md` §6 / `reference-security-model.md` (first-class threat). Full-rebuild property
+  (`CLAUDE.md` §6): empty manifest → every file a create, so `reindex` from a bare vault rebuilds.
+- **Files:** `src/vaultrag/indexer/{scan,secret_guard,__init__}.py`, `tests/test_scan.py` (new,
+  13 tests), `pyproject.toml`/`uv.lock` (+`blake3`, +`pathspec`), `MEMORY.md`.
+- **Decisions (impl-level, consistent with the vault — no write-back needed):**
+  (1) **Scope boundary:** scan *produces* the `ScanDiff`; enqueuing jobs + applying renames as
+  metadata-only updates (vectors untouched) is Step 8's job runner — kept out of Step 3 to honor
+  "work in order, don't batch". Renames are surfaced first-class in the diff so Step 8 can act.
+  (2) `diff_manifest` is a **pure function** (manifest in, diff out) → the classifier is tested
+  without a filesystem. A `_MISSING` sentinel distinguishes "path absent" (create) from
+  "path present with NULL hash" (a half-recorded doc → treated as update, never a rename source).
+  (3) **Content secret-block is whole-file at this boundary** for P0 (a note carrying live-looking
+  key material never enters the index); line-level *redaction* is deferred to Step 4 parsing.
+  (4) Directory-level `.ragignore` prunes aren't counted in `ScanStats.ignored` (their files are
+  never visited — that's the perf win); only file-level ignores increment it. (5) pathspec API:
+  used the non-deprecated `gitignore`/`GitIgnoreSpecPattern` (the `gitwildmatch` factory is
+  deprecated in pathspec 1.1.1 and emitted warnings).
+- **Verify (Step 3 gate, all green):** `uv run pytest` 37 passed (4 CLI + 7 models + 13 store +
+  13 scan); `uv run ruff check .` clean; `uv run mypy src` clean (17 files). **Required
+  guardrail gate met:** `test_secret_file_never_indexed` (files named `.env`/`id_rsa`/`*.pem`/
+  `*credentials*` never surface) and `test_note_with_embedded_secret_never_indexed` (markdown
+  notes embedding an AWS key / PEM block / high-entropy assignment are all withheld;
+  `secrets_blocked == 3`). Plus content-addressed hashing, ragignore, rename detection, NULL-hash
+  update, and the empty-manifest→all-creates full-rebuild property.
+- **Next / handoff:** Start **Step 4 — markdown parsing → `Document` (`parsing/`)**. Reuse
+  `scan_for_secrets` there for line-level redaction (the deferred half of decision #3). Nothing
+  committed yet (still on `main`; branch + `agent(claude-code): …` commit when Anik asks).
 
 ### 2026-07-15 — P0 Step 2: metadata store (SQLite `MetaStore`, `store/`)
 - **Did:** Completed Step 2. Added `store/base.py` (the `MetaStore` `Protocol` +

@@ -7,6 +7,8 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Anik" }]
 dependencies = [
+    "blake3>=1.0.9",
+    "pathspec>=1.1.1",
     "pydantic-settings>=2.5",
     "structlog>=24.4",
     "typer>=0.12",
