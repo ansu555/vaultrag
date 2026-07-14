@@ -9,12 +9,12 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 ## Current state
 
 - **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan)
-  + 4 (parsing) + 5 (chunking) DONE.** Next up: **Step 6 (Embedder interface + Ollama impl +
-  cache — `embedding/`)**.
+  + 4 (parsing) + 5 (chunking) + 6 (embedding) DONE.** Next up: **Step 7 (Qdrant vector store —
+  `index/`)**.
 - **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag --help`
-  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (22 files),
-  and `pytest` (85 tests: 4 CLI + 7 models + 13 store + 13 scan + 33 parsing + 15 chunking) are
-  all green. Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
+  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (25 files),
+  and `pytest` (107 tests: 4 CLI + 7 models + 13 store + 13 scan + 33 parsing + 15 chunking +
+  22 embedding) are all green. Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
   logging wired. `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block`
   / `Chunk` shape, the `Snippet`/`SearchResult` return contract, and deterministic
   `chunk_point_id` + `document_id`. `store/` has the `MetaStore` protocol + `SQLiteMetaStore`
@@ -33,17 +33,28 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   ~300-tok-target/512-hard-max packing at block granularity → single-pass tiny-sibling merge
   ≥120 tok → contextual prefix «Project ▸ folder/note ▸ H1 ▸ H2» + tags line → `prev_id`/
   `next_id` stitching via deterministic `chunk_point_id`), `tokens.py` (`count_tokens`: ~4
-  chars/token heuristic — see decisions below). Deps added: `blake3`, `pathspec`,
-  `markdown-it-py`, `python-frontmatter`, (`types-pyyaml` dev-only). No new deps for chunking.
-- **What's next:** Step 6 — `embedding/`: `Embedder` protocol (shared by indexer + query path)
-  + an Ollama impl for Qwen3-Embedding-0.6B (1024d, batch 32–64) + `embed_cache` keyed
-  `(model, dims, chunk_hash)` (the SQLite table already exists from Step 2 — reuse it, don't
-  re-derive the schema). Refs: `../Rag/projects/vaultrag/embedding-pipeline.md`,
-  `../Rag/decisions/dense-embeddings-qwen3.md`, arch §8. Feed it `Chunk.embed_text` (contextual
-  prefix + body, already built in Step 5's `Chunk` model). Requires a running Ollama with the
-  Qwen3-Embedding-0.6B model pulled — verify that's available before writing the impl. Full
-  11-step plan: `../Rag/projects/vaultrag/p0-step-plan.md`. Work in order; do not batch.
-  Embedder backend for P0 = **Ollama** (behind the `Embedder` interface).
+  chars/token heuristic — see decisions below). `embedding/` turns `Chunk.embed_text` into
+  dense vectors behind the swappable `Embedder` protocol: `base.py` (`Embedder` protocol,
+  `Vector`, `EmbeddingError`, float32 `serialize_vector`/`deserialize_vector` for the cache
+  BLOB, `fit_dims` = Matryoshka truncate-to-`dims` + L2-normalize), `ollama.py`
+  (`OllamaEmbedder`: sync httpx `POST /api/embed`, batch 64, dim/count validation, typed
+  errors on unreachable-Ollama / model-not-found, injectable client for tests, `from_settings`),
+  `cache.py` (`embed_chunks(embedder, store, chunks)` → cache-through on the Step 2
+  `embed_cache` table keyed `(model, dims, chunk_hash)`, de-duped by hash, 0 model calls when
+  all cached; `QueryEmbedder` = LRU over single-query embeds for the read path). Deps added:
+  `blake3`, `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`, (`types-pyyaml`
+  dev-only).
+- **What's next:** Step 7 — `index/`: `VectorStore` protocol + qdrant-client impl. One `chunks`
+  collection with named vectors `dense`(1024, cosine) + sparse `bm25` (fastembed BM25); payload
+  indexes `project_id` (keyword, `is_tenant=true`), `tags`, `path`, `type`, `modified_ts`; point
+  id = `Chunk.point_id` (`uuid5(project, path, ix)`, already on the model); full payload; upsert;
+  **delete-by-`doc_id` filter**. Feed it the vectors `embed_chunks` returns (map each chunk to
+  its vector via `chunk.chunk_hash`). Refs: `../Rag/projects/vaultrag/indexing-pipeline.md`,
+  `../Rag/decisions/vector-search-qdrant.md`, `../Rag/decisions/sparse-bm25-not-elasticsearch.md`,
+  `../Rag/decisions/payload-partitioning-not-collection-per-project.md`, arch §7/§9. Needs
+  `docker compose up -d qdrant` for the live verify (external dep — like Ollama at Step 6, unit
+  tests must not require it). Full 11-step plan: `../Rag/projects/vaultrag/p0-step-plan.md`. Work
+  in order; do not batch.
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
   `CLAUDE.md` §1.
 - **Open questions / blockers:** `search`/`open` response JSON shapes are unspecified in
@@ -67,6 +78,35 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-15 — Reviewed external "token counting" proposal; captured decision, deferred code
+- **Did:** Vetted an external expert doc ("Production Token Counting Strategy for VaultRAG",
+  PDF + `.md` in the impl repo root) that flagged `chunking/tokens.py`'s ~4-chars/token
+  heuristic as the one weak spot in an otherwise production-ready chunker. Ran each of its
+  proposals against our *actual* code (not the `chars/4`-everywhere strawman it assumes) and
+  against the vault. **No code changed** — recorded the decision + deferral in the vault
+  instead (`../Rag/agent-inbox/token-counter-interface-defer-to-step6.md`, status: proposed).
+- **Why:** Anik's call was "only implement if it's a genuine upgrade with no bad side effects."
+  Verdict: the review mostly *confirms* our existing plan (`tokens.py` already documents
+  heuristic-now → real-tokenizer-at-Step-6). The one genuinely good idea — a `TokenCounter`
+  interface so the Step-6 swap is a config change, with the Qwen3 `tokenizer.json` (via the
+  `tokenizers` lib, not `transformers`/torch) as default-when-available and the heuristic as
+  fallback — belongs **with Step 6**, gated by the eval harness. Swapping the live counter now
+  is an unmeasurable chunking-param change (no embedder, no eval yet) — the exact thing
+  `CLAUDE.md` §6's quality gate exists to stop. The 512 cap is a retrieval-quality knob, not a
+  model limit (Qwen3 has 32k ctx), so there's no correctness fire to fix now.
+- **Rejected from the proposal (reasons in the agent-inbox note):** (a) persisting
+  `block.tokens` at parse time — perf premise is false (our chunker already counts each block
+  once; merge pass reuses summed `piece.tokens`), and a token count is tokenizer-relative, so
+  storing it on `Block` goes stale on any model swap; (b) caching token counts on content hash
+  alone — if added (P2), the key must be `(tokenizer_id, block_hash)`, matching how the embed
+  cache is keyed `(model, dims, chunk_hash)`.
+- **Files:** `../Rag/agent-inbox/token-counter-interface-defer-to-step6.md` (new, vault),
+  `MEMORY.md`. No repo code touched; Step 5 stands as-is.
+- **Next / handoff:** Unchanged — start **Step 6 (Embedder interface + Ollama impl + cache)**.
+  When Step 6 lands, also land the `TokenCounter` seam + Qwen3 counter behind it and
+  re-validate the 300/512/120 thresholds against the eval harness (recall@10 ≥ 0.9,
+  MRR@5 ≥ 0.75). If Anik approves the agent-inbox note, promote it to `../Rag/decisions/`.
 
 ### 2026-07-15 — P0 Step 5: heading-tree chunker (`chunking/`)
 - **Did:** Completed Step 5. Added `chunking/tokens.py` (`count_tokens`: ~4-chars/token

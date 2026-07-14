@@ -8,6 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "Anik" }]
 dependencies = [
     "blake3>=1.0.9",
+    "httpx>=0.27",
     "markdown-it-py>=4.2.0",
     "pathspec>=1.1.1",
     "pydantic-settings>=2.5",
