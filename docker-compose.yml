@@ -1,0 +1,26 @@
+# Local single-box stack. P0 needs Qdrant only — the api/indexer services land with the
+# Docker image (P0 polish / P1). Shape: ../Rag/reference/reference-docker-compose.md.
+#
+#   docker compose up -d qdrant     # dashboard: http://localhost:6333/dashboard
+#
+# The volume holds a derived cache, not a backup: the vault is the source of truth and
+# `vaultrag reindex` rebuilds this from bare markdown (CLAUDE.md §6).
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: vaultrag-qdrant
+    restart: unless-stopped
+    ports:
+      # Localhost-only: no auth in front of it by default.
+      - "127.0.0.1:6333:6333" # REST + dashboard
+      - "127.0.0.1:6334:6334" # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  qdrant_data: {}

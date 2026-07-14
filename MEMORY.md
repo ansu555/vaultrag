@@ -9,12 +9,12 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 ## Current state
 
 - **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan)
-  + 4 (parsing) + 5 (chunking) + 6 (embedding) DONE.** Next up: **Step 7 (Qdrant vector store —
-  `index/`)**.
+  + 4 (parsing) + 5 (chunking) + 6 (embedding) + 7 (Qdrant vector store) DONE.** Next up:
+  **Step 8 (wire the indexing pipeline — `vaultrag reindex`)**.
 - **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag --help`
-  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (25 files),
-  and `pytest` (107 tests: 4 CLI + 7 models + 13 store + 13 scan + 33 parsing + 15 chunking +
-  22 embedding) are all green. Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
+  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (29 files),
+  and `pytest` (137 tests: 4 CLI + 7 models + 13 store + 13 scan + 33 parsing + 15 chunking +
+  22 embedding + 30 index) are all green. Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
   logging wired. `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block`
   / `Chunk` shape, the `Snippet`/`SearchResult` return contract, and deterministic
   `chunk_point_id` + `document_id`. `store/` has the `MetaStore` protocol + `SQLiteMetaStore`
@@ -41,25 +41,43 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   errors on unreachable-Ollama / model-not-found, injectable client for tests, `from_settings`),
   `cache.py` (`embed_chunks(embedder, store, chunks)` → cache-through on the Step 2
   `embed_cache` table keyed `(model, dims, chunk_hash)`, de-duped by hash, 0 model calls when
-  all cached; `QueryEmbedder` = LRU over single-query embeds for the read path). Deps added:
-  `blake3`, `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`, (`types-pyyaml`
-  dev-only).
-- **What's next:** Step 7 — `index/`: `VectorStore` protocol + qdrant-client impl. One `chunks`
-  collection with named vectors `dense`(1024, cosine) + sparse `bm25` (fastembed BM25); payload
-  indexes `project_id` (keyword, `is_tenant=true`), `tags`, `path`, `type`, `modified_ts`; point
-  id = `Chunk.point_id` (`uuid5(project, path, ix)`, already on the model); full payload; upsert;
-  **delete-by-`doc_id` filter**. Feed it the vectors `embed_chunks` returns (map each chunk to
-  its vector via `chunk.chunk_hash`). Refs: `../Rag/projects/vaultrag/indexing-pipeline.md`,
-  `../Rag/decisions/vector-search-qdrant.md`, `../Rag/decisions/sparse-bm25-not-elasticsearch.md`,
-  `../Rag/decisions/payload-partitioning-not-collection-per-project.md`, arch §7/§9. Needs
-  `docker compose up -d qdrant` for the live verify (external dep — like Ollama at Step 6, unit
-  tests must not require it). Full 11-step plan: `../Rag/projects/vaultrag/p0-step-plan.md`. Work
-  in order; do not batch.
+  all cached; `QueryEmbedder` = LRU over single-query embeds for the read path). `index/` is the
+  vector store: `base.py` (`VectorStore` + `SparseEmbedder` protocols, `SparseVector`,
+  `VectorStoreError`), `payload.py` (`chunk_payload` → the per-point payload, `EMBED_VER`,
+  `select_frontmatter`), `sparse.py` (`Bm25Embedder`: FastEmbed `Qdrant/bm25`, lazy-loaded so
+  import/construct never hits the network), `qdrant.py` (`QdrantVectorStore`: one `chunks`
+  collection, named vectors `dense`(cosine, int8-quantized, on-disk originals, HNSW
+  m=16/ef_construct=128) + sparse `bm25`(IDF modifier), payload indexes incl. `project_id`
+  `is_tenant=true`; `ensure_collection`/`upsert_chunks`/`delete_by_doc`/`count`,
+  `from_settings`). `docker-compose.yml` ships the Qdrant service. Deps added: `blake3`,
+  `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`, `qdrant-client`, `fastembed`,
+  (`types-pyyaml` dev-only).
+- **What's next:** Step 8 — wire the indexing pipeline behind `vaultrag reindex`: scan (Step 3)
+  → `ScanDiff` → jobs (Step 2 `jobs` table, idempotent by `(project, path, hash)`) → per file
+  parse (Step 4) → chunk (Step 5) → `embed_chunks` (Step 6) → `store.upsert_document`/
+  `upsert_chunks` + `vs.upsert_chunks(chunks, vectors, embed_model=…, document=doc)` (Step 7).
+  Two traps the Step-7 shape hands Step 8: (1) **an update must `vs.delete_by_doc()` before
+  re-upserting** — upsert only overwrites the ids it writes, so a note edited *shorter* strands
+  its old tail points (they stay searchable forever); (2) **a rename re-embeds nothing but must
+  still move its points** — the point id is `uuid5(project, path, ix)`, so path-change ⇒ delete
+  at the old path + upsert at the new, with vectors served from the embed cache. Ref:
+  `../Rag/projects/vaultrag/ingestion-pipeline.md`, arch §4. Full 11-step plan:
+  `../Rag/projects/vaultrag/p0-step-plan.md`. Work in order; do not batch.
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
   `CLAUDE.md` §1.
-- **Open questions / blockers:** `search`/`open` response JSON shapes are unspecified in
-  `../Rag/reference/reference-mcp-tools.md` (params only) — author the cited-snippet contract
-  at Step 1 / Step 10, promote to `reference/` if it hardens.
+- **Open questions / blockers:**
+  - **Docker is not installed on this box** (`docker`/`podman`/`colima` all absent; no brew
+    formula for `qdrant`). Step 7's code is verified against qdrant-client's local mode +
+    live Ollama, but **no real Qdrant server has ever run** — see the Step 7 entry for exactly
+    what that leaves unproven. Anik: install Docker Desktop (or OrbStack/colima), then
+    `docker compose up -d qdrant`. Step 8 can be written without it; Step 9 (hybrid retrieval)
+    genuinely needs it, since local mode's fusion/IDF scoring is not the engine's.
+  - `search`/`open` response JSON shapes are unspecified in
+    `../Rag/reference/reference-mcp-tools.md` (params only) — author the cited-snippet contract
+    at Step 1 / Step 10, promote to `reference/` if it hardens.
+  - **Vault write-back pending Anik's review:** `../Rag/agent-inbox/payload-carries-chunk-text.md`
+    (proposed) — the payload reference omits `text`, but Step 7 stores it and Step 9 needs it.
+    Ratify into `reference-metadata-schema.md` or correct it.
 
 ---
 
@@ -78,6 +96,101 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-15 — P0 Step 7: Qdrant vector store (`index/`)
+- **Did:** Completed Step 7. Added `index/base.py` (`VectorStore` protocol —
+  `ensure_collection`/`upsert_chunks`/`delete_by_doc`/`count`/`close`, write-side only, the read
+  path is Step 9; `SparseEmbedder` protocol; `SparseVector` frozen dataclass that rejects ragged
+  indices/values; `VectorStoreError`), `index/payload.py` (`chunk_payload` builds the per-point
+  payload from `reference-metadata-schema.md`; `EMBED_VER`; `select_frontmatter`),
+  `index/sparse.py` (`Bm25Embedder` over FastEmbed `Qdrant/bm25`, `embed_documents` (term
+  frequencies) + `embed_query` (flat weights, IDF is the collection's job), numpy→native casting
+  at the boundary, **lazy** encoder so importing or constructing never triggers the HuggingFace
+  artifact fetch), and `index/qdrant.py` (`QdrantVectorStore`: one `chunks` collection, named
+  vectors `dense`(cosine, int8 scalar quantization `always_ram`, originals `on_disk`, HNSW
+  m=16/ef_construct=128) + sparse `bm25`(IDF modifier); payload indexes `project_id`
+  (keyword, `is_tenant=true`), `tags`/`path`/`type` (keyword), `modified_ts` (integer); point id
+  = `Chunk.point_id`; batched upsert at 256; delete-by-`doc_id` **filtered by `project_id` too**;
+  `count(project_id=None)`; injectable client + sparse encoder; `from_settings`). Added
+  `docker-compose.yml` (qdrant only — the api/indexer services land with the image at P0
+  polish/P1). Exported the surface from `index/__init__.py`.
+- **Why:** Step 7 of `../Rag/projects/vaultrag/p0-step-plan.md`
+  (`../Rag/projects/vaultrag/indexing-pipeline.md`, `../Rag/decisions/vector-search-qdrant.md`,
+  `../Rag/decisions/sparse-bm25-not-elasticsearch.md`,
+  `../Rag/decisions/payload-partitioning-not-collection-per-project.md`, arch §7/§9) — the
+  searchable half of the index. Step 8 upserts into it; Step 9 queries it.
+- **Files:** `src/vaultrag/index/{base,payload,sparse,qdrant,__init__}.py`, `tests/test_index.py`
+  (new, 30 tests), `docker-compose.yml` (new), `pyproject.toml`/`uv.lock` (+`qdrant-client`,
+  +`fastembed`), `MEMORY.md`, `../Rag/agent-inbox/payload-carries-chunk-text.md` (new, vault).
+- **Decisions (impl-level):**
+  (1) **The payload carries `text`, and `embed_ver` = the embedding *recipe* version — a real
+  divergence from the vault, written back as
+  `../Rag/agent-inbox/payload-carries-chunk-text.md` (proposed).** `reference-metadata-schema.md`
+  omits `text`, but the SQLite `chunks` table is structure-only and `Chunk` carries no line span,
+  so nothing else *can* hold the body — while Step 9 must build snippets with `text` from the
+  hits. The payload is the only place it fits; the omission reads as a gap in an enumeration of
+  *metadata* (which a body isn't), not an exclusion. Stores `text` (raw body), not `embed_text`
+  — the contextual prefix is an embedding-time construct and would be noise in a citation.
+  `embed_ver` is named-but-undefined in the reference; defined here as the recipe version
+  (prefix format / truncation / normalization), starting at 1, so `(embed_model, embed_ver)`
+  per point does the incremental-migration job the reference wants of it. **Needs Anik's
+  ratification** (CLAUDE.md §1: flag the divergence, don't drift).
+  (2) **`frontmatter{...select keys}` = the filterable keys** — scalars and flat lists of
+  scalars, strings ≤512 chars, nested structures dropped. The payload's job is filtering;
+  arbitrary nested YAML bloats every point for something no filter can use.
+  (3) **BM25 encodes `embed_text` (prefix + body), not the bare body** — symmetric with dense,
+  and the prefix's path/heading tokens are what make known-item lookups land (`search
+  "docker-compose.prod.yml"`). Boilerplate prefix terms (the project name) appear in every
+  document, so IDF drives them to ~0 on their own — no manual stripping needed.
+  (4) **The store owns the sparse encoder; the caller passes only dense vectors.** BM25 is
+  cheap, deterministic, and meaningless outside an engine that applies IDF — it belongs to this
+  layer, not the embedding pipeline. So Step 8 stays "dense vectors in, points out"; `vectors`
+  is keyed `chunk_hash` (exactly `embed_chunks`'s return), so identical bodies share a vector.
+  (5) **`delete_by_doc` filters on `project_id` as well as `doc_id`**, though `doc_id` is
+  already `uuid5(project, path)` and globally unique. Defense in depth: no code path can delete
+  across tenants even if handed a foreign id (CLAUDE.md §6), and it matches the tenant index.
+  (6) **A missing/wrong-width vector raises instead of indexing the chunk** — a vector-less
+  point would look indexed while being permanently unfindable. Same rule as Step 6: never fake
+  success.
+  (7) **`ensure_collection` verifies an existing collection's dims** and raises naming the cause
+  (changed `VAULTRAG_EMBED_DIMS`/model) rather than letting every upsert fail one by one. The
+  index is a derived cache — the fix is recreate + reindex, never reshape vectors.
+- **Bug found by probing rather than by tests (fixed):** the first draft caught
+  `(UnexpectedResponse, OSError, ValueError)` around every client call, which *looks* right and
+  passed every test — but qdrant-client wraps connection-refused in `ResponseHandlingException`,
+  which is **not** an `OSError`. So the single most likely real failure (Qdrant not running) blew
+  past the handler and leaked a raw client error, burying the "is it running? `docker compose up
+  -d qdrant`" message the docstring promised. Both exception types share an `ApiException` base;
+  the shared `_CLIENT_ERRORS` tuple now catches that. Regression-locked by
+  `test_unreachable_qdrant_says_so_instead_of_leaking_a_client_error` (points at a dead port).
+  Worth remembering: the local-mode tests can't surface transport bugs at all.
+- **Verify (Step 7 gate, all green):** `uv run pytest` **137 passed** (4 CLI + 7 models + 13
+  store + 13 scan + 33 parsing + 15 chunking + 22 embedding + 30 index); `uv run ruff check .`
+  clean; `uv run mypy src` clean (29 files). Unit tests run against `QdrantClient(":memory:")` —
+  qdrant-client's real local implementation, no Docker — covering every plan criterion (upsert →
+  count; delete-by-doc removes them and leaves other docs; re-upsert idempotent: same ids, no
+  dupes, edited body overwrites in place), plus dims-mismatch/foreign-collection/unreachable
+  errors, tenant-scoped delete + count, missing/wrong-width vector raises, both named vectors
+  written, sparse-encodes-`embed_text`, the full payload shape, and doc-fields-never-leak-onto-
+  another-doc's-chunk. The four real-BM25 tests skip gracefully when FastEmbed's artifact can't
+  be fetched (offline), so the suite stays hermetic.
+- **Live-integration: PARTIAL — the real Qdrant *server* has never run (Docker not installed).**
+  What *was* verified live, end-to-end through our own code on a real vault note
+  (`../Rag/projects/vaultrag/indexing-pipeline.md`): parse → chunk (2 chunks) → **live Ollama**
+  embed (1024-d, `qwen3-embedding:0.6b`, via the Step-6 cache + real `SQLiteMetaStore`) → **real
+  FastEmbed BM25** (78 terms) → `ensure_collection` → upsert (2 points, both named vectors
+  present, dense width 1024) → `count`/`count(project)` = 2 → re-upsert idempotent (still 2) →
+  payload complete (all 20 keys incl. `text`, `title`, `links_out`, `frontmatter`, `embed_ver`)
+  → `delete_by_doc` → 0 → deleting the already-gone doc is not an error. **What local mode
+  cannot prove** (needs `docker compose up -d qdrant`): the HNSW/int8-quantization config is
+  stored but never applied, payload indexes are explicit no-ops (local mode warns as much — so
+  `is_tenant` placement is untested), and **IDF/fusion scoring is not the engine's**, which is
+  why Step 9 can't be trusted without a real server. Anik: installing Docker unblocks that.
+- **Next / handoff:** Start **Step 8 — wire the indexing pipeline (`vaultrag reindex`)**. The
+  two traps Step 7's shape hands it are written up in **Current state → What's next** (stranded
+  tail points on a shortened note; renames must move their points because the id embeds the
+  path). Nothing committed yet (still on `main`; branch + `agent(claude-code): …` commit when
+  Anik asks).
 
 ### 2026-07-15 — P0 Step 6: Embedder interface + Ollama impl + cache (`embedding/`)
 - **Did:** Completed Step 6. Added `embedding/base.py` (`Embedder` `Protocol`
