@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import math
 
-_CHARS_PER_TOKEN = 4
+# Public so the one place that needs the inverse conversion (the `open` tool's
+# token-cap → char-budget in mcp/server.py) shares this definition instead of
+# hardcoding its own 4 — the two must move together if the heuristic is ever tuned.
+CHARS_PER_TOKEN = 4
 
 
 def count_tokens(text: str) -> int:
@@ -20,4 +23,4 @@ def count_tokens(text: str) -> int:
     stripped = text.strip()
     if not stripped:
         return 0
-    return max(1, math.ceil(len(stripped) / _CHARS_PER_TOKEN))
+    return max(1, math.ceil(len(stripped) / CHARS_PER_TOKEN))

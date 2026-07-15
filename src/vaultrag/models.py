@@ -2,8 +2,9 @@
 
 Parsing (Step 4) produces a :class:`Document`; chunking (Step 5) turns it into
 :class:`Chunk` children; embedding/indexing (Steps 6-8) persist those; retrieval
-(Step 9) and MCP (Step 10) return :class:`SearchResult` / :class:`Snippet`. Keeping
-this shape fixed is ordering constraint #1 (arch §5): every later stage depends on it.
+(Step 9) and MCP (Step 10) return :class:`SearchResult` / :class:`Snippet` /
+:class:`OpenResult`. Keeping this shape fixed is ordering constraint #1 (arch §5):
+every later stage depends on it.
 
 Field provenance:
 * Qdrant payload per point — ``../Rag/reference/reference-metadata-schema.md`` (arch §7)
@@ -227,3 +228,23 @@ class SearchResult(_Base):
     snippets: list[Snippet] = Field(default_factory=list)
     total_tokens: int = 0
     truncated: bool = False  # True if budget_tokens forced dropping lower-ranked hits
+
+
+class OpenResult(_Base):
+    """The ``open`` response: one exact slice of a note, read straight from the vault.
+
+    The vault is the source of truth, so this is always at least as fresh as the index
+    the citation came from. ``line_start``/``line_end`` are 1-based inclusive (an empty
+    slice is the canonical ``1..0``); ``total_lines`` lets an agent page a long note
+    with ``lines=[start, end]`` follow-ups.
+    """
+
+    path: str
+    title: str | None = None
+    heading: str | None = None  # resolved heading text when a heading was requested
+    line_start: int
+    line_end: int
+    total_lines: int
+    text: str
+    tokens: int
+    truncated: bool = False  # hard safety cap hit — narrow with heading= or lines=

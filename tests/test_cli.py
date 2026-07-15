@@ -1,4 +1,4 @@
-"""CLI smoke tests: the app wires up, ``reindex`` (Step 8) and the ``mcp`` stub run."""
+"""CLI smoke tests: the app wires up; ``reindex`` (Step 8) and ``mcp`` (Step 10) fail cleanly."""
 
 from __future__ import annotations
 
@@ -86,7 +86,26 @@ def test_reindex_fails_gracefully_when_db_is_unopenable(tmp_path: Path) -> None:
     assert "reindex failed" in result.output.lower()
 
 
-def test_mcp_stub_runs() -> None:
-    result = runner.invoke(app, ["mcp"])
-    assert result.exit_code == 0
-    assert "not implemented" in result.output.lower()
+def test_mcp_fails_gracefully_when_vault_is_missing(tmp_path: Path) -> None:
+    """A misconfigured vault path (the common `claude mcp add` mistake) must exit 1 with a
+    message on stderr before ever binding stdio — not hang as a broken protocol server."""
+    result = runner.invoke(
+        app,
+        ["mcp", "--vault", str(tmp_path / "does-not-exist")],
+        env={"VAULTRAG_PROJECT_ID": "test"},
+    )
+    assert result.exit_code == 1
+    assert "mcp failed" in result.output.lower()
+
+
+def test_mcp_fails_gracefully_on_bad_embed_dims(tmp_path: Path) -> None:
+    """Misconfiguration (VAULTRAG_EMBED_DIMS <= 0) exits 1 cleanly, not a traceback."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    result = runner.invoke(
+        app,
+        ["mcp", "--vault", str(vault_dir)],
+        env={"VAULTRAG_PROJECT_ID": "test", "VAULTRAG_EMBED_DIMS": "0"},
+    )
+    assert result.exit_code == 1
+    assert "mcp failed" in result.output.lower()

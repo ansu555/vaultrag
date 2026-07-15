@@ -66,7 +66,7 @@ def search(
     )
 
     snippets = [_to_snippet(hit) for hit in hits]
-    packed, total_tokens, truncated = _pack_budget(snippets, budget_tokens)
+    packed, total_tokens, truncated = pack_budget(snippets, budget_tokens)
     return SearchResult(
         query=query,
         project_id=project_id,
@@ -98,11 +98,12 @@ def _as_str(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _pack_budget(
+def pack_budget(
     snippets: list[Snippet], budget_tokens: int
 ) -> tuple[list[Snippet], int, bool]:
     """Greedy best-first pack: hits already arrive RRF-ranked, so keep taking snippets in
-    that order until the next one would exceed ``budget_tokens``.
+    that order until the next one would exceed ``budget_tokens``. Returns
+    ``(kept, total_tokens, truncated)``.
 
     The top hit is always kept even if it alone exceeds the budget — an oversized best
     match beats an empty response, and a search that returns nothing because its single
@@ -110,6 +111,10 @@ def _pack_budget(
     ``truncated`` is True whenever a lower-ranked hit existed but didn't make the cut.
     Full compression (near-dupe drop, MMR, per-doc cap) is P1 (arch §13); P0 is this
     "simple truncation" per the plan.
+
+    Public because it is *the* budget-packing rule: the MCP layer re-packs compact-mode
+    previews with it so ``budget_tokens``/``truncated`` mean the same thing in every
+    search mode.
     """
     packed: list[Snippet] = []
     total = 0

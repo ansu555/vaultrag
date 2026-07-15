@@ -127,6 +127,34 @@ def _hash_file(abs_path: Path) -> str:
     return hasher.hexdigest()
 
 
+def exclusion_reason(
+    rel_path: str, *, ignore: PathSpec[GitIgnoreSpecPattern]
+) -> str | None:
+    """Why ``rel_path`` may not be indexed *or served*, or ``None`` if it is fair game.
+
+    The single source of truth for the path-level gates, so every consumer refuses the
+    same set: :func:`walk_vault` applies it while scanning, and the MCP ``open`` tool
+    applies it before serving raw note text — if the two ever diverged, ``open`` would
+    hand an agent exactly the files indexing withholds (CLAUDE.md §6). Content-level
+    gating (:func:`~vaultrag.indexer.secret_guard.scan_for_secrets` on the file text)
+    is the callers' second step — it needs the bytes, this needs only the path.
+
+    Order matters and mirrors the walk: a file under an always-pruned directory is
+    never even visited there; a secret filename is counted as secret-blocked even when
+    ``.ragignore`` would also drop it.
+    """
+    parts = rel_path.split("/")
+    if any(part in _ALWAYS_PRUNE_DIRS for part in parts[:-1]):
+        return "pruned-dir"
+    if is_secret_filename(rel_path):
+        return "secret-filename"
+    if ignore.match_file(rel_path):
+        return "ragignore"
+    if Path(rel_path).suffix.lower() not in _INDEXABLE_SUFFIXES:
+        return "unsupported"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Walk
 # ---------------------------------------------------------------------------
@@ -164,17 +192,21 @@ def walk_vault(
             rel = f"{rel_dir}/{fname}" if rel_dir else fname
             abs_path = Path(dirpath) / fname
 
-            # Secret filename guard first: non-overridable, and we want it counted
-            # even for paths .ragignore would also drop.
-            if is_secret_filename(rel):
+            # One shared gate for scan and serve (see exclusion_reason): the walk only
+            # translates each reason into its stats counter. "pruned-dir" cannot fire
+            # here (those directories were pruned above) but stays handled defensively.
+            reason = exclusion_reason(rel, ignore=spec)
+            if reason == "secret-filename":
                 secrets_blocked += 1
                 log.warning("scan.secret_blocked", path=rel, rule="filename")
                 continue
-            if spec.match_file(rel):
+            if reason == "ragignore":
                 ignored += 1
                 continue
-            if abs_path.suffix.lower() not in _INDEXABLE_SUFFIXES:
+            if reason == "unsupported":
                 unsupported += 1
+                continue
+            if reason is not None:
                 continue
 
             try:
