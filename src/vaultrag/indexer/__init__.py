@@ -2,8 +2,19 @@
 
 Step 3 (done): :mod:`~vaultrag.indexer.scan` walks the vault, hashes files, applies
 ``.ragignore`` + the built-in :mod:`~vaultrag.indexer.secret_guard`, and diffs against
-the ``documents`` manifest. Step 8 will add the reindex pipeline (parse → chunk → embed
-→ upsert) that consumes the :class:`~vaultrag.indexer.scan.ScanDiff`.
+the ``documents`` manifest. Step 8 (done): :mod:`~vaultrag.indexer.pipeline` consumes the
+:class:`~vaultrag.indexer.scan.ScanDiff` and drives parse → chunk → embed → upsert via
+:func:`~vaultrag.indexer.pipeline.reindex_vault`.
+
+``pipeline`` is deliberately **not** re-exported here (import it directly, e.g.
+``from vaultrag.indexer.pipeline import reindex_vault``): it depends on ``parsing``,
+``chunking``, ``embedding``, ``index`` and ``store``, while ``parsing.markdown`` depends
+back on this package's own :mod:`~vaultrag.indexer.secret_guard`. Eagerly importing
+``pipeline`` here would make that a real circular import (whichever of ``indexer``/
+``parsing`` loads first would fail); submodule-direct imports sidestep it since Python
+only needs this package's ``__init__`` to finish, not ``pipeline``, before
+``secret_guard`` is reachable.
+
 See ``../Rag/projects/vaultrag/p0-step-plan.md``.
 """
 

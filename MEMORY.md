@@ -9,12 +9,14 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 ## Current state
 
 - **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan)
-  + 4 (parsing) + 5 (chunking) + 6 (embedding) + 7 (Qdrant vector store) DONE.** Next up:
-  **Step 8 (wire the indexing pipeline — `vaultrag reindex`)**.
-- **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag --help`
-  lists `reindex` + `mcp` (both stubbed, log-and-exit); `ruff check .`, `mypy src` (29 files),
-  and `pytest` (137 tests: 4 CLI + 7 models + 13 store + 13 scan + 33 parsing + 15 chunking +
-  22 embedding + 30 index) are all green. Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
+  + 4 (parsing) + 5 (chunking) + 6 (embedding) + 7 (Qdrant vector store) + 8 (reindex
+  pipeline) DONE.** Next up: **Step 9 (hybrid retrieval read path, `retrieval/`)**.
+- **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag reindex`
+  builds a real index end-to-end (`--project`/`--vault` flags, env defaults otherwise);
+  `uv run vaultrag --help` lists `reindex` (live) + `mcp` (still stubbed); `ruff check .`,
+  `mypy src` (30 files), and `pytest` (144 tests: 4 CLI + 7 models + 13 store + 13 scan + 33
+  parsing + 15 chunking + 22 embedding + 30 index + 7 indexer-pipeline) are all green.
+  Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
   logging wired. `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block`
   / `Chunk` shape, the `Snippet`/`SearchResult` return contract, and deterministic
   `chunk_point_id` + `document_id`. `store/` has the `MetaStore` protocol + `SQLiteMetaStore`
@@ -49,29 +51,37 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   collection, named vectors `dense`(cosine, int8-quantized, on-disk originals, HNSW
   m=16/ef_construct=128) + sparse `bm25`(IDF modifier), payload indexes incl. `project_id`
   `is_tenant=true`; `ensure_collection`/`upsert_chunks`/`delete_by_doc`/`count`,
-  `from_settings`). `docker-compose.yml` ships the Qdrant service. Deps added: `blake3`,
-  `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`, `qdrant-client`, `fastembed`,
-  (`types-pyyaml` dev-only).
-- **What's next:** Step 8 — wire the indexing pipeline behind `vaultrag reindex`: scan (Step 3)
-  → `ScanDiff` → jobs (Step 2 `jobs` table, idempotent by `(project, path, hash)`) → per file
-  parse (Step 4) → chunk (Step 5) → `embed_chunks` (Step 6) → `store.upsert_document`/
-  `upsert_chunks` + `vs.upsert_chunks(chunks, vectors, embed_model=…, document=doc)` (Step 7).
-  Two traps the Step-7 shape hands Step 8: (1) **an update must `vs.delete_by_doc()` before
-  re-upserting** — upsert only overwrites the ids it writes, so a note edited *shorter* strands
-  its old tail points (they stay searchable forever); (2) **a rename re-embeds nothing but must
-  still move its points** — the point id is `uuid5(project, path, ix)`, so path-change ⇒ delete
-  at the old path + upsert at the new, with vectors served from the embed cache. Ref:
-  `../Rag/projects/vaultrag/ingestion-pipeline.md`, arch §4. Full 11-step plan:
-  `../Rag/projects/vaultrag/p0-step-plan.md`. Work in order; do not batch.
+  `from_settings`). `docker-compose.yml` ships the Qdrant service. `indexer/pipeline.py` is
+  the reindex orchestration (`reindex_vault`, `ReindexStats`): scans (Step 3) →
+  creates/updates get parsed (Step 4) → chunked (Step 5) → embedded via `embed_chunks`
+  (Step 6) → upserted to both stores (Step 7); renames are delete-at-old-path +
+  ingest-at-new-path; deletes remove the doc + its points. Every (re)ingest deletes a
+  document's existing chunks/points *before* writing fresh ones (no stranded tail on a
+  shrunk note), and a document's `hash` column commits *last*, after chunks+vectors are
+  fully upserted (a half-written doc keeps `hash=None`, which Step 3's `diff_manifest`
+  already treats as "needs reprocessing" — so a crash mid-ingest self-heals on the next
+  `reindex` instead of looking falsely done). One `jobs` row per changed path
+  (`enqueue_job`/`set_job_state`); a bad file is parked `dead` and logged, never aborts the
+  rest of the run — retry/backoff is explicitly left to the *live-watch* trigger (watchdog,
+  P1), which doesn't exist yet; this is the boot-reconcile/manual trigger, run serially.
+  `cli.py`'s `reindex` command wires `Settings` → `SQLiteMetaStore`/`QdrantVectorStore`/
+  `OllamaEmbedder` `.from_settings(...)` → `reindex_vault`, prints a one-line summary, exits
+  1 on `VectorStoreError`/`EmbeddingError`/`OSError` or if any file failed. Deps added:
+  `blake3`, `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`, `qdrant-client`,
+  `fastembed`, (`types-pyyaml` dev-only).
+- **What's next:** Step 9 — hybrid retrieval read path (`retrieval/`): embed query (dense,
+  Step 6's `QueryEmbedder`) + BM25 sparse (Step 7's `Bm25Embedder.embed_query`) → Qdrant
+  Query API prefetch dense k=100 + sparse k=100 **with filters inside both branches** → RRF
+  fuse → top-k → build cited `Snippet`/`SearchResult` (Step 1's contract) using the
+  payload's `text` (the Step 7 divergence — see open questions) → inject `project_id`
+  server-side (a client filter can only narrow) → honor `budget_tokens` (simple truncation
+  for P0). Ref: `../Rag/projects/vaultrag/hybrid-search.md`,
+  `../Rag/projects/vaultrag/retrieval-pipeline.md`, arch §9/§11. Rerank/parent-swap/graph
+  are explicitly P1+, not P0. Full 11-step plan: `../Rag/projects/vaultrag/p0-step-plan.md`.
+  Work in order; do not batch.
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
   `CLAUDE.md` §1.
 - **Open questions / blockers:**
-  - **Docker is not installed on this box** (`docker`/`podman`/`colima` all absent; no brew
-    formula for `qdrant`). Step 7's code is verified against qdrant-client's local mode +
-    live Ollama, but **no real Qdrant server has ever run** — see the Step 7 entry for exactly
-    what that leaves unproven. Anik: install Docker Desktop (or OrbStack/colima), then
-    `docker compose up -d qdrant`. Step 8 can be written without it; Step 9 (hybrid retrieval)
-    genuinely needs it, since local mode's fusion/IDF scoring is not the engine's.
   - `search`/`open` response JSON shapes are unspecified in
     `../Rag/reference/reference-mcp-tools.md` (params only) — author the cited-snippet contract
     at Step 1 / Step 10, promote to `reference/` if it hardens.
@@ -96,6 +106,150 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-15 — P0 Step 8: wire the indexing pipeline (`indexer/pipeline.py`, `vaultrag reindex`)
+- **Did:** Completed Step 8. Added `indexer/pipeline.py`: `reindex_vault(project_id, vault_path,
+  store, vector_store, embedder) -> ReindexStats` — registers the project, `ensure_collection()`,
+  scans (Step 3) against `store.document_manifest(project)`, then for each create/update: parse
+  (Step 4) → chunk (Step 5) → `embed_chunks` (Step 6) → delete the doc's existing chunks/points →
+  reserve the document row (`hash=None`) → upsert fresh points + chunk rows → commit the real
+  hash last. Renames are delete-at-`old_path` + ingest-at-`new_path` (the point id embeds the
+  path, so a hash match at a new path can't be a metadata-only move here). Deletes remove the doc
+  + its points. Every changed path gets one `jobs` row (`enqueue_job`/`set_job_state`); an
+  exception during one file's ingest parks its job `dead`, logs, and lets the rest of the run
+  continue — one bad note can't abort a whole-vault reindex. Wired `cli.py`'s `reindex` command:
+  builds `SQLiteMetaStore`/`QdrantVectorStore`/`OllamaEmbedder` via `.from_settings(...)`, calls
+  `reindex_vault`, prints a one-line stats summary, exits 1 on `VectorStoreError`/
+  `EmbeddingError`/`OSError` or any per-file failure, closes all three clients in `finally`.
+- **Why:** Step 8 of `../Rag/projects/vaultrag/p0-step-plan.md`
+  (`../Rag/projects/vaultrag/ingestion-pipeline.md`, arch §4) — the orchestration that turns every
+  prior stage (Steps 3-7, each independently built and tested) into the one thing P0 actually
+  ships: a working `vaultrag reindex`.
+- **Files:** `src/vaultrag/indexer/pipeline.py` (new), `src/vaultrag/indexer/__init__.py`
+  (docstring only — see decision 3, `pipeline` is deliberately *not* re-exported), `src/vaultrag/cli.py`
+  (`reindex` command wired), `tests/test_indexer_pipeline.py` (new, 7 tests), `tests/test_cli.py`
+  (replaced the Step-8 stub test with a hermetic "services down → clean exit 1" test), `MEMORY.md`.
+- **Decisions (impl-level, consistent with the vault — no write-back needed):**
+  (1) **A document's `hash` column commits last, after its chunks and vectors are fully
+  upserted; every step before that reserves the row with `hash=None`.** This is what makes a
+  crash mid-ingest safe: Step 3's `diff_manifest` already treats "present in manifest with a
+  NULL hash" as an update (a comment written at Step 3, before Step 8 existed, that turned out to
+  describe exactly this case) — so a half-written doc looks like it still needs reprocessing on
+  the next `reindex`, instead of falsely looking done because its old hash (or a prematurely
+  written new one) happened to match disk. Locked in by
+  `test_partial_failure_reserves_hash_none_and_retries_next_run` (a `FlakyVectorStore` fails the
+  first `upsert_chunks`, asserts `hash is None` after, then succeeds and commits on the next run).
+  (2) **Every (re)ingest deletes a document's existing chunks/points before writing the new
+  ones — for both stores, not just Qdrant.** The Step 7 handoff flagged this trap for the vector
+  store (chunk/point ids are `uuid5(project, path, ix)`; upsert only overwrites the ids it
+  writes, so a note edited *shorter* strands its old tail forever). The same trap exists in
+  SQLite's `chunks` table via the identical id scheme — missed on first read-through, caught by
+  writing `test_edit_shrinks_chunks_and_old_tail_is_not_stranded` before checking `store.get_chunk`
+  on the stale id, not just `vector_store.count()`. (3) **`vaultrag.indexer.pipeline` is not
+  re-exported from `indexer/__init__.py`.** First draft added `from vaultrag.indexer.pipeline
+  import reindex_vault` to `__init__.py` for a tidy public surface, which created a real circular
+  import: `pipeline` needs `parsing.markdown`, and `parsing.markdown` needs
+  `indexer.secret_guard` — fine on its own, but importing any submodule of `indexer` always runs
+  `indexer/__init__.py` first, so whichever of `vaultrag.parsing` / `vaultrag.indexer` a test
+  happened to import first would fail (`tests/test_chunking.py`'s collection did, reproducibly).
+  Fixed by leaving `__init__.py` exporting only `scan`/`secret_guard` as before and having callers
+  `from vaultrag.indexer.pipeline import reindex_vault` directly (already how `cli.py` needed it).
+  (4) **Renames are re-parsed, not fast-pathed as metadata-only**, even though content is
+  unchanged (hash match). The ingestion-pipeline note's "rename = metadata-only, vectors
+  untouched" describes a different id scheme than this repo actually built at Step 1/7
+  (`uuid5(project, path, ix)` — path is part of the id), so a rename here necessarily gets new
+  chunk/point ids; treating it as delete-old + ingest-new is what actually satisfies "re-embeds
+  nothing" (the embed cache keys on body-hash, not path) while still being correct for the id
+  scheme in hand. Confirms the trap #2 framing from the Step 7 handoff was right, just clarifies
+  *why* a true metadata-only path isn't available. (5) **Retry/backoff is not implemented for
+  this trigger.** `ingestion-pipeline.md` describes retries/backoff for the *live-watch* job
+  runner (trigger #2, watchdog — P1, doesn't exist yet); `vaultrag reindex` is the boot-reconcile/
+  manual trigger (#1/#3), which the same note describes only as "walk, diff, enqueue" — so a
+  failed file is parked `dead` and picked up again whenever `reindex` next runs (naturally, since
+  its hash still won't match disk), rather than building an in-process retry loop with sleep
+  timers that nothing here can meaningfully test or that P1's real worker pool will duplicate.
+- **Verify (Step 8 gate, all green):** `uv run pytest` **144 passed** (4 CLI + 7 models + 13
+  store + 13 scan + 33 parsing + 15 chunking + 22 embedding + 30 index + 7 indexer-pipeline);
+  `uv run ruff check .` clean; `uv run mypy src` clean (30 files). New tests run a real
+  `SQLiteMetaStore` on a tmp-dir db against `QdrantClient(":memory:")` + a fake sparse encoder
+  (Step 7 pattern) + a call-counting fake `Embedder` (Step 6 pattern), covering every plan
+  criterion: full reindex creates docs+points; **re-run makes zero embedder calls and zero
+  dupes** (nothing in the diff at all, since unchanged paths are skipped outright); delete a note
+  → its doc row + points gone, other docs untouched; **edit a note shorter → its stale tail chunk
+  row and vector point are both gone**, not just the live one; **rename → points move (count
+  unchanged) with zero new embedder calls**, old path's doc/chunks gone, new path indexed; one
+  bad file (embedder raises) doesn't stop a good file in the same run, and the bad file's document
+  row was never even created; a vector-store failure mid-ingest leaves `hash=None` and is cleanly
+  retried (and this time succeeds) on the next `reindex_vault` call.
+- **Live-integration: VERIFIED.** Both `docker compose`'s `qdrant` and Ollama's
+  `qwen3-embedding:0.6b` were already up from the Step 7 session. Ran `uv run vaultrag reindex`
+  against a real throwaway fixture vault (scratchpad, never the design vault) with
+  `VAULTRAG_PROJECT_ID=step8-live-verify` and `VAULTRAG_QDRANT_COLLECTION=chunks_live_verify_step8`
+  (an isolated collection, dropped afterward — the real `chunks` collection was never touched):
+  create (1 note, real Ollama embed, real Qdrant upsert, full 20-key payload incl. `text`
+  confirmed via a real `scroll`) → re-run (0 new HTTP calls to either service, confirmed by
+  grepping the run's own request log) → **grow to 3 chunks then shrink to 1 → real point count
+  goes 3 → 1** (trap #1 confirmed against the real server, not just `:memory:`) → **rename → 0
+  `POST /api/embed` calls, point count unchanged** (trap #2 confirmed live) → delete → count 0.
+  Every stage of the CLI's actual wiring (`Settings` → real `SQLiteMetaStore`/
+  `QdrantVectorStore`/`OllamaEmbedder` → `reindex_vault`) ran exactly as unit-tested, against the
+  real services, not fakes.
+- **Next / handoff:** Start **Step 9 — hybrid retrieval read path (`retrieval/`)**, per **Current
+  state → What's next** above. `search`/`open`'s response shape (`Snippet`/`SearchResult`,
+  authored at Step 1) is the target; the payload's `text` field (Step 7's flagged divergence,
+  still pending Anik's ratification — `../Rag/agent-inbox/payload-carries-chunk-text.md`) is what
+  Step 9 will actually read to build snippet bodies. Nothing new committed this session (still on
+  `main`; branch + `agent(claude-code): …` commit when Anik asks).
+
+### 2026-07-15 — Step 7 live-integration gap closed: real Qdrant server + real Ollama
+- **Did:** Anik installed Docker and Ollama on this box (a different machine than the prior
+  session — `uv` itself was also missing here; installed via `pipx install uv`, then
+  `uv sync` reproduced the exact same 137-pass/ruff-clean/mypy-clean gate). Started
+  `docker compose up -d qdrant` (healthy, Qdrant 1.18.2 on `127.0.0.1:6333`) and
+  `ollama pull qwen3-embedding:0.6b` (639 MB). Wrote a throwaway script (not committed —
+  scratchpad only) that runs the same real-note pipeline the prior session ran against
+  qdrant-client's local mode, but this time against the **real server**, into an isolated
+  `chunks_live_verify` collection (never touches the real `chunks` collection), then deletes
+  it after. Every check the prior session flagged as unprovable **passed**:
+  - `HnswConfigDiff(m=16, ef_construct=128)` — read back from `get_collection()`, actually
+    applied server-side (local mode silently accepts and ignores this).
+  - int8 scalar quantization (`always_ram=True`) and `on_disk=True` originals — both applied,
+    not just accepted.
+  - Sparse `bm25` vector's IDF `Modifier` — present in the real collection config.
+  - **Payload indexes are real, not no-ops** (local mode literally warns "Payload indexes
+    have no effect in the local Qdrant" — this was the crux of what was unverified):
+    `get_collection().payload_schema` on the real server lists all five
+    (`project_id`, `tags`, `path`, `type`, `modified_ts`), and `project_id`'s `data_type`
+    reads back as `keyword` (the tenant index is real).
+  - **A real hybrid RRF query** (`client.query_points` with dense `Prefetch` + sparse
+    `Prefetch` + `FusionQuery(fusion=Fusion.RRF)`, filtered by `project_id`) returns hits, and
+    the top hit is the exact chunk queried verbatim — proof the IDF/RRF scoring is the
+    engine's own, not something local mode fakes. (This is a hand-rolled query for
+    verification only — Step 9 owns the real hybrid-query implementation.)
+  - `ensure_collection` → `upsert_chunks` (2 real points, 1024-d Ollama vectors, real FastEmbed
+    BM25) → `count()`/`count(project_id)` = 2 → re-upsert idempotent (still 2, no dupes) →
+    `delete_by_doc` → 0, all against the real server.
+- **Why:** Step 7 was code-complete and unit-tested but had an explicit, named gap: "no real
+  Qdrant server has ever run" (see the Step 7 entry below). That gap is what CLAUDE.md §6's
+  quality-gate spirit exists to close before trusting Step 9 (hybrid retrieval) on top of it —
+  local mode's fusion/IDF scoring is admittedly not the real engine's, so nothing built on top
+  of it was trustworthy until checked against the real thing.
+- **Files:** `MEMORY.md` only. No `src/` changes — Step 7's code was already correct; this
+  session only ran it against infrastructure that didn't exist before. The verification script
+  lived in the session scratchpad, not the repo (it's a one-off probe, not a test — the
+  project's actual test suite intentionally stays hermetic per the Step 7 entry's own
+  reasoning: unit tests must not require a live Qdrant).
+- **Left running:** `docker-compose.yml`'s `qdrant` service (`restart: unless-stopped`) is up
+  and will persist; `qwen3-embedding:0.6b` is pulled in Ollama. Both are now real
+  prerequisites Step 8/Step 9 work can assume are available on this box.
+- **Next / handoff:** **Step 7 is now fully closed — no remaining unverified claims.** Start
+  **Step 8 — wire the indexing pipeline (`vaultrag reindex`)** per the existing "What's next"
+  note above (the two traps: delete-before-re-upsert on update, move-points-on-rename). Nothing
+  new committed this session (still on `main`, working tree otherwise clean — commit when
+  Anik asks). One environment note for whichever machine runs next: if `uv` is missing,
+  `pipx install uv` then `uv sync` reproduces the toolchain from `pyproject.toml`/`uv.lock`
+  exactly (confirmed byte-for-byte same test count/lint result on this box as the log's prior
+  entries).
 
 ### 2026-07-15 — P0 Step 7: Qdrant vector store (`index/`)
 - **Did:** Completed Step 7. Added `index/base.py` (`VectorStore` protocol —
