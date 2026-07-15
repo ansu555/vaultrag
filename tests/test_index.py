@@ -419,6 +419,21 @@ def test_select_frontmatter_keeps_filterable_values_only() -> None:
     assert kept == {"status": "active", "priority": 3, "done": False, "tags": ["a", "b"]}
 
 
+def test_select_frontmatter_drops_non_flat_lists() -> None:
+    """ "Flat list of scalars" means flat: a nested list is structure no filter can match,
+    exactly like the dict case, and carrying it just bloats every point in the note."""
+    kept = select_frontmatter(
+        {
+            "matrix": [[1, 2], [3]],
+            "objects": [{"a": 1}],
+            "mixed": ["ok", ["nope"]],
+            "essays": ["x" * 1000],  # per-element length rules apply inside lists too
+            "tags": ["a", "b"],
+        }
+    )
+    assert kept == {"tags": ["a", "b"]}
+
+
 # ---------------------------------------------------------------------------
 # Hybrid query — the Step 9 read path (retrieval/ builds Snippets on top of this)
 # ---------------------------------------------------------------------------
@@ -442,9 +457,7 @@ def _seed_query_fixture(store: QdrantVectorStore) -> dict[str, Chunk]:
         bm25_match.chunk_hash: [0.0, 1.0, 0.0, 0.0],
         irrelevant.chunk_hash: [0.0, 0.0, 1.0, 0.0],
     }
-    store.upsert_chunks(
-        [dense_match, bm25_match, irrelevant], vectors, embed_model="fake-model"
-    )
+    store.upsert_chunks([dense_match, bm25_match, irrelevant], vectors, embed_model="fake-model")
     return {"dense_match": dense_match, "bm25_match": bm25_match, "irrelevant": irrelevant}
 
 

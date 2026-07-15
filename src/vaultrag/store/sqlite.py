@@ -183,9 +183,7 @@ class SQLiteMetaStore:
             )
 
     def get_project(self, project_id: str) -> ProjectRow | None:
-        row = self._conn.execute(
-            "SELECT * FROM projects WHERE id = ?", (project_id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if row is None:
             return None
         return ProjectRow(
@@ -309,9 +307,7 @@ class SQLiteMetaStore:
         return {row["id"]: row["hash"] for row in rows}
 
     def get_chunk(self, chunk_id: str) -> ChunkRow | None:
-        row = self._conn.execute(
-            "SELECT * FROM chunks WHERE id = ?", (chunk_id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
         if row is None:
             return None
         return ChunkRow(

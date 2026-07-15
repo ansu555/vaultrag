@@ -68,8 +68,13 @@ class QueryEmbedder:
     The query path embeds one string at a time and repeats popular queries; an LRU keyed
     on the query text avoids re-hitting the model. The cache stores an immutable tuple and
     every call returns a fresh list, so a caller mutating the result can't corrupt the
-    cache. Not thread-safe by construction — front it with the same worker-thread offload
-    the async query path already uses (CLAUDE.md §5).
+    cache.
+
+    Safe to share across threads (the MCP server calls it from FastMCP's worker-thread
+    pool): ``lru_cache`` locks its own bookkeeping, and the only race left is two threads
+    missing on the same query at once, which costs one duplicate model call and stores an
+    identical vector. Nothing to guard — a lock here would serialize every query embed to
+    prevent a harmless repeat.
     """
 
     def __init__(self, embedder: Embedder, *, maxsize: int = 256) -> None:

@@ -11,137 +11,29 @@ flowing from settings, filter parsing, compact mode, and ``open``'s vault gates)
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+import dataclasses
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
+from tests.fakes import (
+    PROJECT,
+    DownVectorStore,
+    FakeEmbedder,
+    FakeSparse,
+    FakeVectorStore,
+    make_hit,
+)
 from vaultrag.chunking.tokens import count_tokens
 from vaultrag.embedding.cache import QueryEmbedder
-from vaultrag.index.base import ScoredChunk, SearchFilters, SparseVector, VectorStoreError
+from vaultrag.index.base import ScoredChunk, SearchFilters
+from vaultrag.indexer.scan import ExclusionReason
 from vaultrag.mcp import build_mcp_server
-from vaultrag.mcp.server import _apply_cap
-from vaultrag.models import Chunk, Document
-
-PROJECT = "vaultrag-design"
-
-
-# ---------------------------------------------------------------------------
-# Test doubles (mirrors test_retrieval.py)
-# ---------------------------------------------------------------------------
-class FakeEmbedder:
-    def __init__(self, *, dims: int = 4) -> None:
-        self._dims = dims
-        self.calls = 0
-
-    @property
-    def model(self) -> str:
-        return "fake-model"
-
-    @property
-    def dims(self) -> int:
-        return self._dims
-
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        self.calls += 1
-        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
-
-
-class FakeSparse:
-    def __init__(self) -> None:
-        self.queries: list[str] = []
-
-    @property
-    def model(self) -> str:
-        return "fake-bm25"
-
-    def embed_documents(self, texts: Sequence[str]) -> list[SparseVector]:
-        return [SparseVector(indices=[], values=[]) for _ in texts]
-
-    def embed_query(self, text: str) -> SparseVector:
-        self.queries.append(text)
-        return SparseVector(indices=[1], values=[1.0])
-
-
-class FakeVectorStore:
-    def __init__(self, hits: Sequence[ScoredChunk] = ()) -> None:
-        self._hits = list(hits)
-        self.calls: list[dict[str, object]] = []
-
-    def ensure_collection(self) -> None:
-        raise NotImplementedError
-
-    def upsert_chunks(
-        self,
-        chunks: Sequence[Chunk],
-        vectors: Mapping[str, list[float]],
-        *,
-        embed_model: str,
-        document: Document | None = None,
-    ) -> int:
-        raise NotImplementedError
-
-    def delete_by_doc(self, project_id: str, doc_id: str) -> None:
-        raise NotImplementedError
-
-    def query(
-        self,
-        *,
-        project_id: str,
-        dense: list[float],
-        sparse: SparseVector,
-        limit: int,
-        prefetch_limit: int = 100,
-        filters: SearchFilters | None = None,
-    ) -> list[ScoredChunk]:
-        self.calls.append(
-            {
-                "project_id": project_id,
-                "limit": limit,
-                "prefetch_limit": prefetch_limit,
-                "filters": filters,
-            }
-        )
-        return self._hits
-
-    def count(self, project_id: str | None = None) -> int:
-        raise NotImplementedError
-
-    def close(self) -> None:
-        pass
-
-
-class DownVectorStore(FakeVectorStore):
-    """Simulates Qdrant being unreachable at query time."""
-
-    def query(self, **kwargs: object) -> list[ScoredChunk]:  # type: ignore[override]
-        raise VectorStoreError("cannot reach Qdrant (is it running? `docker compose up -d qdrant`)")
-
-
-def make_hit(
-    *,
-    point_id: str = "point-1",
-    score: float = 1.0,
-    text: str = "Dense catches paraphrase; BM25 catches exact tokens.",
-    tokens: int = 10,
-) -> ScoredChunk:
-    return ScoredChunk(
-        point_id=point_id,
-        score=score,
-        payload={
-            "path": "projects/vaultrag/hybrid-search.md",
-            "title": "Hybrid Search Details",
-            "heading_path": ["Design"],
-            "anchor": "Design",
-            "text": text,
-            "tokens": tokens,
-            "doc_id": "doc-1",
-        },
-    )
-
+from vaultrag.mcp.server import _EXCLUSION_MESSAGES, SearchFiltersParam, _apply_cap
 
 # ---------------------------------------------------------------------------
 # Harness
@@ -187,6 +79,12 @@ def vault(tmp_path: Path) -> Path:
         "# Oops\n\nkey is AKIAABCDEFGHIJKLMNOP somewhere\n", encoding="utf-8"
     )
     (root / "data.canvas").write_text("{}", encoding="utf-8")
+    # Markdown living inside dirs the walk always prunes: real files, real .md, and the
+    # index has never heard of them — `open` must not be the way in.
+    (root / ".trash").mkdir()
+    (root / ".trash" / "deleted.md").write_text("# Deleted secret plans\n", encoding="utf-8")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "README.md").write_text("# Vendored\n", encoding="utf-8")
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "external.md").write_text("# Not yours\n", encoding="utf-8")
@@ -251,7 +149,7 @@ def test_search_returns_cited_snippets(vault: Path) -> None:
     assert result["project_id"] == PROJECT
     snippet = result["snippets"][0]
     assert snippet["path"] == "projects/vaultrag/hybrid-search.md"
-    assert snippet["anchor"] == "Design"
+    assert snippet["anchor"] == "design"
     assert snippet["text"].startswith("Dense catches")
     assert snippet["score"] == 1.0
 
@@ -308,9 +206,7 @@ def test_search_parses_filters_into_search_filters(vault: Path) -> None:
         "search",
         {"query": "q", "filters": {"tags": ["component/qdrant"], "modified_after": 5}},
     )
-    assert store.calls[0]["filters"] == SearchFilters(
-        tags=("component/qdrant",), modified_after=5
-    )
+    assert store.calls[0]["filters"] == SearchFilters(tags=("component/qdrant",), modified_after=5)
 
 
 def test_search_rejects_unknown_filter_keys(vault: Path) -> None:
@@ -318,6 +214,20 @@ def test_search_rejects_unknown_filter_keys(vault: Path) -> None:
     server, store, _, _ = build(vault)
     call_expecting_error(server, "search", {"query": "q", "filters": {"project_id": "other"}})
     assert store.calls == []
+
+
+def test_filter_param_exposes_every_narrowing_filter_and_no_widening_one() -> None:
+    """Tripwire on the MCP-boundary twin of SearchFilters.
+
+    The twin exists to hold model-facing descriptions and `extra="forbid"`, but a
+    duplicated field list rots silently in both directions: a filter added to the engine
+    would become unreachable over MCP, and a `project` field appearing here would hand
+    clients the tenancy switch the whole scoping design withholds (CLAUDE.md §6).
+    """
+    engine = {f.name for f in dataclasses.fields(SearchFilters)}
+    exposed = set(SearchFiltersParam.model_fields)
+    assert exposed == engine
+    assert "project" not in exposed and "project_id" not in exposed
 
 
 def test_search_rejects_out_of_range_k(vault: Path) -> None:
@@ -334,6 +244,36 @@ def test_search_compact_mode_returns_one_line_previews(vault: Path) -> None:
     assert snippet["text"] == "First line of the chunk body."
     assert snippet["tokens"] == count_tokens("First line of the chunk body.")
     assert result["total_tokens"] == snippet["tokens"]
+
+
+def test_search_compact_mode_budgets_the_previews_not_the_full_texts(vault: Path) -> None:
+    """Compact must budget what it *returns*. Hits whose full text blows the budget but
+    whose one-liner fits are the entire point of the mode: budgeting the full texts
+    first would drop them before compaction and hand back one preview for a k=10 browse.
+    """
+    hits = [
+        make_hit(point_id=f"p{i}", score=1.0 - i / 10, text="Short line.\n\nrest", tokens=500)
+        for i in range(5)
+    ]
+    server, _, _, _ = build(vault, hits=hits, default_budget_tokens=50)
+    result = call(server, "search", {"query": "q", "mode": "compact"})
+    assert [s["chunk_id"] for s in result["snippets"]] == ["p0", "p1", "p2", "p3", "p4"]
+    assert result["total_tokens"] == 5 * count_tokens("Short line.")
+    assert result["truncated"] is False
+
+
+def test_search_compact_mode_still_honors_the_budget(vault: Path) -> None:
+    """...but the budget is real: enough previews still truncate.
+
+    Previews are capped at _COMPACT_LINE_CHARS (160 → ~40 tokens each), so a 100-token
+    budget fits two of them and drops the rest.
+    """
+    hits = [make_hit(point_id=f"p{i}", score=1.0 - i / 10, text="x" * 400) for i in range(5)]
+    server, _, _, _ = build(vault, hits=hits, default_budget_tokens=100)
+    result = call(server, "search", {"query": "q", "mode": "compact"})
+    assert [s["chunk_id"] for s in result["snippets"]] == ["p0", "p1"]
+    assert result["total_tokens"] <= 100
+    assert result["truncated"] is True
 
 
 def test_search_rejects_unknown_mode(vault: Path) -> None:
@@ -370,6 +310,21 @@ def test_open_whole_note(vault: Path) -> None:
     assert result["truncated"] is False
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        {},
+        {"lines": [1, 5]},
+        {"heading": "Setup"},
+    ],
+    ids=["whole", "lines", "heading"],
+)
+def test_open_reports_the_note_title_in_every_mode(vault: Path, args: dict[str, Any]) -> None:
+    """`title` describes the note, not the slice — which slice was asked for is irrelevant."""
+    result = call(build(vault)[0], "open", {"path": "notes/guide.md", **args})
+    assert result["title"] == "Guide"
+
+
 def test_open_heading_returns_exactly_that_section(vault: Path) -> None:
     server, _, _, _ = build(vault)
     result = call(server, "open", {"path": "notes/guide.md", "heading": "Setup"})
@@ -386,14 +341,17 @@ def test_open_heading_returns_exactly_that_section(vault: Path) -> None:
     assert "Call search first." not in result["text"]  # next sibling excluded
 
 
-def test_open_heading_match_is_case_insensitive_and_sluggy(vault: Path) -> None:
-    server, _, _, _ = build(vault)
-    assert call(server, "open", {"path": "notes/guide.md", "heading": "setup"})[
-        "heading"
-    ] == "Setup"
-    assert call(server, "open", {"path": "notes/guide.md", "heading": "quick-start"})[
-        "heading"
-    ] == "Quick Start"
+@pytest.mark.parametrize(
+    "given", ["Quick Start", "quick start", "quick-start", "Quick_Start", "  quick start  "]
+)
+def test_open_heading_match_is_forgiving(vault: Path, given: str) -> None:
+    """Agents pass anchors in every one of these forms; all normalize to one key.
+
+    ``Quick_Start`` is the case a ``\\W+``-only fold gets wrong — ``_`` is a word
+    character, so it would survive and never match the space in 'Quick Start'.
+    """
+    result = call(build(vault)[0], "open", {"path": "notes/guide.md", "heading": given})
+    assert result["heading"] == "Quick Start"
 
 
 def test_open_heading_inside_code_fence_is_not_a_heading(vault: Path) -> None:
@@ -466,9 +424,7 @@ def test_apply_cap_always_keeps_the_first_line() -> None:
 # open — the vault gates (CLAUDE.md §6: open must refuse what indexing refuses)
 # ---------------------------------------------------------------------------
 def test_open_blocks_path_traversal(vault: Path) -> None:
-    message = call_expecting_error(
-        build(vault)[0], "open", {"path": "../outside/external.md"}
-    )
+    message = call_expecting_error(build(vault)[0], "open", {"path": "../outside/external.md"})
     assert "escapes the vault" in message
 
 
@@ -504,3 +460,27 @@ def test_open_blocks_ragignored_paths(vault: Path) -> None:
 def test_open_blocks_non_markdown(vault: Path) -> None:
     message = call_expecting_error(build(vault)[0], "open", {"path": "data.canvas"})
     assert "markdown" in message
+
+
+@pytest.mark.parametrize(
+    "path", [".trash/deleted.md", "node_modules/pkg/README.md", ".obsidian/workspace.md"]
+)
+def test_open_blocks_always_pruned_dirs(vault: Path, path: str) -> None:
+    """`open` refuses what the walk prunes — otherwise it is a hole around the scanner.
+
+    These are markdown files that pass every *other* gate (inside the vault, not
+    .ragignored, no secret in the name), so nothing but the prune rule stops them being
+    served — and the index has never seen them, which is exactly why an agent must not
+    reach them through the tool that reads the vault directly.
+    """
+    message = call_expecting_error(build(vault)[0], "open", {"path": path})
+    assert "never scans" in message
+
+
+def test_open_has_a_refusal_message_for_every_indexer_gate() -> None:
+    """Tripwire: every gate `exclusion_reason` can return has a refusal message.
+
+    A gate added to the scanner without a message here would KeyError in front of an
+    agent instead of refusing cleanly, so the two must move together.
+    """
+    assert set(get_args(ExclusionReason)) == set(_EXCLUSION_MESSAGES)

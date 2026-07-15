@@ -37,14 +37,18 @@ _MAX_FRONTMATTER_STR = 512
 _SCALARS = (str, int, float, bool)
 
 
-def _keep_frontmatter_value(value: Any) -> bool:
+def _keep_scalar(value: Any) -> bool:
     if isinstance(value, str):
         return len(value) <= _MAX_FRONTMATTER_STR
-    if isinstance(value, _SCALARS) or value is None:
-        return True
+    return isinstance(value, _SCALARS) or value is None
+
+
+def _keep_frontmatter_value(value: Any) -> bool:
     if isinstance(value, list):
-        return all(_keep_frontmatter_value(v) for v in value)
-    return False
+        # Flat only — deliberately not recursive: a nested list is structure no Qdrant
+        # filter can match on, which is exactly what these rules exist to keep off points.
+        return all(_keep_scalar(v) for v in value)
+    return _keep_scalar(value)
 
 
 def select_frontmatter(frontmatter: dict[str, Any]) -> dict[str, Any]:

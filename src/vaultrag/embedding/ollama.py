@@ -162,7 +162,6 @@ def _extract_embeddings(resp: httpx.Response, *, expected: int, model: str) -> l
         )
     if len(embeddings) != expected:
         raise EmbeddingError(
-            f"Ollama returned {len(embeddings)} embeddings for {expected} inputs "
-            f"(model {model!r})"
+            f"Ollama returned {len(embeddings)} embeddings for {expected} inputs (model {model!r})"
         )
     return embeddings

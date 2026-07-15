@@ -98,9 +98,7 @@ def _as_str(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def pack_budget(
-    snippets: list[Snippet], budget_tokens: int
-) -> tuple[list[Snippet], int, bool]:
+def pack_budget(snippets: list[Snippet], budget_tokens: int) -> tuple[list[Snippet], int, bool]:
     """Greedy best-first pack: hits already arrive RRF-ranked, so keep taking snippets in
     that order until the next one would exceed ``budget_tokens``. Returns
     ``(kept, total_tokens, truncated)``.

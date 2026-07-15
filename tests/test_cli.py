@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+import pytest
+from fastmcp import FastMCP
 from typer.testing import CliRunner
 
 from vaultrag import __version__
 from vaultrag.cli import app
+from vaultrag.embedding.ollama import OllamaEmbedder
+from vaultrag.index.qdrant import QdrantVectorStore
 
 runner = CliRunner()
 
@@ -109,3 +114,37 @@ def test_mcp_fails_gracefully_on_bad_embed_dims(tmp_path: Path) -> None:
     )
     assert result.exit_code == 1
     assert "mcp failed" in result.output.lower()
+
+
+def test_mcp_composes_a_stdio_server_and_closes_its_clients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The composition root's contract, with `run()` stubbed so nothing binds stdio.
+
+    Pins the two properties that break the protocol silently rather than loudly:
+    `transport="stdio"` and `show_banner=False` (a banner would print to stdout — the
+    JSON-RPC channel — and corrupt the stream). Also pins that both clients get closed,
+    since the `finally` is the only thing preventing a leaked httpx/Qdrant connection.
+    """
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    captured: dict[str, Any] = {}
+    closed: list[str] = []
+
+    def fake_run(self: FastMCP, **kwargs: Any) -> None:
+        captured["name"] = self.name
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(FastMCP, "run", fake_run)
+    monkeypatch.setattr(QdrantVectorStore, "close", lambda self: closed.append("qdrant"))
+    monkeypatch.setattr(OllamaEmbedder, "close", lambda self: closed.append("ollama"))
+
+    result = runner.invoke(
+        app,
+        ["mcp", "--project", "test-proj", "--vault", str(vault_dir)],
+        # A port nothing listens on: construction must not need a live service.
+        env={"VAULTRAG_QDRANT_URL": "http://127.0.0.1:1"},
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["kwargs"] == {"transport": "stdio", "show_banner": False}
+    assert sorted(closed) == ["ollama", "qdrant"]

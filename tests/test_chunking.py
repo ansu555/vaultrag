@@ -57,9 +57,7 @@ def test_root_level_content_before_any_heading_has_no_anchor() -> None:
 def test_heading_with_no_direct_content_contributes_no_standalone_chunk() -> None:
     # "Overview" has nothing directly under it before "Details" -- it should only
     # appear as an ancestor in the descendant's heading_path, not its own chunk.
-    chunks = _chunks(
-        "n.md", "# Overview\n\n## Details\n\nSome content under Details.\n"
-    )
+    chunks = _chunks("n.md", "# Overview\n\n## Details\n\nSome content under Details.\n")
     assert len(chunks) == 1
     assert chunks[0].heading_path == ["Overview", "Details"]
 
@@ -165,9 +163,7 @@ def test_chunk_hash_is_stable_across_reruns() -> None:
     first = _chunks("n.md", raw)
     second = _chunks("n.md", raw)
     assert [c.chunk_hash for c in first] == [c.chunk_hash for c in second]
-    assert [c.model_dump(mode="json") for c in first] == [
-        c.model_dump(mode="json") for c in second
-    ]
+    assert [c.model_dump(mode="json") for c in first] == [c.model_dump(mode="json") for c in second]
 
 
 def test_target_and_hard_max_constants_are_sane() -> None:

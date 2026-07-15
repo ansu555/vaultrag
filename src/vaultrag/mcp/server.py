@@ -53,10 +53,10 @@ from vaultrag.chunking.tokens import CHARS_PER_TOKEN, count_tokens
 from vaultrag.embedding.base import EmbeddingError
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import SearchFilters, SparseEmbedder, VectorStore, VectorStoreError
-from vaultrag.indexer.scan import exclusion_reason, load_ignore_spec
+from vaultrag.indexer.scan import ExclusionReason, exclusion_reason, load_ignore_spec
 from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
-from vaultrag.models import BlockType, Document, OpenResult, SearchResult
+from vaultrag.models import BlockType, OpenResult, SearchResult
 from vaultrag.parsing import heading_section, parse_document
 from vaultrag.retrieval import DEFAULT_BUDGET_TOKENS, DEFAULT_K
 from vaultrag.retrieval import search as retrieval_search
@@ -81,9 +81,16 @@ _UNBOUNDED_BUDGET = 1_000_000_000
 # governs `search`; `open` is the explicit "give me the exact content" escape hatch).
 _OPEN_CAP_TOKENS = 8_000
 
+# Cap on how many headings a "heading not found" error lists back — enough to pick from,
+# bounded so a heading-dense note can't blow up the agent's context on an error path.
+_HEADING_LIST_LIMIT = 30
+
 # exclusion_reason rule → the model-facing refusal text. One message per gate the scan
 # boundary enforces; `open` must refuse the same set or it is a bypass (CLAUDE.md §6).
-_EXCLUSION_MESSAGES = {
+# Keyed by ExclusionReason, which makes a *misspelled* rule a mypy error; a *missing* one
+# is caught by test_open_has_a_refusal_message_for_every_indexer_gate (mypy does not
+# require dict literals to be exhaustive over a Literal).
+_EXCLUSION_MESSAGES: dict[ExclusionReason, str] = {
     "pruned-dir": "is under a directory the indexer never scans (.git/.obsidian/.trash/…)",
     "secret-filename": "is blocked by the built-in secret guard",
     "ragignore": "is excluded by .ragignore and cannot be opened",
@@ -142,8 +149,8 @@ def build_mcp_server(
     vector_store: VectorStore,
     embedder: QueryEmbedder,
     sparse: SparseEmbedder,
-    default_k: int = 10,
-    default_budget_tokens: int = 2000,
+    default_k: int = DEFAULT_K,
+    default_budget_tokens: int = DEFAULT_BUDGET_TOKENS,
 ) -> FastMCP:
     """Assemble the VaultRAG MCP server around already-built dependencies.
 
@@ -230,6 +237,7 @@ def build_mcp_server(
                 "`vaultrag mcp --project` instance for other projects"
             )
         t0 = time.perf_counter()
+        effective_budget = budget_tokens if budget_tokens is not None else default_budget_tokens
         try:
             result = retrieval_search(
                 query,
@@ -239,16 +247,17 @@ def build_mcp_server(
                 sparse=sparse,
                 k=k if k is not None else default_k,
                 filters=filters.to_filters() if filters is not None else None,
-                budget_tokens=(
-                    budget_tokens if budget_tokens is not None else default_budget_tokens
-                ),
+                # Compact mode budgets the *previews*, not the full texts: packing full
+                # texts first would silently drop hits the agent asked to browse (k),
+                # so retrieval runs unbounded and _compact re-packs to the real budget.
+                budget_tokens=_UNBOUNDED_BUDGET if mode == "compact" else effective_budget,
             )
         except (VectorStoreError, EmbeddingError) as exc:
             # ToolError text reaches the agent verbatim — keep the actionable message
             # ("is Qdrant running? docker compose up -d qdrant") instead of masking it.
             raise ToolError(f"search failed: {exc}") from exc
         if mode == "compact":
-            result = _compact(result)
+            result = _compact(result, budget_tokens=effective_budget)
         log.info(
             "mcp.search",  # q_hash, never the raw query, at info level (CLAUDE.md §5)
             project=project_id,
@@ -303,13 +312,25 @@ def build_mcp_server(
         rel, text = _read_note(vault_root, path)
         source_lines = text.splitlines()
         total = len(source_lines)
+        # Parse once, for every mode: `heading` needs the block tree, and `title` is
+        # frontmatter the caller wants regardless of which slice they asked for.
+        document = parse_document(path=rel, raw_text=text)
 
-        title: str | None = None
         resolved_heading: str | None = None
         if lines is not None:
             start, end = _validate_lines(lines, total, rel)
         elif heading is not None:
-            start, end, resolved_heading, title = _heading_span(rel, text, heading, total)
+            span = heading_section(document, heading, total)
+            if span is None:
+                # Name the real headings so the agent can retry without a second probe;
+                # whole headings only (a char-truncated one would just get re-sent mangled).
+                names = [b.text for b in document.blocks if b.type is BlockType.heading]
+                available = ", ".join(names[:_HEADING_LIST_LIMIT]) or "(none)"
+                raise ToolError(
+                    f"heading {heading!r} not found in {rel!r}; headings here: {available}"
+                )
+            start, end, block = span
+            resolved_heading = block.text
         else:
             start, end = 1, total
 
@@ -319,7 +340,7 @@ def build_mcp_server(
         line_end = start + len(kept) - 1 if kept else start - 1
         result = OpenResult(
             path=rel,
-            title=title,
+            title=document.metadata.title,
             heading=resolved_heading,
             line_start=start,
             line_end=line_end,
@@ -344,16 +365,27 @@ def build_mcp_server(
 # ---------------------------------------------------------------------------
 # search helpers
 # ---------------------------------------------------------------------------
-def _compact(result: SearchResult) -> SearchResult:
-    """Squash each snippet to a one-line preview (arch §10: 'title + 1-liner')."""
-    snippets = []
-    total = 0
+def _compact(result: SearchResult, *, budget_tokens: int) -> SearchResult:
+    """Squash each snippet to a one-line preview (arch §10: 'title + 1-liner').
+
+    The caller's budget is applied *here*, to the previews, using search's own
+    :func:`~vaultrag.retrieval.pipeline.pack_budget` — so ``budget_tokens`` and
+    ``truncated`` keep identical meaning across modes. Retrieval itself ran unbounded
+    (``_UNBOUNDED_BUDGET``): budgeting full texts first would drop hits whose *preview*
+    would have fit fine, which is the opposite of what "compact" is for.
+    """
+    compacted = []
     for snippet in result.snippets:
         line = _one_line(snippet.text)
-        tokens = count_tokens(line)
-        snippets.append(snippet.model_copy(update={"text": line, "tokens": tokens}))
-        total += tokens
-    return result.model_copy(update={"snippets": snippets, "total_tokens": total})
+        compacted.append(snippet.model_copy(update={"text": line, "tokens": count_tokens(line)}))
+    packed, total, truncated = pack_budget(compacted, budget_tokens)
+    return result.model_copy(
+        update={
+            "snippets": packed,
+            "total_tokens": total,
+            "truncated": result.truncated or truncated,
+        }
+    )
 
 
 def _one_line(text: str, limit: int = _COMPACT_LINE_CHARS) -> str:
@@ -371,10 +403,15 @@ def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
     """Resolve ``path`` inside the vault and read it, enforcing every indexing gate.
 
     ``open`` reads the vault directly, so it must refuse exactly what the scan
-    boundary refuses (CLAUDE.md §6) — otherwise it is a bypass: containment (also
-    catches a symlink pointing outside the vault, since ``resolve()`` follows it
-    before the check), secret filename, ``.ragignore``, P0 markdown-only scope, and
-    the whole-file content secret scan.
+    boundary refuses (CLAUDE.md §6) — otherwise it is a bypass. Containment is checked
+    here (``resolve()`` follows symlinks first, so a note pointing outside the vault is
+    caught); the rest is delegated to :func:`~vaultrag.indexer.scan.exclusion_reason`,
+    the *same* predicate ``walk_vault`` filters with, so the two can never drift apart
+    into a hole. The whole-file content scan follows the read.
+
+    ``.ragignore`` is re-read per call on purpose: an edit that adds an exclusion must
+    take effect immediately, and a cached spec would keep serving a file the user just
+    withdrew.
     """
     if not path.strip():
         raise ToolError("`path` must be a non-empty vault-relative path")
@@ -384,14 +421,11 @@ def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
         raise ToolError(f"path {path!r} escapes the vault — pass a vault-relative note path")
     rel = candidate.relative_to(vault_root).as_posix()
 
-    if is_secret_filename(rel):
-        log.warning("mcp.open_blocked", path=rel, rule="filename")
-        raise ToolError(f"{rel!r} is blocked by the built-in secret guard")
-    if load_ignore_spec(vault_root).match_file(rel):
-        log.warning("mcp.open_blocked", path=rel, rule="ragignore")
-        raise ToolError(f"{rel!r} is excluded by .ragignore and cannot be opened")
-    if candidate.suffix.lower() not in iter_indexable_suffixes():
-        raise ToolError(f"{rel!r} is not a markdown note — P0 serves markdown only")
+    reason = exclusion_reason(rel, ignore=load_ignore_spec(vault_root))
+    if reason is not None:
+        if reason == "secret-filename":
+            log.warning("mcp.open_blocked", path=rel, rule="filename")
+        raise ToolError(f"{rel!r} {_EXCLUSION_MESSAGES[reason]}")
     if not candidate.is_file():
         raise ToolError(f"note not found: {rel!r}")
 
@@ -420,45 +454,6 @@ def _validate_lines(lines: list[int], total: int, rel: str) -> tuple[int, int]:
     return start, min(end, total)
 
 
-def _heading_span(rel: str, text: str, heading: str, total: int) -> tuple[int, int, str, str]:
-    """Resolve ``heading`` to its section's line span via the real parser.
-
-    Parsing (rather than regex-scanning raw lines) is what keeps a ``## fake heading``
-    inside a code fence from matching. The span runs from the heading line to the line
-    before the next heading of the same or higher level (else EOF) — the whole
-    subsection, nested children included.
-    """
-    document = parse_document(path=rel, raw_text=text)
-    headings = [b for b in document.blocks if b.type == BlockType.heading]
-    wanted = _norm_heading(heading)
-    match: Block | None = next((b for b in headings if _norm_heading(b.text) == wanted), None)
-    if match is None or match.line_start is None:
-        available = ", ".join(b.text for b in headings[:30]) or "(none)"
-        raise ToolError(f"heading {heading!r} not found in {rel!r}; headings here: {available}")
-
-    end = total
-    seen_match = False
-    for block in headings:
-        if block is match:
-            seen_match = True
-            continue
-        if not seen_match or block.line_start is None:
-            continue
-        if (block.level or 99) <= (match.level or 99):
-            end = block.line_start - 1
-            break
-    return match.line_start, end, match.text, document.metadata.title
-
-
-def _norm_heading(text: str) -> str:
-    """Forgiving heading key: casefold + collapse non-word runs to single hyphens.
-
-    Makes 'Quick Start', 'quick start', and the slug-ish 'quick-start' all meet at
-    'quick-start' — agents pass anchors in all three forms.
-    """
-    return re.sub(r"\W+", "-", text.casefold()).strip("-")
-
-
 def _apply_cap(
     slice_lines: list[str], cap_tokens: int = _OPEN_CAP_TOKENS
 ) -> tuple[list[str], bool]:
@@ -467,7 +462,7 @@ def _apply_cap(
     Same philosophy as search's budget packer: an oversized-but-requested first line
     beats an empty response.
     """
-    budget_chars = cap_tokens * 4  # count_tokens is the ~4-chars/token heuristic
+    budget_chars = cap_tokens * CHARS_PER_TOKEN  # inverse of count_tokens' heuristic
     kept: list[str] = []
     used = 0
     for line in slice_lines:

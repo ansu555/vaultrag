@@ -155,7 +155,10 @@ def mcp(
                 default_k=settings.default_top_k,
                 default_budget_tokens=settings.budget_tokens,
             )
-        except ValueError as exc:  # misconfiguration, e.g. VAULTRAG_EMBED_DIMS <= 0
+        # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
+        # client that resolves/binds something at construction. Either way the fix is
+        # the operator's, so fail with a readable line rather than a stdio traceback.
+        except (ValueError, OSError) as exc:
             log.error("mcp.failed", project=project_id, error=str(exc))
             typer.echo(f"mcp failed: {exc}", err=True)
             raise typer.Exit(code=1) from exc

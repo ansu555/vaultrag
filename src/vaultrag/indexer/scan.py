@@ -24,6 +24,7 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import structlog
 from blake3 import blake3
@@ -44,6 +45,11 @@ _INDEXABLE_SUFFIXES = frozenset({".md", ".markdown"})
 _ALWAYS_PRUNE_DIRS = frozenset({".git", ".obsidian", ".trash", ".smart-env", "node_modules"})
 
 _HASH_CHUNK = 1 << 20  # 1 MiB streaming read; vault notes are small, PDFs (P2) are not.
+
+# The closed set of path-level gates. Spelled as a Literal so a consumer that maps every
+# reason to something (the MCP `open` tool maps each to a refusal message) is checked
+# against the real list rather than a guess that silently rots when a gate is added.
+ExclusionReason = Literal["pruned-dir", "secret-filename", "ragignore", "unsupported"]
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +135,7 @@ def _hash_file(abs_path: Path) -> str:
 
 def exclusion_reason(
     rel_path: str, *, ignore: PathSpec[GitIgnoreSpecPattern]
-) -> str | None:
+) -> ExclusionReason | None:
     """Why ``rel_path`` may not be indexed *or served*, or ``None`` if it is fair game.
 
     The single source of truth for the path-level gates, so every consumer refuses the

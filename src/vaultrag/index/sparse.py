@@ -14,6 +14,7 @@ constructing a store, or importing this module, never touches the network.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +45,7 @@ class Bm25Embedder:
     ) -> None:
         self._model = model
         self._encoder_instance = encoder
+        self._encoder_lock = threading.Lock()
 
     @property
     def model(self) -> str:
@@ -73,11 +75,20 @@ class Bm25Embedder:
     # --- internals ------------------------------------------------------------
     @property
     def _encoder(self) -> SparseTextEmbedding:
-        if self._encoder_instance is None:
-            from fastembed import SparseTextEmbedding
+        """Build the encoder on first use, at most once.
 
-            log.debug("bm25.load", model=self._model)
-            self._encoder_instance = SparseTextEmbedding(model_name=self._model)
+        Locked because the MCP server runs sync tools in a worker-thread pool: two
+        concurrent first searches would otherwise both see ``None`` and race two
+        HuggingFace fetches into the same cache dir. Double-checked so the steady state
+        (every call after the first) stays lock-free.
+        """
+        if self._encoder_instance is None:
+            with self._encoder_lock:
+                if self._encoder_instance is None:
+                    from fastembed import SparseTextEmbedding
+
+                    log.debug("bm25.load", model=self._model)
+                    self._encoder_instance = SparseTextEmbedding(model_name=self._model)
         return self._encoder_instance
 
 

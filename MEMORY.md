@@ -8,18 +8,23 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan)
+- **Phase:** **P0 is CODE-COMPLETE.** Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan)
   + 4 (parsing) + 5 (chunking) + 6 (embedding) + 7 (Qdrant vector store) + 8 (reindex
-  pipeline) + 9 (hybrid retrieval read path) DONE.** Next up: **Step 10 (FastMCP `search`
-  + `open` + `vaultrag mcp` — the P0 finish line)**.
+  pipeline) + 9 (hybrid retrieval read path) + **10 (FastMCP `search`/`open` + `vaultrag
+  mcp` — the P0 finish line) DONE.** Next up: **P1** (watchdog + manifest/renames,
+  reranker, parent-child, citations w/ `obsidian://`, `write_note` + git auto-commit) —
+  but first, the one P0 acceptance step still unrun: **dogfood via `claude mcp add`**
+  (blocked on Docker, see Open questions).
 - **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag reindex`
   builds a real index end-to-end (`--project`/`--vault` flags, env defaults otherwise);
-  `uv run vaultrag --help` lists `reindex` (live) + `mcp` (still stubbed); `ruff check .`,
-  `mypy src` (31 files), and `pytest` (168 tests: 6 CLI + 7 models + 13 store + 13 scan + 34
-  parsing + 15 chunking + 22 embedding + 41 index + 7 indexer-pipeline + 10 retrieval) are
-  all green. A full-code audit of Steps 0-9 (2026-07-15, see session log) found and fixed
-  two defects (frontmatter line-number drift; CLI store-construction failure paths) and
-  ratified everything else as-designed.
+  **`uv run vaultrag mcp --project X --vault Y` serves `search`+`open` over real stdio**
+  (verified by a spawned-subprocess round-trip, not just in-memory tests); `ruff check .`,
+  `ruff format --check .`, `mypy src` (33 files), and `pytest` (216 tests: 8 CLI + 7 models
+  + 13 store + 13 scan + 34 parsing + 15 chunking + 22 embedding + 42 index + 7
+  indexer-pipeline + 10 retrieval + 45 mcp) are all green. A full-code audit of Steps 0-9
+  (2026-07-15) fixed two defects (frontmatter line-number drift; CLI store-construction
+  failure paths); a second full audit of Steps 0-10 (2026-07-16, see session log) fixed
+  nine more — including a **security-grade `open()` gate bypass** — and ratified the rest.
   Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
   logging wired. `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block`
   / `Chunk` shape, the `Snippet`/`SearchResult` return contract, and deterministic
@@ -90,35 +95,73 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   alone exceeds budget** (an oversized best match beats an empty response), setting
   `truncated=True` iff a lower-ranked hit existed but didn't fit. An empty/whitespace query
   short-circuits to an empty `SearchResult` with zero embed calls. Rerank/parent-swap/graph-
-  expand/MMR-compression (arch §10 stages 4-7) are explicitly P1+, not built here. Deps
-  added: `blake3`, `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`,
-  `qdrant-client`, `fastembed`, (`types-pyyaml` dev-only) — no new deps at Step 9.
-- **What's next:** Step 10 — FastMCP `search` + `open` + `vaultrag mcp` (`mcp/`), the **P0
-  finish line**. FastMCP 2.x over stdio; `search(query, project?, k?, filters?,
-  budget_tokens?, mode?)` wraps Step 9's `retrieval.search(...)` (default `mode="snippets"`
-  is exactly what Step 9 returns; `compact`/`answer` modes are this step's job, not Step
-  9's) and `open(path, heading?, lines?)` (new — reads a note's exact section straight from
-  the vault, not the index); model-facing tool descriptions; `vaultrag mcp --project X`
-  entrypoint. Ref: `../Rag/reference/reference-mcp-tools.md`,
-  `../Rag/projects/vaultrag/agent-integration-layer.md`,
-  `../Rag/decisions/mcp-first-not-rest-first.md`,
-  `../Rag/decisions/snippets-not-answers-by-default.md`, arch §10/§16. **Verify (P0 "done
-  when"):** `claude mcp add vaultrag -- uv run vaultrag mcp --project X`; from Claude Code,
-  `search(...)` returns cited snippets and `open(...)` the exact section — then dogfood by
-  registering this design vault and querying it (repo `CLAUDE.md` §1). Full 11-step plan:
-  `../Rag/projects/vaultrag/p0-step-plan.md`.
+  expand/MMR-compression (arch §10 stages 4-7) are explicitly P1+, not built here.
+  `mcp/server.py` is Step 10: `build_mcp_server(project_id, vault_path, vector_store,
+  embedder, sparse, default_k, default_budget_tokens) -> FastMCP` — a pure assembly
+  function over already-built deps (the CLI's `mcp` command is the composition root), so
+  every tool is testable through FastMCP's in-memory `Client` with fakes, no stdio or live
+  services. Tools: **`search(query, project?, k?, filters?, budget_tokens?, mode?)`** wraps
+  Step 9's `retrieval.search` (tenancy: `project` may only *name* the served project, else
+  `ToolError` before any engine work; `SearchFiltersParam` is the pydantic MCP-boundary twin
+  of `SearchFilters` with `extra="forbid"` and no `project` field; `mode="compact"` returns
+  one-line previews; `mode="answer"` is P3 and not in the schema; engine failures become
+  `ToolError`s that keep the actionable "is Qdrant running?" text; logs `q_hash` (blake3,
+  12 chars) never raw query text). **`open(path, heading?, lines?)`** reads an exact slice
+  straight from the vault (the source of truth, always ≥ as fresh as the index) and
+  **enforces every gate indexing enforces** via the shared `exclusion_reason` predicate —
+  containment (incl. symlink escape), always-pruned dirs, secret filenames, `.ragignore`,
+  markdown-only — plus a whole-file `scan_for_secrets`; heading resolution goes through
+  `parsing/sections.py` (`heading_section`/`normalize_heading`) so a `## fake heading`
+  inside a code fence can never match and P1's write-back reuses one definition of a
+  section's bounds. `cli.py`'s `mcp` command wires `Settings` → `QdrantVectorStore`/
+  `OllamaEmbedder`/`QueryEmbedder`/`Bm25Embedder` → `build_mcp_server` →
+  `run(transport="stdio", show_banner=False)`, exits 1 cleanly on a bad vault path or
+  misconfig, closes both clients in `finally`. **`logging.py` writes to stderr only** (via a
+  `_StderrProxy` resolving `sys.stderr` at write time) — stdout is the JSON-RPC channel.
+  Deps added: `blake3`, `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`,
+  `qdrant-client`, `fastembed`, **`fastmcp>=3.4.4`**, (`types-pyyaml` dev-only).
+- **What's next:** **P1** (`CLAUDE.md` §4): watchdog + manifest/renames, reranker,
+  parent-child, citations w/ `obsidian://` links, `write_note` + git auto-commit. Before
+  that, close the one P0 acceptance step that hasn't run (needs Docker — see Open
+  questions): `docker compose up -d qdrant` → `uv run vaultrag reindex --project
+  vaultrag-design --vault ../Rag` → `claude mcp add vaultrag -- uv run --directory
+  /Users/anik/Desktop/vaultrag vaultrag mcp --project vaultrag-design --vault
+  /Users/anik/Desktop/Rag` → from a Claude Code session, `search("how does the heading-tree
+  chunker merge tiny sections")` should return cited snippets. That dogfood is also the best
+  eval signal we have (repo `CLAUDE.md` §1): when retrieval feels bad while building P1,
+  that's a real bug report — capture it.
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
   `CLAUDE.md` §1.
 - **Open questions / blockers:**
+  - **BLOCKER (env, not code): Docker Desktop will not start on this box**, so the
+    Qdrant-dependent dogfood above is the one P0 acceptance step never run. Symptom: the
+    `com.docker.backend` process runs but never creates
+    `~/.docker/run/docker.sock`, so every `docker` command hangs/fails; `docker context ls`
+    shows `desktop-linux` pointing at that missing socket. Its stderr log's last entries are
+    a burst of `FILE_ERROR_NO_SPACE` from 2026-07-15T12:00Z — the disk was full then, but
+    now reads 117Gi free, so that's a stale cause, not the current one. Tried across three
+    sessions: `pkill -f com.docker.backend` + `open -a Docker`, plus repeated polling — all
+    failed (two-strike rule → stopped). **Anik: this needs a hands-on Docker Desktop restart
+    (or reinstall) from the GUI.** Nothing in `src/` is implicated: Ollama is up (v0.32.0,
+    `qwen3-embedding:0.6b`) and the MCP server itself is verified over real stdio without
+    Qdrant. Everything Qdrant-side was verified live in the Step 7/8/9 sessions when Docker
+    last worked.
   - `search`/`open` response JSON shapes are unspecified in
-    `../Rag/reference/reference-mcp-tools.md` (params only) — Step 9 landed the concrete
-    contract in code (`SearchResult`/`Snippet`, `models.py`); Step 10 wraps it as the MCP
-    tool's actual return type. Promote to `reference/` once Step 10 hardens it.
-  - **Vault write-back pending Anik's review:** `../Rag/agent-inbox/payload-carries-chunk-text.md`
-    (proposed) — the payload reference omits `text`, but Step 7 stores it and Step 9's
-    `_to_snippet` now depends on reading it directly from the payload (no SQLite
-    round-trip), which makes this divergence load-bearing rather than theoretical.
-    Ratify into `reference-metadata-schema.md` or correct it.
+    `../Rag/reference/reference-mcp-tools.md` (params only) — Step 10 has now hardened the
+    concrete contract in code (`SearchResult`/`Snippet`/**`OpenResult`**, `models.py`), and
+    it is what the MCP tools actually return. **Ready to promote to `reference/`** — the
+    shapes are no longer speculative.
+  - **Vault write-backs pending Anik's review** (both in `../Rag/agent-inbox/`):
+    - `payload-carries-chunk-text.md` (proposed) — the payload reference omits `text`, but
+      Step 7 stores it and Step 9's `_to_snippet` depends on reading it directly from the
+      payload (no SQLite round-trip), which makes this divergence load-bearing rather than
+      theoretical. Ratify into `reference-metadata-schema.md` or correct it.
+    - **`fastmcp-3x-not-2x.md` (new, proposed)** — `reference-technology-stack.md` says
+      "FastMCP 2.x"; Step 10 shipped on **3.4.4** (what `uv add fastmcp` resolves to today).
+      Verified empirically against 3.4.4: bare `@mcp.tool`, `run(transport="stdio",
+      show_banner=False)`, in-memory `Client(server)` for tests, `ToolError` text reaching
+      the client verbatim, and sync tools auto-running in anyio worker threads. Ratify the
+      version bump or pin 2.x.
 
 ---
 
@@ -137,6 +180,143 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-16 — P0 Step 10 (FastMCP `search`/`open` + `vaultrag mcp`) + full Steps 0-10 audit — **P0 CODE-COMPLETE**
+- **Did:** Two things Anik asked for in one session: (1) implemented **Step 10**, the P0
+  finish line; (2) audited the **entire** P0 codebase (Steps 0-10) and fixed everything
+  substandard, then ran the suite.
+- **Step 10 shipped:** `mcp/server.py` (`build_mcp_server` + `search`/`open` tools +
+  `SearchFiltersParam`), `mcp/__init__.py`, `models.py` (+`OpenResult`),
+  `parsing/sections.py` (new — `heading_section`/`normalize_heading`), `cli.py`'s `mcp`
+  command wired to real stdio, `logging.py` switched to stderr-only. Details in **Current
+  state → What works**. Tool descriptions are written *for models* (when to call, arg
+  semantics, budget guidance) per `../Rag/decisions/mcp-first-not-rest-first.md`.
+- **Audit method:** every `src/vaultrag` module read end-to-end against `CLAUDE.md` §5/§6 and
+  the vault design notes, **plus** the `/code-review` skill at high effort (8 parallel finder
+  angles — line-by-line, removed-behavior, cross-file, reuse, simplification, efficiency,
+  altitude, conventions — then a verify pass triaging each candidate). Nine defects fixed,
+  each with a regression test that **fails against the pre-fix code** (spot-verified by
+  reverting the fix and re-running, e.g. the pruned-dir gate):
+  1. **`open()` bypassed the always-pruned-dir gate — security-grade** (`mcp/server.py`).
+     `_read_note` checked secret-filename + `.ragignore` + suffix, but **not**
+     `_ALWAYS_PRUNE_DIRS`. So `open(".trash/deleted.md")`, `open(".obsidian/workspace.md")`,
+     `open("node_modules/pkg/README.md")` **served files the indexer never scans** — real
+     markdown, passing every other gate, that `search` can by construction never cite. `open`
+     reads the vault directly, so any gate it doesn't repeat is a hole around the scanner
+     (CLAUDE.md §6). **Fixed at the right altitude rather than by adding a fourth check:**
+     extracted `exclusion_reason(rel_path, *, ignore) -> ExclusionReason | None` into
+     `indexer/scan.py` as the single source of truth for path-level gates; `walk_vault` now
+     filters with it (mapping reason → its stats counter) and `_read_note` refuses with it.
+     The two can no longer drift apart. `ExclusionReason` is a `Literal`, so a *misspelled*
+     key in the MCP layer's refusal-message map is a mypy error (verified by injecting one),
+     and a *missing* one is caught by `test_open_has_a_refusal_message_for_every_indexer_gate`
+     (mypy does not require dict literals to be exhaustive over a Literal — checked, not
+     assumed).
+  2. **`mode="compact"` applied `budget_tokens` to the full texts, before compaction**
+     (`mcp/server.py`). A `k=10` browse where each chunk is 500 tokens against a 2000-token
+     budget returned **4 previews instead of 10** — hits were dropped for the size of text
+     compact mode was about to throw away. Fixed: compact retrieves with `_UNBOUNDED_BUDGET`
+     and `_compact` re-packs the one-liners through search's own **now-public** `pack_budget`,
+     so `budget_tokens`/`truncated` mean the same thing in both modes.
+  3. **`open()` returned `title=None` in whole-note and `lines=` modes** (`mcp/server.py`) —
+     only the `heading=` path parsed the document. `title` describes the *note*, not the
+     slice. Fixed by parsing once up front for every mode (also removes a redundant parse).
+  4. **`_norm_heading` didn't fold `_`** — `\W+` keeps underscores (a `\w` char), so
+     `heading="Quick_Start"` never matched `## Quick Start`. Fixed to `[\W_]+` in the new
+     `parsing/sections.py`.
+  5. **`QdrantClient(url=...)` fired a blocking version-check GET from its constructor**
+     (`index/qdrant.py`) — turning "construct a store" into "reach the network", stalling
+     `vaultrag mcp` startup and printing a warning **to stdout, the JSON-RPC channel**, when
+     Qdrant is down. Fixed with `check_compatibility=False`; this also makes `cli.py`'s
+     "neither client connects at construction" comment true rather than aspirational.
+  6. **`Bm25Embedder`'s lazy `_encoder` init raced under FastMCP's worker-thread pool**
+     (`index/sparse.py`) — two concurrent first searches both see `None` and race two
+     HuggingFace fetches into one cache dir. Fixed with a double-checked `threading.Lock`
+     (steady state stays lock-free).
+  7. **`_keep_frontmatter_value` recursed into lists** (`index/payload.py`), so
+     `[[1,2],[3]]` passed despite the module contract saying "a flat list of scalars" —
+     carrying nested structure no Qdrant filter can match onto every point in the note.
+     Fixed to a flat-scalar check (per-element length rules now apply inside lists too).
+  8. **`_apply_cap` hardcoded `cap_tokens * 4`** — a silent duplicate of `count_tokens`'
+     heuristic that would drift the moment it's tuned. Fixed by publishing
+     `CHARS_PER_TOKEN` from `chunking/tokens.py` and sharing it.
+  9. **`QueryEmbedder`'s docstring claimed "not thread-safe by construction"**
+     (`embedding/cache.py`) — false, and newly load-bearing now that the MCP server calls it
+     from concurrent worker threads. `lru_cache` locks its own bookkeeping; the only race is
+     two threads missing the same query, costing one duplicate call that stores an identical
+     vector. Truthed up (a lock here would serialize every embed to prevent a harmless
+     repeat).
+- **Also cleaned up:** duplicated test doubles (`FakeEmbedder`/`FakeSparse`/`FakeVectorStore`/
+  `make_hit`) were copy-pasted across `test_retrieval.py` and `test_mcp.py` → extracted to
+  `tests/fakes.py` (two drifting copies of a protocol stand-in is how a suite goes green
+  against an interface the real code no longer has). **`ruff format` had evidently never been
+  run**: the code was hand-wrapped at ~88 chars while `pyproject.toml` declares
+  `line-length = 100`, so the formatter touched 9 files. Kept — the repo now matches its own
+  declared style (CLAUDE.md §5) — but it's why this diff is noisier than the fix list.
+  `ruff format --check .` is now clean and worth keeping in CI next to `ruff check`.
+- **Reviewed and deliberately NOT changed** (each considered, with a reason): eager BM25
+  warm-up before stdio binds (rejected — costs offline resilience for a one-time first-call
+  delay); per-call `.ragignore` reload (kept — freshness *is* the safety property: an
+  exclusion the user just added must take effect now); the `_StderrProxy` (kept — the
+  altitude angle endorsed it); `reindex`'s structured logs going to stdout (intended — it's a
+  CLI, not a protocol server); `SearchFiltersParam` as a hand-maintained twin of
+  `SearchFilters` (kept for its model-facing descriptions + `extra="forbid"`, but a
+  field-parity tripwire test now fails if the engine gains a filter the MCP layer doesn't
+  expose, or if a `project` field ever appears here). One candidate was **refuted** on
+  inspection: "`Bm25Embedder` is never closed" — it has no `close()`.
+- **Why:** Anik: *"pls audit the code which till p0 entirely… is it absolutely perfect the
+  code implementation or not. if its not upto the standars then do take the nesscery steps.
+  and after all of this run the test also. do all of this after implimenting step 10 and 11"*
+  (the plan's steps are 0-indexed; "10 and 11" = plan Step 10, the last one).
+- **Files:** `src/vaultrag/mcp/{server,__init__}.py` (new), `src/vaultrag/parsing/sections.py`
+  (new), `tests/fakes.py` (new), `tests/test_mcp.py` (new, 45 tests), plus
+  `src/vaultrag/{models,cli,logging}.py`, `src/vaultrag/indexer/{scan,__init__}.py`,
+  `src/vaultrag/index/{qdrant,sparse,payload}.py`, `src/vaultrag/embedding/cache.py`,
+  `src/vaultrag/chunking/tokens.py`, `src/vaultrag/retrieval/pipeline.py`,
+  `src/vaultrag/parsing/__init__.py`, `tests/{test_cli,test_index,test_retrieval}.py`,
+  `pyproject.toml`/`uv.lock` (+`fastmcp>=3.4.4`), `MEMORY.md`,
+  `../Rag/agent-inbox/fastmcp-3x-not-2x.md` (new, vault).
+- **Decisions (impl-level):** (1) **FastMCP 3.4.4, not the stack note's 2.x** — a real
+  divergence, written back to `../Rag/agent-inbox/fastmcp-3x-not-2x.md` (proposed) rather
+  than drifted silently (CLAUDE.md §1). Every 3.x API used was verified empirically, not
+  assumed from training data. (2) **Tools are deliberately sync** — FastMCP runs them in a
+  worker thread, which *is* the "keep blocking I/O off the event loop" pattern CLAUDE.md §5
+  prescribes (probed against 3.4 to confirm, and it's what makes fix #6 necessary).
+  (3) **`build_mcp_server` takes built dependencies; the CLI is the composition root** —
+  which is what lets all 45 MCP tests drive the real server through FastMCP's in-memory
+  client with fakes, no stdio and no live services. (4) **`heading_section` lives in
+  `parsing/`, not `mcp/`** — "which lines belong to this heading" is a document-structure
+  question, and P1's write-back (`append_section`) needs the identical definition of a
+  section's bounds. (5) **`_OPEN_CAP_TOKENS = 8000` is a safety valve, not a budget** —
+  principle #7 governs `search`; `open` is the explicit "give me the exact content" escape
+  hatch and must not be starved, so it truncates generously with `truncated=True` +
+  `total_lines` so the agent can re-slice.
+- **Verify (all green):** `uv run pytest` **216 passed** (was 200 pre-audit, 168 pre-Step-10):
+  8 CLI + 7 models + 13 store + 13 scan + 34 parsing + 15 chunking + 22 embedding + 42 index +
+  7 indexer-pipeline + 10 retrieval + 45 mcp. `uv run ruff check .` clean, `ruff format
+  --check .` clean, `uv run mypy src` clean (33 files).
+- **Live verify — REAL STDIO ROUND-TRIP PASSED (the P0 "done when"):** spawned an actual
+  `uv run vaultrag mcp --project smoke --vault <tmp>` **subprocess** and drove it over real
+  stdin/stdout with a `StdioTransport` client (not the in-memory client the unit tests use):
+  `list_tools()` → `['open', 'search']`; `open(path, heading="quick-start")` → resolved
+  `heading='Quick Start'`, `title='Guide'`, correct body; `search` with Qdrant pointed at a
+  dead port → `ToolError: search failed: … [Errno 61] Connection refused` (actionable, not a
+  hang), **and the session kept serving afterwards**. This also proves the stderr-only
+  logging fix: FastEmbed's HuggingFace download chatter, its tqdm bar, and every structlog
+  line all went to stderr while stdout stayed clean JSON-RPC — any one of them on stdout
+  would have broken the handshake outright.
+- **Live verify — NOT DONE (blocked, env not code):** the Qdrant-dependent dogfood
+  (`reindex ../Rag` as `vaultrag-design` → `claude mcp add` → search it from Claude Code).
+  **Docker Desktop will not start on this box** — see **Open questions** for the diagnosis,
+  what was tried, and the exact commands to finish it once Docker is back. Ollama is up.
+- **Next / handoff:** **P0 is code-complete; P1 is next** (`CLAUDE.md` §4). Two things for
+  Anik first: (a) restart Docker Desktop by hand, then run the dogfood commands in **Current
+  state → What's next** — that's the last P0 acceptance step *and* the first real eval
+  signal; (b) rule on the two `../Rag/agent-inbox/` notes (`payload-carries-chunk-text.md`,
+  `fastmcp-3x-not-2x.md`). Also ready: promote the now-hardened `SearchResult`/`Snippet`/
+  `OpenResult` shapes into `../Rag/reference/reference-mcp-tools.md` (it still specifies
+  params only). **Nothing committed this session** — still on `main`, working tree dirty
+  (branch + `agent(claude-code): …` commit when Anik asks).
 
 ### 2026-07-15 — Full audit of Steps 0-9; two defects found and fixed
 - **Did:** Read every `src/vaultrag` module end-to-end and audited against `CLAUDE.md` §5/§6

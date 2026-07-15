@@ -81,7 +81,11 @@ class QdrantVectorStore:
         self._dims = dims
         self._collection = collection
         self._owns_client = client is None
-        self._client = client or QdrantClient(url=url)
+        # check_compatibility=False: the default fires a blocking version-check GET from
+        # the constructor, which turns "construct a store" into "reach the network" —
+        # it would stall `vaultrag mcp` startup (and log a warning to stdout, the MCP
+        # JSON-RPC channel) whenever Qdrant is down. Real calls surface that anyway.
+        self._client = client or QdrantClient(url=url, check_compatibility=False)
         self._sparse: SparseEmbedder = sparse or Bm25Embedder()
 
     @classmethod
@@ -335,9 +339,7 @@ class QdrantVectorStore:
                 with_payload=True,
             )
         except _CLIENT_ERRORS as exc:
-            raise VectorStoreError(
-                f"hybrid query on {self._collection!r} failed: {exc}"
-            ) from exc
+            raise VectorStoreError(f"hybrid query on {self._collection!r} failed: {exc}") from exc
         return [
             ScoredChunk(point_id=str(point.id), score=point.score, payload=point.payload or {})
             for point in result.points
@@ -351,9 +353,7 @@ class QdrantVectorStore:
             else None
         )
         try:
-            return self._client.count(
-                self._collection, count_filter=count_filter, exact=True
-            ).count
+            return self._client.count(self._collection, count_filter=count_filter, exact=True).count
         except _CLIENT_ERRORS as exc:
             raise VectorStoreError(f"count on {self._collection!r} failed: {exc}") from exc
 
@@ -393,9 +393,7 @@ def _build_filter(project_id: str, filters: SearchFilters | None) -> models.Filt
             must.append(
                 models.FieldCondition(
                     key="modified_ts",
-                    range=models.Range(
-                        gte=filters.modified_after, lt=filters.modified_before
-                    ),
+                    range=models.Range(gte=filters.modified_after, lt=filters.modified_before),
                 )
             )
     return models.Filter(must=must)

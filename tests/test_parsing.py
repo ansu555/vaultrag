@@ -142,9 +142,7 @@ def test_tag_requires_word_boundary_before_hash() -> None:
 # Callouts / blockquotes
 # ---------------------------------------------------------------------------
 def test_callout_parsed_with_type_and_text() -> None:
-    doc = parse_document(
-        path="n.md", raw_text="> [!warning] Careful\n> this is the body\n"
-    )
+    doc = parse_document(path="n.md", raw_text="> [!warning] Careful\n> this is the body\n")
     (block,) = doc.blocks
     assert block.type == BlockType.callout
     assert block.callout_type == "warning"
@@ -320,8 +318,7 @@ def test_multiline_secret_body_is_redacted_not_just_header_line() -> None:
     # keeps the body from surviving alongside a "redacted" header line.
     body_marker = "MIIEabcSECRETBODYXYZ"
     pem = (
-        "```\n-----BEGIN RSA PRIVATE KEY-----\n"
-        f"{body_marker}\n-----END RSA PRIVATE KEY-----\n```\n"
+        f"```\n-----BEGIN RSA PRIVATE KEY-----\n{body_marker}\n-----END RSA PRIVATE KEY-----\n```\n"
     )
     doc = parse_document(path="leak.md", raw_text=pem)
     assert body_marker not in _blob(doc)
