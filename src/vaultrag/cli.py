@@ -12,6 +12,7 @@ Later phases add ``serve`` (HTTP) and ``eval``. See
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Annotated
 
@@ -71,10 +72,17 @@ def reindex(
     project_id = project or settings.project_id
     vault_path = vault or settings.vault_path
 
-    store = SQLiteMetaStore.from_settings(settings)
-    vector_store = QdrantVectorStore.from_settings(settings)
-    embedder = OllamaEmbedder.from_settings(settings)
+    # Constructed inside the guarded region: opening the SQLite store can itself fail
+    # (unwritable VAULTRAG_STATE_DIR, unopenable db file) and must exit 1 with a message,
+    # not a traceback. sqlite3.Error is caught here because the CLI is the composition
+    # root — the one place that knows the concrete MetaStore is SQLite.
+    store: SQLiteMetaStore | None = None
+    vector_store: QdrantVectorStore | None = None
+    embedder: OllamaEmbedder | None = None
     try:
+        store = SQLiteMetaStore.from_settings(settings)
+        vector_store = QdrantVectorStore.from_settings(settings)
+        embedder = OllamaEmbedder.from_settings(settings)
         stats = reindex_vault(
             project_id=project_id,
             vault_path=vault_path,
@@ -82,14 +90,14 @@ def reindex(
             vector_store=vector_store,
             embedder=embedder,
         )
-    except (VectorStoreError, EmbeddingError, OSError) as exc:
+    except (VectorStoreError, EmbeddingError, OSError, sqlite3.Error) as exc:
         log.error("reindex.failed", project=project_id, vault=str(vault_path), error=str(exc))
         typer.echo(f"reindex failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     finally:
-        embedder.close()
-        vector_store.close()
-        store.close()
+        for closer in (embedder, vector_store, store):
+            if closer is not None:
+                closer.close()
 
     typer.echo(
         f"reindex complete: +{stats.created} ~{stats.updated} -{stats.deleted} "

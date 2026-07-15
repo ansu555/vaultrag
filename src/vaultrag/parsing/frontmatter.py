@@ -28,23 +28,26 @@ def split_frontmatter(path: str, raw_text: str) -> tuple[dict[str, Any], str]:
     """Split ``raw_text`` into ``(frontmatter dict, body)``. Never raises.
 
     Falls back to ``({}, raw_text)`` on malformed YAML, logging a warning with the
-    path (never the content). When no ``---`` block is present, ``raw_text`` is
-    returned verbatim rather than python-frontmatter's own ``.content``: that
-    attribute ``.strip()``s whitespace at the document boundary, which would corrupt
-    a body whose very first line is a 4-space-indented code block (turning it into
-    an ordinary paragraph). This only needs to special-case the *no-frontmatter*
-    path -- there the whole input *is* the body, no boundary-detection guesswork
-    required; when a frontmatter block genuinely is present, ``post.content`` (the
-    well-tested split) is used as-is.
+    path (never the content). The body is never taken from python-frontmatter's
+    ``.content``: that attribute is ``.strip()``-ed at both document boundaries,
+    which (a) corrupts a no-frontmatter body whose first line is a 4-space-indented
+    code block (turning it into an ordinary paragraph), and (b) drops blank lines
+    between the closing ``---`` and the first content line -- shifting every block's
+    ``line_start``/``line_end`` off the file by however many were stripped, which
+    breaks the line anchors ``open(path, heading?, lines?)`` cites
+    (``../Rag/reference/reference-mcp-tools.md``). Instead the body is sliced from
+    ``raw_text`` at :func:`frontmatter_line_offset`, so body line *k* is file line
+    ``offset + k`` by construction; python-frontmatter still parses the YAML itself.
     """
     try:
         post = fm.loads(raw_text)
     except yaml.YAMLError as exc:
         log.warning("parse.frontmatter_invalid", path=path, error=str(exc))
         return {}, raw_text
-    if frontmatter_line_offset(raw_text) == 0:
+    offset = frontmatter_line_offset(raw_text)
+    if offset == 0:
         return post.metadata, raw_text
-    return post.metadata, post.content
+    return post.metadata, "".join(raw_text.splitlines(keepends=True)[offset:])
 
 
 def frontmatter_line_offset(raw_text: str) -> int:

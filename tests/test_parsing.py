@@ -257,6 +257,22 @@ def test_line_numbers_offset_past_frontmatter() -> None:
     assert heading.line_end == 5
 
 
+def test_line_numbers_survive_blank_lines_after_frontmatter() -> None:
+    """Blank lines between the closing ``---`` and the first content line must not
+    shift line numbers: python-frontmatter's ``.content`` strips them, so a body
+    sliced from it would report every block N lines early (N = blank lines) —
+    corrupting the ``open(path, lines)`` anchors. The body must come from the raw
+    text at the computed offset instead."""
+    doc = parse_document(
+        path="n.md",
+        raw_text="---\ntitle: X\n---\n\n# Heading\n\nBody paragraph.\n",
+    )
+    heading = next(b for b in doc.blocks if b.type == BlockType.heading)
+    paragraph = next(b for b in doc.blocks if b.type == BlockType.paragraph)
+    assert (heading.line_start, heading.line_end) == (5, 5)
+    assert (paragraph.line_start, paragraph.line_end) == (7, 7)
+
+
 # ---------------------------------------------------------------------------
 # Empty / malformed input never crashes (a vault is messy, real user data)
 # ---------------------------------------------------------------------------

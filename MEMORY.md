@@ -15,9 +15,11 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 - **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag reindex`
   builds a real index end-to-end (`--project`/`--vault` flags, env defaults otherwise);
   `uv run vaultrag --help` lists `reindex` (live) + `mcp` (still stubbed); `ruff check .`,
-  `mypy src` (31 files), and `pytest` (165 tests: 4 CLI + 7 models + 13 store + 13 scan + 33
+  `mypy src` (31 files), and `pytest` (168 tests: 6 CLI + 7 models + 13 store + 13 scan + 34
   parsing + 15 chunking + 22 embedding + 41 index + 7 indexer-pipeline + 10 retrieval) are
-  all green.
+  all green. A full-code audit of Steps 0-9 (2026-07-15, see session log) found and fixed
+  two defects (frontmatter line-number drift; CLI store-construction failure paths) and
+  ratified everything else as-designed.
   Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
   logging wired. `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block`
   / `Chunk` shape, the `Snippet`/`SearchResult` return contract, and deterministic
@@ -135,6 +137,58 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-15 — Full audit of Steps 0-9; two defects found and fixed
+- **Did:** Read every `src/vaultrag` module end-to-end and audited against `CLAUDE.md` §5/§6
+  and the vault design notes (chunk thresholds, filters-inside-prefetch, tenancy, secret
+  guard, idempotency ordering all conform). Two real defects found, both fixed with
+  regression tests:
+  1. **Frontmatter line-number drift** (`parsing/frontmatter.py`): `split_frontmatter`
+     returned python-frontmatter's `post.content` when a `---` block was present, but
+     `frontmatter.parse` **always** `.strip()`s content — so blank lines between the
+     closing `---` and the first content line (the most common Obsidian layout) were
+     silently dropped, shifting every block's `line_start`/`line_end` early by that count.
+     Confirmed empirically (heading reported line 4, actually 5). This corrupts the
+     citation anchors `open(path, heading?, lines?)` (Step 10, `reference-mcp-tools.md`)
+     depends on. The prior docstring claimed only the *no-frontmatter* path needed
+     protecting — wrong. Fix: the body is now always sliced from `raw_text` at
+     `frontmatter_line_offset` (`"".join(splitlines(keepends=True)[offset:])`), so body
+     line *k* = file line *offset+k* by construction; python-frontmatter still parses the
+     YAML. The pre-existing offset test passed by luck (no blank line after `---`); added
+     `test_line_numbers_survive_blank_lines_after_frontmatter`.
+  2. **CLI `reindex` construction/`sqlite3.Error` failure paths** (`cli.py`): the three
+     stores were built *outside* the `try`, and `sqlite3.Error` wasn't in the except tuple
+     — an unwritable `VAULTRAG_STATE_DIR` or unopenable db file tracebacked instead of the
+     documented clean exit-1-with-message. Fix: construction moved inside the guarded
+     region (`store`/`vector_store`/`embedder` start as `None`; `finally` closes only what
+     was built), `sqlite3.Error` added to the catch (justified in a comment: the CLI is
+     the composition root, the one place that knows the MetaStore is SQLite). Added
+     `test_reindex_fails_gracefully_when_state_dir_is_a_file` and
+     `..._when_db_is_unopenable` (db path is a directory → `sqlite3.OperationalError`).
+- **Audited and deliberately NOT changed** (each checked, judged as-designed or not worth
+  it at P0): payload carries `text` (already a flagged divergence pending Anik);
+  embed-cache keyed on body hash so a prefix-only change (e.g. heading rename above an
+  unchanged body) reuses the stale vector — ratified vault design, `EMBED_VER` is the
+  recipe-level invalidation lever; `put_cached_vector` commits per vector and `scan.py`
+  reads each file twice (secret scan + hash) — perf nits dominated by embedding cost;
+  `config.py` retrieval defaults duplicated as `retrieval/pipeline.py` constants — Step 10
+  wires `Settings` through and should collapse them; python-frontmatter accepts a
+  `----` (4+ dash) boundary where `frontmatter_line_offset` doesn't — diverges only on
+  that exotic form and fails safe (frontmatter indexed as body text, line numbers stay
+  correct).
+- **Why:** Anik asked for a Steps-0-9 audit before Step 10 (code was written by
+  Sonnet + Anik). Both fixes protect Step 10's `open()` contract and the CLI's stated
+  error contract.
+- **Files:** `src/vaultrag/parsing/frontmatter.py` (body slicing), `src/vaultrag/cli.py`
+  (guarded construction + `sqlite3.Error`), `tests/test_parsing.py` (+1),
+  `tests/test_cli.py` (+2), `MEMORY.md`.
+- **Verify (all green):** `uv run pytest` **168 passed** (was 165), `uv run ruff check .`
+  clean, `uv run mypy src` clean (31 files). Line fix re-verified by direct probe: blank
+  line after `---` → heading at 5/paragraph at 7 (was 4/6); two blank lines → 6 (was 4);
+  no-frontmatter leading indented-code case still intact.
+- **Next / handoff:** Unchanged — **Step 10 (FastMCP `search` + `open` + `vaultrag mcp`)**
+  per Current state. `open()` can now trust `line_start`/`line_end`. Nothing committed
+  this session (still on `main`; branch + `agent(claude-code): …` commit when Anik asks).
 
 ### 2026-07-15 — P0 Step 9: hybrid retrieval read path (`retrieval/`, `VectorStore.query`)
 - **Did:** Completed Step 9. Extended `index/base.py` with the read side of the `VectorStore`

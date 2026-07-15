@@ -45,6 +45,47 @@ def test_reindex_fails_gracefully_when_services_are_down(tmp_path: Path) -> None
     assert "reindex failed" in result.output.lower()
 
 
+def test_reindex_fails_gracefully_when_state_dir_is_a_file(tmp_path: Path) -> None:
+    """Opening the metadata store can itself fail (bad VAULTRAG_STATE_DIR) — that too
+    must be a clean exit 1 with a message, not a traceback from before the try block."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    state_path = tmp_path / "state"
+    state_path.write_text("a file where the state dir should be")
+    result = runner.invoke(
+        app,
+        ["reindex"],
+        env={
+            "VAULTRAG_VAULT_PATH": str(vault_dir),
+            "VAULTRAG_STATE_DIR": str(state_path),
+            "VAULTRAG_PROJECT_ID": "test",
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 1
+    assert "reindex failed" in result.output.lower()
+
+
+def test_reindex_fails_gracefully_when_db_is_unopenable(tmp_path: Path) -> None:
+    """sqlite3.Error (here: the db path is a directory) exits 1 cleanly, not a traceback."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    state_dir = tmp_path / "state"
+    (state_dir / "vaultrag.db").mkdir(parents=True)
+    result = runner.invoke(
+        app,
+        ["reindex"],
+        env={
+            "VAULTRAG_VAULT_PATH": str(vault_dir),
+            "VAULTRAG_STATE_DIR": str(state_dir),
+            "VAULTRAG_PROJECT_ID": "test",
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 1
+    assert "reindex failed" in result.output.lower()
+
+
 def test_mcp_stub_runs() -> None:
     result = runner.invoke(app, ["mcp"])
     assert result.exit_code == 0
