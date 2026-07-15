@@ -10,12 +10,14 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 - **Phase:** P0 (see `CLAUDE.md` §4). **Steps 0 (scaffold) + 1 (models) + 2 (store) + 3 (scan)
   + 4 (parsing) + 5 (chunking) + 6 (embedding) + 7 (Qdrant vector store) + 8 (reindex
-  pipeline) DONE.** Next up: **Step 9 (hybrid retrieval read path, `retrieval/`)**.
+  pipeline) + 9 (hybrid retrieval read path) DONE.** Next up: **Step 10 (FastMCP `search`
+  + `open` + `vaultrag mcp` — the P0 finish line)**.
 - **What works:** the project builds and runs. `uv sync` installs; `uv run vaultrag reindex`
   builds a real index end-to-end (`--project`/`--vault` flags, env defaults otherwise);
   `uv run vaultrag --help` lists `reindex` (live) + `mcp` (still stubbed); `ruff check .`,
-  `mypy src` (30 files), and `pytest` (144 tests: 4 CLI + 7 models + 13 store + 13 scan + 33
-  parsing + 15 chunking + 22 embedding + 30 index + 7 indexer-pipeline) are all green.
+  `mypy src` (31 files), and `pytest` (165 tests: 4 CLI + 7 models + 13 store + 13 scan + 33
+  parsing + 15 chunking + 22 embedding + 41 index + 7 indexer-pipeline + 10 retrieval) are
+  all green.
   Env-driven `config.py` (pydantic-settings, `VAULTRAG_` prefix) + structlog JSON
   logging wired. `models.py` holds the normalized `Document{metadata, blocks, links}` / `Block`
   / `Chunk` shape, the `Snippet`/`SearchResult` return contract, and deterministic
@@ -66,27 +68,54 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   P1), which doesn't exist yet; this is the boot-reconcile/manual trigger, run serially.
   `cli.py`'s `reindex` command wires `Settings` → `SQLiteMetaStore`/`QdrantVectorStore`/
   `OllamaEmbedder` `.from_settings(...)` → `reindex_vault`, prints a one-line summary, exits
-  1 on `VectorStoreError`/`EmbeddingError`/`OSError` or if any file failed. Deps added:
-  `blake3`, `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`, `qdrant-client`,
-  `fastembed`, (`types-pyyaml` dev-only).
-- **What's next:** Step 9 — hybrid retrieval read path (`retrieval/`): embed query (dense,
-  Step 6's `QueryEmbedder`) + BM25 sparse (Step 7's `Bm25Embedder.embed_query`) → Qdrant
-  Query API prefetch dense k=100 + sparse k=100 **with filters inside both branches** → RRF
-  fuse → top-k → build cited `Snippet`/`SearchResult` (Step 1's contract) using the
-  payload's `text` (the Step 7 divergence — see open questions) → inject `project_id`
-  server-side (a client filter can only narrow) → honor `budget_tokens` (simple truncation
-  for P0). Ref: `../Rag/projects/vaultrag/hybrid-search.md`,
-  `../Rag/projects/vaultrag/retrieval-pipeline.md`, arch §9/§11. Rerank/parent-swap/graph
-  are explicitly P1+, not P0. Full 11-step plan: `../Rag/projects/vaultrag/p0-step-plan.md`.
-  Work in order; do not batch.
+  1 on `VectorStoreError`/`EmbeddingError`/`OSError` or if any file failed. `index/base.py`
+  now also carries the Step 9 read-side shapes: `SearchFilters` (engine-agnostic
+  tags/paths/type/modified-range narrowing — no `project_id` field, since a client can
+  never set/widen tenancy) and `ScoredChunk` (point id + RRF score + payload), plus
+  `VectorStore.query(...)` in the protocol. `QdrantVectorStore.query` runs one Query API
+  call: dense `Prefetch` (k=`prefetch_limit`, default 100) + sparse `Prefetch` (same k,
+  skipped entirely when the sparse vector has zero terms — a pure-stopword query still
+  works dense-only) → `FusionQuery(fusion=RRF)` → top `limit`; both prefetch branches carry
+  the *same* filter (`project_id` always-`must` + `_build_filter`'s translation of
+  `SearchFilters`), never a post-fusion filter, so a narrow query can't be starved of
+  candidates before fusion sees them. `retrieval/pipeline.py` (`search`, exported from
+  `retrieval/__init__.py`) is the Step 9 orchestration: embeds the (stripped) query dense
+  via `QueryEmbedder.embed_query` + sparse via `Bm25Embedder.embed_query` → one
+  `vector_store.query(...)` call → `_to_snippet` builds each `Snippet` straight from the
+  hit's payload (no SQLite round-trip — `text`/`heading_path`/`anchor`/`doc_id`/`tokens`
+  already live there per the Step 7 payload divergence) → `_pack_budget` greedily keeps
+  already-RRF-ranked hits under `budget_tokens`, **always keeping the top hit even if it
+  alone exceeds budget** (an oversized best match beats an empty response), setting
+  `truncated=True` iff a lower-ranked hit existed but didn't fit. An empty/whitespace query
+  short-circuits to an empty `SearchResult` with zero embed calls. Rerank/parent-swap/graph-
+  expand/MMR-compression (arch §10 stages 4-7) are explicitly P1+, not built here. Deps
+  added: `blake3`, `pathspec`, `markdown-it-py`, `python-frontmatter`, `httpx`,
+  `qdrant-client`, `fastembed`, (`types-pyyaml` dev-only) — no new deps at Step 9.
+- **What's next:** Step 10 — FastMCP `search` + `open` + `vaultrag mcp` (`mcp/`), the **P0
+  finish line**. FastMCP 2.x over stdio; `search(query, project?, k?, filters?,
+  budget_tokens?, mode?)` wraps Step 9's `retrieval.search(...)` (default `mode="snippets"`
+  is exactly what Step 9 returns; `compact`/`answer` modes are this step's job, not Step
+  9's) and `open(path, heading?, lines?)` (new — reads a note's exact section straight from
+  the vault, not the index); model-facing tool descriptions; `vaultrag mcp --project X`
+  entrypoint. Ref: `../Rag/reference/reference-mcp-tools.md`,
+  `../Rag/projects/vaultrag/agent-integration-layer.md`,
+  `../Rag/decisions/mcp-first-not-rest-first.md`,
+  `../Rag/decisions/snippets-not-answers-by-default.md`, arch §10/§16. **Verify (P0 "done
+  when"):** `claude mcp add vaultrag -- uv run vaultrag mcp --project X`; from Claude Code,
+  `search(...)` returns cited snippets and `open(...)` the exact section — then dogfood by
+  registering this design vault and querying it (repo `CLAUDE.md` §1). Full 11-step plan:
+  `../Rag/projects/vaultrag/p0-step-plan.md`.
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
   `CLAUDE.md` §1.
 - **Open questions / blockers:**
   - `search`/`open` response JSON shapes are unspecified in
-    `../Rag/reference/reference-mcp-tools.md` (params only) — author the cited-snippet contract
-    at Step 1 / Step 10, promote to `reference/` if it hardens.
+    `../Rag/reference/reference-mcp-tools.md` (params only) — Step 9 landed the concrete
+    contract in code (`SearchResult`/`Snippet`, `models.py`); Step 10 wraps it as the MCP
+    tool's actual return type. Promote to `reference/` once Step 10 hardens it.
   - **Vault write-back pending Anik's review:** `../Rag/agent-inbox/payload-carries-chunk-text.md`
-    (proposed) — the payload reference omits `text`, but Step 7 stores it and Step 9 needs it.
+    (proposed) — the payload reference omits `text`, but Step 7 stores it and Step 9's
+    `_to_snippet` now depends on reading it directly from the payload (no SQLite
+    round-trip), which makes this divergence load-bearing rather than theoretical.
     Ratify into `reference-metadata-schema.md` or correct it.
 
 ---
@@ -106,6 +135,113 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-15 — P0 Step 9: hybrid retrieval read path (`retrieval/`, `VectorStore.query`)
+- **Did:** Completed Step 9. Extended `index/base.py` with the read side of the `VectorStore`
+  protocol (write side landed at Step 7): `SearchFilters` (frozen dataclass — `tags`/`paths`
+  any-of, `type` exact, `modified_after`/`modified_before` range; deliberately has no
+  `project_id` field, since a client filter can only narrow tenancy, never set or widen it),
+  `ScoredChunk` (`point_id`, RRF `score`, `payload`), and `VectorStore.query(project_id, dense,
+  sparse, limit, prefetch_limit=100, filters=None) -> list[ScoredChunk]`. Implemented it in
+  `index/qdrant.py`: one `client.query_points` call with a dense `Prefetch` and a sparse
+  `Prefetch` (skipped when the sparse vector has zero terms, e.g. a pure-stopword query — dense
+  alone still carries it rather than sending a doomed empty branch), both carrying the *same*
+  filter (`_build_filter`: `project_id` always `must`, `SearchFilters` translated into more
+  `must` clauses), and `query=FusionQuery(fusion=RRF)`. Added `retrieval/pipeline.py`
+  (`search(query, *, project_id, vector_store, embedder, sparse, k=10, filters=None,
+  budget_tokens=2000, prefetch_limit=100) -> SearchResult`, exported as `vaultrag.retrieval.search`):
+  embeds the stripped query dense (`QueryEmbedder.embed_query`) + sparse
+  (`Bm25Embedder.embed_query`) → one `vector_store.query(...)` call → `_to_snippet` builds each
+  `Snippet` straight from the hit's payload → `_pack_budget` greedily packs the already-ranked
+  hits into `budget_tokens`.
+- **Why:** Step 9 of `../Rag/projects/vaultrag/p0-step-plan.md`
+  (`../Rag/projects/vaultrag/hybrid-search.md`, `../Rag/projects/vaultrag/retrieval-pipeline.md`,
+  arch §9-§11) — the read path every later MCP tool (Step 10) calls into. Filters applied inside
+  both prefetch branches (not post-hoc) is a named requirement in `hybrid-search.md`: filtering
+  only after an already-capped ANN search would starve a narrow query of candidates the search
+  never returned in the first place.
+- **Files:** `src/vaultrag/index/base.py` (`SearchFilters`, `ScoredChunk`, `VectorStore.query`
+  added to the protocol), `src/vaultrag/index/qdrant.py` (`QdrantVectorStore.query`,
+  `_build_filter`), `src/vaultrag/index/__init__.py` (exports), `src/vaultrag/retrieval/pipeline.py`
+  (new), `src/vaultrag/retrieval/__init__.py` (now exports `search`/`SearchFilters`/the size
+  constants instead of the Step-0 empty stub), `tests/test_index.py` (+11 query tests, new
+  `WordHashSparse` fake + `query_store` fixture), `tests/test_retrieval.py` (new, 10 tests),
+  `MEMORY.md`. No `pyproject.toml` changes — no new dependencies.
+- **Decisions (impl-level, consistent with the vault — no write-back needed):**
+  (1) **`SearchFilters` is engine-agnostic and lives in `index/base.py`, not `retrieval/`.**
+  It crosses the `VectorStore.query` boundary (a Qdrant-specific engine translates it), so it
+  belongs next to `SparseVector`/`ScoredChunk` as a value object the protocol itself defines —
+  `retrieval/` imports and re-exports it rather than defining its own copy, keeping one
+  definition of "what a caller can narrow by." (2) **The sparse `Prefetch` branch is omitted
+  entirely (not sent as an empty vector) when a query encodes to zero BM25 terms** — verified
+  empirically (`test_query_with_no_sparse_terms_still_returns_dense_hits`, and a manual probe
+  against `QdrantClient(":memory:")` confirming single-branch `FusionQuery(RRF)` degrades
+  gracefully to the one branch's own rank order) rather than assumed. A pure-stopword or
+  punctuation-only query is a real if rare agent input; this keeps it a normal dense-only search
+  instead of a wasted round-trip or a fragile all-zero sparse vector. (3) **Both `Prefetch`
+  branches receive the identical filter object** (`project_id` + `SearchFilters`, never applied
+  only at the outer `query_points` level) — this is the literal fix for the "no k-starvation on
+  filtered queries" requirement in `hybrid-search.md`; an outer-only filter would let the ANN
+  prefetch (capped at `prefetch_limit`) return fewer candidates than expected before the filter
+  ever ran. (4) **`_pack_budget` always keeps the top-ranked hit even if its `tokens` alone
+  exceed `budget_tokens`**, only refusing hits *after* the first. The plan's "simple truncation
+  for P0" is under-specified on this edge case; the alternative (returning zero snippets because
+  the single best match didn't fit) would make `truncated=True, snippets=[]` look identical to
+  "nothing relevant," which is a worse failure mode for an agent than one oversized-but-relevant
+  citation. Locked in by `test_budget_packing_always_keeps_the_top_hit_even_if_oversized`.
+  Revisit if P1's real compression stage (arch §13: near-dupe drop, MMR, per-doc cap) wants
+  different edge-case behavior — this is explicitly the *simple* P0 stand-in for that stage, not
+  a permanent policy. (5) **`retrieval.search` builds `Snippet`s straight from the Qdrant
+  payload, never re-reading SQLite** — this is what makes the Step 7 `payload-carries-chunk-text`
+  divergence load-bearing rather than a nice-to-have (see Open questions): the payload is the
+  only place `text` lives at all, since the SQLite `chunks` table is structure-only. (6) Query
+  embedding always goes through `query.strip()` first, and an empty/whitespace result
+  short-circuits to an empty `SearchResult` **before** calling either embedder — an agent
+  sending a blank query is a real (if degenerate) input, and embedding an empty string is pure
+  waste, not a meaningful vector.
+- **Verify (Step 9 gate, all green):** `uv run pytest` **165 passed** (4 CLI + 7 models + 13
+  store + 13 scan + 33 parsing + 15 chunking + 22 embedding + 41 index + 7 indexer-pipeline + 10
+  retrieval); `uv run ruff check .` clean; `uv run mypy src` clean (31 files). New `test_index.py`
+  coverage runs `QdrantVectorStore.query` against a real `QdrantClient(":memory:")` with a new
+  `WordHashSparse` fake (hashes whitespace tokens to stable indices — unlike the existing
+  constant-vector `FakeSparse`, this actually distinguishes texts, which is what's needed to
+  prove *fusion* rather than just plumbing): tenancy scoping (another project's points never
+  returned), `limit` respected, **the plan's named verify criterion** — an exact-identifier query
+  (`ERR_CONN_RESET`) ranks its chunk above a purely-irrelevant one via BM25 signal even though its
+  dense vector is orthogonal to the query — all four `SearchFilters` dimensions narrowing
+  independently (tags/paths/type/modified-range), dims-mismatch and unreachable-Qdrant raising,
+  and the empty-sparse-vector dense-only path. `test_retrieval.py` isolates pure orchestration
+  against a `FakeVectorStore` double (RRF fusion itself is Step 7's job, already covered above):
+  `Snippet` field mapping from payload (including a payload missing optional keys defaulting
+  safely), `project_id`/`filters`/`k`/`prefetch_limit` forwarded untouched to `vector_store.query`
+  (including the documented defaults when not overridden), the stripped-query embedding calls,
+  the empty-query short-circuit making zero embed calls, and all three budget-packing shapes
+  (fits with no truncation; truncates a middle/tail hit; keeps an oversized top hit alone).
+- **Live-integration: VERIFIED.** Both `docker compose`'s `qdrant` and Ollama's
+  `qwen3-embedding:0.6b` were already up from the Step 7/8 sessions. Wrote a throwaway 3-note
+  fixture vault (scratchpad only, never committed) — one note about connection pooling, one
+  containing the literal string `ERR_CONN_RESET`, one an unrelated changelog entry — and ran the
+  real `reindex_vault` (Step 8) into an isolated `chunks_live_verify_step9` collection under
+  project `step9-live-verify` (dropped after; the real `chunks` collection was never touched).
+  Then called the real `vaultrag.retrieval.search` (real Ollama dense embeddings, real Qdrant
+  server, real FastEmbed BM25 — no fakes anywhere in this pass) and confirmed, against actual
+  engine behavior rather than local-mode: **exact-identifier query `"ERR_CONN_RESET"` ranks the
+  matching note first** (score 1.0 vs 0.33/0.25 for the others); **a paraphrase query** ("how do
+  we reuse sockets to avoid repeated handshakes") **ranks the connection-pooling note first via
+  dense** with no literal token overlap; a foreign `project_id` sees zero results (tenancy);
+  `SearchFilters(tags=(...))` correctly narrows to just the matching note; `budget_tokens=1`
+  still returns exactly one snippet with `truncated=True` (decision #4 confirmed live, not just
+  in a fake). This closes the same category of gap Step 7's live session flagged — local mode's
+  RRF/IDF aren't necessarily the real engine's, so Step 9 wasn't trustworthy until checked
+  against a live server, and now has been.
+- **Next / handoff:** Start **Step 10 — FastMCP `search` + `open` + `vaultrag mcp` (`mcp/`)** —
+  the **P0 finish line**, per **Current state → What's next** above. `retrieval.search(...)` is
+  the function the MCP `search` tool wraps directly (its `mode="snippets"` default *is* this
+  function's return value; `compact`/`answer` modes and `filters`/`k`/`budget_tokens` param
+  parsing from the MCP call are Step 10's job). `open(path, heading?, lines?)` is new work, not
+  a wrapper — it reads a note's exact section from the vault (or an already-indexed chunk's
+  `line_start`/`line_end`, TBD at Step 10) rather than the Qdrant index. Nothing committed this
+  session (still on `main`; branch + `agent(claude-code): …` commit when Anik asks).
 
 ### 2026-07-15 — P0 Step 8: wire the indexing pipeline (`indexer/pipeline.py`, `vaultrag reindex`)
 - **Did:** Completed Step 8. Added `indexer/pipeline.py`: `reindex_vault(project_id, vault_path,

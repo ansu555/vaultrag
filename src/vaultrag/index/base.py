@@ -7,8 +7,8 @@ the filterable payload for every chunk. Structure and ops state live in the
 
 :class:`VectorStore` is a :class:`typing.Protocol` so the engine stays swappable
 (CLAUDE.md §5). Qdrant is the P0 implementation and the only one planned — see
-``../Rag/decisions/vector-search-qdrant.md``. The protocol deliberately covers the
-*write* side only (ensure/upsert/delete/count); the hybrid read path is Step 9.
+``../Rag/decisions/vector-search-qdrant.md``. Write side (ensure/upsert/delete/count)
+landed at Step 7; :meth:`VectorStore.query` is the Step 9 hybrid read side.
 
 Sparse (BM25) vectors are modeled here rather than in ``vaultrag.embedding`` because
 they are a property of *this* layer: BM25 term weights only mean something to an engine
@@ -53,6 +53,40 @@ class SparseVector:
             raise ValueError(
                 f"sparse vector is ragged: {len(self.indices)} indices vs {len(self.values)} values"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class SearchFilters:
+    """Optional narrowing filters for the Step 9 read path — engine-agnostic.
+
+    Mirrors the four filterable payload fields (``../Rag/reference/reference-metadata-schema.md``):
+    ``tags``/``path``/``type`` (keyword-indexed, exact match) and ``modified_ts`` (integer
+    range). Every field here can only narrow a query already scoped to one ``project_id``
+    server-side — there is no field for ``project_id`` itself, because a client can never
+    set or widen tenancy (CLAUDE.md §6); the caller passes ``project_id`` to
+    :meth:`VectorStore.query` directly instead.
+    """
+
+    tags: tuple[str, ...] = ()  # match ANY of these tags
+    paths: tuple[str, ...] = ()  # match ANY of these exact vault-relative paths
+    type: str | None = None  # exact DocType value, e.g. "note"
+    modified_after: int | None = None  # epoch seconds, inclusive
+    modified_before: int | None = None  # epoch seconds, exclusive
+
+
+@dataclass(frozen=True, slots=True)
+class ScoredChunk:
+    """One fused hit from :meth:`VectorStore.query`: a point id, its RRF score, and payload.
+
+    ``payload`` is the same dict :func:`~vaultrag.index.payload.chunk_payload` wrote — the
+    read path (Step 9) builds :class:`~vaultrag.models.Snippet` s straight from it rather
+    than re-fetching from SQLite, since ``text``/``heading_path``/``anchor``/etc. already
+    live there (see ``index/payload.py``'s docstring on why ``text`` is in the payload).
+    """
+
+    point_id: str
+    score: float
+    payload: Mapping[str, object]
 
 
 @runtime_checkable
@@ -115,6 +149,26 @@ class VectorStore(Protocol):
 
     def delete_by_doc(self, project_id: str, doc_id: str) -> None:
         """Delete every point of one document. Deleting nothing is not an error."""
+
+    def query(
+        self,
+        *,
+        project_id: str,
+        dense: Vector,
+        sparse: SparseVector,
+        limit: int,
+        prefetch_limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[ScoredChunk]:
+        """Hybrid search: dense + sparse prefetch, fused server-side, top ``limit`` hits.
+
+        Both branches prefetch ``prefetch_limit`` candidates (default 100) and are scoped
+        to ``project_id`` **inside the prefetch itself**, not as a post-filter — filtering
+        after an already-capped ANN search would starve a narrow query of candidates before
+        fusion ever sees them (``../Rag/projects/vaultrag/hybrid-search.md``). ``filters``
+        narrows the same two branches further; it can never widen past ``project_id``.
+        Fusion is RRF (rank-based, no score calibration needed across the two engines).
+        """
 
     def count(self, project_id: str | None = None) -> int:
         """Exact point count, optionally scoped to one project."""

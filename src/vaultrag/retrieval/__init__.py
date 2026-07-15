@@ -1,4 +1,25 @@
 """vaultrag.retrieval — Hybrid search read path: dense + BM25 to RRF fuse to cited snippets. Step 9.
 
-Empty at Step 0 — see ../Rag/projects/vaultrag/p0-step-plan.md.
+:func:`search` is the one entry point: embed query (dense + BM25 sparse) → hybrid RRF
+query against the Step 7 :class:`~vaultrag.index.base.VectorStore` → budget-packed
+:class:`~vaultrag.models.SearchResult`. See ``pipeline.py`` and
+``../Rag/projects/vaultrag/{hybrid-search,retrieval-pipeline}.md``.
 """
+
+from __future__ import annotations
+
+from vaultrag.index.base import SearchFilters
+from vaultrag.retrieval.pipeline import (
+    DEFAULT_BUDGET_TOKENS,
+    DEFAULT_K,
+    DEFAULT_PREFETCH_LIMIT,
+    search,
+)
+
+__all__ = [
+    "DEFAULT_BUDGET_TOKENS",
+    "DEFAULT_K",
+    "DEFAULT_PREFETCH_LIMIT",
+    "SearchFilters",
+    "search",
+]

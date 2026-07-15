@@ -25,6 +25,8 @@ from vaultrag.index import (
     SPARSE_VECTOR,
     Bm25Embedder,
     QdrantVectorStore,
+    ScoredChunk,
+    SearchFilters,
     SparseEmbedder,
     SparseVector,
     VectorStore,
@@ -68,6 +70,35 @@ class FakeSparse:
     def embed_query(self, text: str) -> SparseVector:
         self.seen.append(text)
         return SparseVector(indices=[1], values=[1.0])
+
+
+class WordHashSparse:
+    """A minimal but *distinguishing* BM25 stand-in for hybrid-query tests.
+
+    Unlike ``FakeSparse`` (a constant vector, fine for upsert-path tests that only check
+    plumbing), this hashes each whitespace token to a stable index so different texts
+    produce different sparse vectors — enough to prove the *engine's* RRF fusion, not
+    FastEmbed specifically, combines dense + sparse signal correctly.
+    """
+
+    @property
+    def model(self) -> str:
+        return "fake-wordhash-bm25"
+
+    def embed_documents(self, texts: Sequence[str]) -> list[SparseVector]:
+        return [self._encode(t) for t in texts]
+
+    def embed_query(self, text: str) -> SparseVector:
+        return self._encode(text)
+
+    def _encode(self, text: str) -> SparseVector:
+        terms: dict[int, float] = {}
+        for word in text.lower().split():
+            idx = hash(word) % (2**31)
+            terms[idx] = terms.get(idx, 0.0) + 1.0
+        if not terms:
+            return SparseVector(indices=[], values=[])
+        return SparseVector(indices=list(terms.keys()), values=list(terms.values()))
 
 
 def make_chunk(
@@ -119,6 +150,22 @@ def store() -> QdrantVectorStore:
         collection="chunks",
         client=QdrantClient(":memory:"),
         sparse=FakeSparse(),
+    )
+    s.ensure_collection()
+    return s
+
+
+@pytest.fixture
+def query_store() -> QdrantVectorStore:
+    """Same as ``store`` but with a *distinguishing* sparse encoder — the ``store``
+    fixture's ``FakeSparse`` returns an identical vector for every text, which is fine for
+    upsert-path plumbing tests but useless for proving hybrid-query fusion behaves.
+    """
+    s = QdrantVectorStore(
+        dims=DIMS,
+        collection="chunks",
+        client=QdrantClient(":memory:"),
+        sparse=WordHashSparse(),
     )
     s.ensure_collection()
     return s
@@ -370,6 +417,210 @@ def test_select_frontmatter_keeps_filterable_values_only() -> None:
         }
     )
     assert kept == {"status": "active", "priority": 3, "done": False, "tags": ["a", "b"]}
+
+
+# ---------------------------------------------------------------------------
+# Hybrid query — the Step 9 read path (retrieval/ builds Snippets on top of this)
+# ---------------------------------------------------------------------------
+def _seed_query_fixture(store: QdrantVectorStore) -> dict[str, Chunk]:
+    """Three chunks with distinguishable dense *and* sparse signal.
+
+    - ``dense_match``: dense vector identical to the query's, body has no error code.
+    - ``bm25_match``: dense vector orthogonal to the query's, body *is* the exact
+      identifier the query asks for — proves fusion, not dense alone, surfaces it.
+    - ``irrelevant``: neither dense- nor sparse-similar; used to prove filters narrow.
+    """
+    dense_match = make_chunk(
+        ix=0, text="How connection pooling reuses sockets.", tags=["component/pool"]
+    )
+    bm25_match = make_chunk(
+        ix=1, text="Investigate ERR_CONN_RESET before retrying.", tags=["component/errors"]
+    )
+    irrelevant = make_chunk(ix=2, text="Unrelated changelog entry.", tags=["component/docs"])
+    vectors = {
+        dense_match.chunk_hash: [1.0, 0.0, 0.0, 0.0],
+        bm25_match.chunk_hash: [0.0, 1.0, 0.0, 0.0],
+        irrelevant.chunk_hash: [0.0, 0.0, 1.0, 0.0],
+    }
+    store.upsert_chunks(
+        [dense_match, bm25_match, irrelevant], vectors, embed_model="fake-model"
+    )
+    return {"dense_match": dense_match, "bm25_match": bm25_match, "irrelevant": irrelevant}
+
+
+def test_query_returns_relevant_hits_scoped_to_project(
+    query_store: QdrantVectorStore,
+) -> None:
+    seeded = _seed_query_fixture(query_store)
+    other = make_chunk(ix=0, project_id=OTHER_PROJECT, text="Someone else's ERR_CONN_RESET note")
+    query_store.upsert_chunks(
+        [other], {other.chunk_hash: [0.0, 1.0, 0.0, 0.0]}, embed_model="fake-model"
+    )
+
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=WordHashSparse().embed_query("connection pooling sockets"),
+        limit=10,
+    )
+
+    point_ids = {hit.point_id for hit in hits}
+    assert seeded["dense_match"].point_id in point_ids
+    assert other.point_id not in point_ids  # tenancy: never another project's points
+
+
+def test_query_fusion_surfaces_exact_identifier_via_bm25(
+    query_store: QdrantVectorStore,
+) -> None:
+    """Dense alone would favor `dense_match`; RRF fusion must still rank the exact-token
+    hit highly on the strength of its sparse match (arch §11, plan Step 9 verify)."""
+    seeded = _seed_query_fixture(query_store)
+    sparse = WordHashSparse()
+
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],  # closest to dense_match, orthogonal to bm25_match
+        sparse=sparse.embed_query("ERR_CONN_RESET"),
+        limit=10,
+    )
+
+    ranked_ids = [hit.point_id for hit in hits]
+    assert seeded["bm25_match"].point_id in ranked_ids
+    # the exact-identifier hit must not be buried behind the purely-irrelevant chunk
+    assert ranked_ids.index(seeded["bm25_match"].point_id) < ranked_ids.index(
+        seeded["irrelevant"].point_id
+    )
+
+
+def test_query_respects_limit(query_store: QdrantVectorStore) -> None:
+    _seed_query_fixture(query_store)
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=SparseVector(indices=[], values=[]),
+        limit=2,
+    )
+    assert len(hits) == 2
+
+
+def test_query_with_no_sparse_terms_still_returns_dense_hits(
+    query_store: QdrantVectorStore,
+) -> None:
+    """A pure-stopword query encodes to an empty sparse vector; the dense branch alone
+    must still carry the query rather than the call erroring out."""
+    _seed_query_fixture(query_store)
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=SparseVector(indices=[], values=[]),
+        limit=10,
+    )
+    assert len(hits) == 3
+
+
+def test_query_filters_by_tags_narrow_results(query_store: QdrantVectorStore) -> None:
+    seeded = _seed_query_fixture(query_store)
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=SparseVector(indices=[], values=[]),
+        limit=10,
+        filters=SearchFilters(tags=("component/errors",)),
+    )
+    assert {hit.point_id for hit in hits} == {seeded["bm25_match"].point_id}
+
+
+def test_query_filters_by_paths_narrow_results(query_store: QdrantVectorStore) -> None:
+    seeded = _seed_query_fixture(query_store)
+    other_path_chunk = make_chunk(
+        ix=0, path="decisions/vector-search-qdrant.md", text="A different note."
+    )
+    query_store.upsert_chunks(
+        [other_path_chunk],
+        {other_path_chunk.chunk_hash: [0.0, 0.0, 0.0, 1.0]},
+        embed_model="fake-model",
+    )
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=SparseVector(indices=[], values=[]),
+        limit=10,
+        filters=SearchFilters(paths=(PATH,)),
+    )
+    point_ids = {hit.point_id for hit in hits}
+    assert seeded["dense_match"].point_id in point_ids
+    assert other_path_chunk.point_id not in point_ids
+
+
+def test_query_filters_by_type_narrow_results(query_store: QdrantVectorStore) -> None:
+    _seed_query_fixture(query_store)
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=SparseVector(indices=[], values=[]),
+        limit=10,
+        filters=SearchFilters(type="pdf"),  # none of the fixture chunks are PDFs
+    )
+    assert hits == []
+
+
+def test_query_filters_by_modified_range_narrow_results(
+    query_store: QdrantVectorStore,
+) -> None:
+    old = make_chunk(ix=0, text="Old note.").model_copy(update={"modified_ts": 1_000})
+    new = make_chunk(ix=1, text="New note.").model_copy(update={"modified_ts": 2_000_000})
+    query_store.upsert_chunks(
+        [old, new],
+        {old.chunk_hash: [1.0, 0.0, 0.0, 0.0], new.chunk_hash: [1.0, 0.0, 0.0, 0.0]},
+        embed_model="fake-model",
+    )
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=SparseVector(indices=[], values=[]),
+        limit=10,
+        filters=SearchFilters(modified_after=1_500_000),
+    )
+    assert {hit.point_id for hit in hits} == {new.point_id}
+
+
+def test_query_dims_mismatch_raises(query_store: QdrantVectorStore) -> None:
+    with pytest.raises(VectorStoreError, match=r"is 1-d"):
+        query_store.query(
+            project_id=PROJECT,
+            dense=[1.0],
+            sparse=SparseVector(indices=[], values=[]),
+            limit=10,
+        )
+
+
+def test_query_unreachable_qdrant_raises() -> None:
+    store = QdrantVectorStore(dims=DIMS, url="http://localhost:6399", sparse=WordHashSparse())
+    with pytest.raises(VectorStoreError, match="hybrid query"):
+        store.query(
+            project_id=PROJECT,
+            dense=[1.0, 0.0, 0.0, 0.0],
+            sparse=SparseVector(indices=[], values=[]),
+            limit=10,
+        )
+    store.close()
+
+
+def test_query_result_payload_matches_scored_chunk_shape(
+    query_store: QdrantVectorStore,
+) -> None:
+    seeded = _seed_query_fixture(query_store)
+    hits = query_store.query(
+        project_id=PROJECT,
+        dense=[1.0, 0.0, 0.0, 0.0],
+        sparse=SparseVector(indices=[], values=[]),
+        limit=1,
+    )
+    assert len(hits) == 1
+    hit = hits[0]
+    assert isinstance(hit, ScoredChunk)
+    assert hit.point_id == seeded["dense_match"].point_id
+    assert hit.payload["text"] == "How connection pooling reuses sockets."
 
 
 # ---------------------------------------------------------------------------

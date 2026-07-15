@@ -26,7 +26,13 @@ from qdrant_client.http.exceptions import ApiException
 
 from vaultrag.config import Settings
 from vaultrag.embedding.base import Vector
-from vaultrag.index.base import SparseEmbedder, SparseVector, VectorStoreError
+from vaultrag.index.base import (
+    ScoredChunk,
+    SearchFilters,
+    SparseEmbedder,
+    SparseVector,
+    VectorStoreError,
+)
 from vaultrag.index.payload import chunk_payload
 from vaultrag.index.sparse import Bm25Embedder
 from vaultrag.models import Chunk, Document
@@ -284,6 +290,59 @@ class QdrantVectorStore:
             ) from exc
 
     # --- reads ----------------------------------------------------------------
+    def query(
+        self,
+        *,
+        project_id: str,
+        dense: Vector,
+        sparse: SparseVector,
+        limit: int,
+        prefetch_limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[ScoredChunk]:
+        """Hybrid RRF search: one Query API call, two filtered prefetch branches.
+
+        Both branches carry the same filter (``project_id`` + ``filters``) so neither can
+        starve the other before fusion — a post-hoc filter on the fused list would let a
+        narrow query lose candidates the ANN search never returned in the first place
+        (``../Rag/projects/vaultrag/hybrid-search.md``).
+        """
+        if len(dense) != self._dims:
+            raise VectorStoreError(
+                f"query vector is {len(dense)}-d but the collection stores {self._dims}-d"
+            )
+        qfilter = _build_filter(project_id, filters)
+        prefetch = [
+            models.Prefetch(
+                query=list(dense), using=DENSE_VECTOR, filter=qfilter, limit=prefetch_limit
+            )
+        ]
+        if sparse.indices:
+            prefetch.append(
+                models.Prefetch(
+                    query=models.SparseVector(indices=sparse.indices, values=sparse.values),
+                    using=SPARSE_VECTOR,
+                    filter=qfilter,
+                    limit=prefetch_limit,
+                )
+            )
+        try:
+            result = self._client.query_points(
+                self._collection,
+                prefetch=prefetch,
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=limit,
+                with_payload=True,
+            )
+        except _CLIENT_ERRORS as exc:
+            raise VectorStoreError(
+                f"hybrid query on {self._collection!r} failed: {exc}"
+            ) from exc
+        return [
+            ScoredChunk(point_id=str(point.id), score=point.score, payload=point.payload or {})
+            for point in result.points
+        ]
+
     def count(self, project_id: str | None = None) -> int:
         """Exact point count, optionally scoped to one project."""
         count_filter = (
@@ -312,3 +371,31 @@ class QdrantVectorStore:
 
 def _match(key: str, value: str) -> models.FieldCondition:
     return models.FieldCondition(key=key, match=models.MatchValue(value=value))
+
+
+def _build_filter(project_id: str, filters: SearchFilters | None) -> models.Filter:
+    """``project_id`` is always a ``must`` clause; ``filters`` can only add more of them —
+    there is no way to reach this function with a condition that widens past one project.
+    """
+    must: list[models.Condition] = [_match("project_id", project_id)]
+    if filters is not None:
+        if filters.tags:
+            must.append(
+                models.FieldCondition(key="tags", match=models.MatchAny(any=list(filters.tags)))
+            )
+        if filters.paths:
+            must.append(
+                models.FieldCondition(key="path", match=models.MatchAny(any=list(filters.paths)))
+            )
+        if filters.type is not None:
+            must.append(_match("type", filters.type))
+        if filters.modified_after is not None or filters.modified_before is not None:
+            must.append(
+                models.FieldCondition(
+                    key="modified_ts",
+                    range=models.Range(
+                        gte=filters.modified_after, lt=filters.modified_before
+                    ),
+                )
+            )
+    return models.Filter(must=must)
