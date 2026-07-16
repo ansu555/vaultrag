@@ -35,7 +35,9 @@ def test_rerank_reorders_a_fused_set_by_cross_encoder_score() -> None:
         _cand("b", 0.20, "the answer: dense plus bm25 fused by rrf"),
         _cand("c", 0.10, "another off-topic note"),
     ]
-    reranker = FakeReranker({"the answer: dense plus bm25 fused by rrf": 0.9})
+    # a/c stay above the 0.3 threshold so this isolates *reordering*, not dropping; their
+    # equal scores keep fusion order (stable sort), so b is promoted over both.
+    reranker = FakeReranker({"the answer: dense plus bm25 fused by rrf": 0.9}, default=0.5)
     # dominant_ratio=0 disables the fast path so we always exercise the model.
     out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0))
     assert [c.point_id for c in out] == ["b", "a", "c"]
@@ -60,16 +62,31 @@ def test_exact_identifier_query_still_ranks_first_after_rerank() -> None:
 # ---------------------------------------------------------------------------
 def test_sub_threshold_candidates_are_dropped_not_padded() -> None:
     cands = [_cand("a", 0.5, "good"), _cand("b", 0.4, "garbage"), _cand("c", 0.3, "more garbage")]
-    reranker = FakeReranker({"good": 0.8}, default=0.05)  # b, c below 0.3
-    out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0))
+    reranker = FakeReranker({"good": 0.8}, default=0.05)  # b, c below the 0.3 threshold
+    out = rerank_candidates(
+        "q", cands, reranker, keep=10, params=RerankParams(threshold=0.3, dominant_ratio=0)
+    )
     assert [c.point_id for c in out] == ["a"]
 
 
 def test_all_below_threshold_returns_empty_an_honest_no_result() -> None:
     cands = [_cand("a", 0.5, "x"), _cand("b", 0.4, "y")]
     reranker = FakeReranker(default=0.1)
-    out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0))
+    out = rerank_candidates(
+        "q", cands, reranker, keep=10, params=RerankParams(threshold=0.3, dominant_ratio=0)
+    )
     assert out == []
+
+
+def test_default_threshold_is_no_floor_so_reorder_never_drops() -> None:
+    """Default RerankParams has no absolute floor (0.0): rerank reorders + caps to keep, but
+    never evicts on score alone — the measured fix for the vault's 0.3 recall regression
+    (see agent-inbox/rerank-threshold-should-be-per-vault-not-global.md)."""
+    assert RerankParams().threshold == 0.0
+    cands = [_cand("a", 0.5, "x"), _cand("b", 0.4, "y")]
+    reranker = FakeReranker(default=0.001)  # would be dropped by any positive floor
+    out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0))
+    assert {c.point_id for c in out} == {"a", "b"}
 
 
 def test_keep_caps_the_number_of_survivors() -> None:
@@ -125,9 +142,7 @@ def test_single_candidate_is_returned_without_calling_the_model() -> None:
 def test_top_n_bounds_what_is_sent_to_the_model() -> None:
     cands = [_cand(str(i), 0.5, f"b{i}") for i in range(10)]
     reranker = FakeReranker(default=0.9)
-    rerank_candidates(
-        "q", cands, reranker, keep=10, params=RerankParams(top_n=3, dominant_ratio=0)
-    )
+    rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(top_n=3, dominant_ratio=0))
     _, passages = reranker.calls[0]
     assert passages == ["b0", "b1", "b2"]
 
@@ -153,10 +168,14 @@ def test_load_reranker_returns_none_when_disabled() -> None:
     assert load_reranker(enabled=False) is None
 
 
-def test_load_reranker_falls_back_to_noop_when_the_model_cannot_load() -> None:
-    # A repo id that cannot resolve makes BgeReranker.load raise RerankError; the loader
-    # must swallow it into a NoOpReranker so the server still comes up (graceful degrade).
-    reranker = load_reranker(
-        enabled=True, repo_id="vaultrag/does-not-exist-xyz", model_file="onnx/model_int8.onnx"
-    )
-    assert isinstance(reranker, NoOpReranker)
+def test_load_reranker_falls_back_to_noop_when_the_model_cannot_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model that can't be fetched/opened must degrade to NoOp, never raise — the server
+    still comes up rerank-off. Monkeypatched so the test is hermetic (no HF network)."""
+
+    def _boom(**_: object) -> object:
+        raise RerankError("simulated offline / missing export")
+
+    monkeypatch.setattr("vaultrag.retrieval.rerank.BgeReranker.load", _boom)
+    assert isinstance(load_reranker(enabled=True), NoOpReranker)

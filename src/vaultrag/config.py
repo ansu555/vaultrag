@@ -79,11 +79,16 @@ class Settings(BaseSettings):
     # --- reranker (retrieval stage 4; P1 Stage 1) -----------------------------
     # bge-reranker-v2-m3 ONNX-int8, loaded directly via onnxruntime (no torch/transformers).
     # See ../Rag/decisions/reranker-bge-v2-m3.md and projects/vaultrag/reranking.md.
-    # Enabled by default (the biggest single accuracy lever, arch §12); if the model can't
-    # be fetched/loaded, retrieval degrades gracefully to a no-op reranker (fusion order).
+    # DISABLED by default: on the P1 golden set, fusion-only beat rerank at every threshold
+    # (recall@10 1.00 / MRR@5 0.825 vs rerank's best 1.00 / 0.796) — we don't ship a measured
+    # regression on by default. The stage is code-complete behind this flag; flip it on with
+    # VAULTRAG_RERANK_ENABLED=true once it beats fusion on a harder golden set. See
+    # ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md. When on, a
+    # missing/unfetchable model degrades gracefully to a no-op reranker (fusion order).
     rerank_enabled: bool = Field(
-        default=True,
-        description="Run the cross-encoder rerank stage after RRF fusion.",
+        default=False,
+        description="Run the cross-encoder rerank stage after RRF fusion. Off by default "
+        "(fusion currently scores higher on the golden set); enable per-vault once it wins.",
     )
     rerank_model: str = Field(
         default="onnx-community/bge-reranker-v2-m3-ONNX",
@@ -98,13 +103,16 @@ class Settings(BaseSettings):
         description="Number of top fused candidates fed to the cross-encoder (top-50 → top-k).",
     )
     rerank_threshold: float = Field(
-        default=0.3,
-        description="Drop candidates whose rerank score is below this (garbage, not padding).",
+        default=0.0,
+        description="Absolute rerank-score floor. Default 0.0 (no floor): a fixed cutoff is "
+        "score-distribution-dependent and evicts relevant chunks (the vault's 0.3 was "
+        "measured to regress recall — see agent-inbox/rerank-threshold-should-be-per-vault). "
+        "Raise per-vault to drop low-relevance hits.",
     )
     rerank_dominant_ratio: float = Field(
         default=1.5,
-        description="Skip reranking when the top-1 fusion score is ≥ this × the top-2 "
-        "(known-item fast path). Set to 0 to always rerank.",
+        description="Skip reranking when the top-1 fusion score is at least this multiple "
+        "of the top-2 (known-item fast path). Set to 0 to always rerank.",
     )
 
     # --- logging --------------------------------------------------------------

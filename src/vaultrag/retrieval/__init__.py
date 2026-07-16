@@ -18,9 +18,9 @@ from vaultrag.retrieval.pipeline import (
 from vaultrag.retrieval.rerank import (
     BgeReranker,
     NoOpReranker,
+    Reranker,
     RerankError,
     RerankParams,
-    Reranker,
     load_reranker,
     rerank_candidates,
 )

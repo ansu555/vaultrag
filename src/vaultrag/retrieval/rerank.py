@@ -1,7 +1,7 @@
 """Cross-encoder reranking — retrieval stage 4 (P1 Stage 1), the biggest accuracy lever.
 
 After RRF fusion (stage 3) the top candidates are re-scored by a cross-encoder that reads
-``query × child chunk`` *together* (not two independent embeddings), which is far more
+``query x child chunk`` *together* (not two independent embeddings), which is far more
 precise than the bi-encoder recall pass — see ``../Rag/decisions/reranker-bge-v2-m3.md``
 and ``../Rag/projects/vaultrag/reranking.md`` (arch §12).
 
@@ -33,7 +33,15 @@ from vaultrag.logging import get_logger
 log = get_logger(__name__)
 
 DEFAULT_TOP_N = 50
-DEFAULT_THRESHOLD = 0.3
+# No absolute floor by default. The vault's 0.3 (reranking.md / reranker-bge-v2-m3.md) was
+# measured to systematically evict *relevant* chunks — bge-v2-m3's sigmoid scores land at
+# ~0.02-0.25 on real content, so a fixed floor is score-distribution-dependent and can't
+# generalize across vaults. A threshold sweep on the design vault (P1 Stage 1) showed 0.3
+# was the worst point (recall@10 0.90) and 0.0 the best (1.00). Superseded pending
+# ratification — see ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md
+# (the durable fix is a distribution-free / per-vault-calibrated gate, not another magic
+# number). Raise this per-vault (VAULTRAG_RERANK_THRESHOLD) to drop low-relevance hits.
+DEFAULT_THRESHOLD = 0.0
 DEFAULT_DOMINANT_RATIO = 1.5
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_BATCH = 16
@@ -68,7 +76,7 @@ class RerankParams:
 
 @runtime_checkable
 class Reranker(Protocol):
-    """Scores ``query × passage`` pairs. One score per passage, order preserved.
+    """Scores ``query x passage`` pairs. One score per passage, order preserved.
 
     Cross-encoders are CPU-bound, so implementations are synchronous and async callers run
     them in a worker thread (CLAUDE.md §5), exactly like the dense
@@ -115,7 +123,7 @@ def rerank_candidates(
 
     ``reranker is None`` means the stage is disabled entirely — candidates pass through
     (trimmed to ``keep``) with their RRF scores intact. Otherwise the top ``params.top_n``
-    are scored ``query × child text``, re-sorted by score, thresholded, and capped to
+    are scored ``query x child text``, re-sorted by score, thresholded, and capped to
     ``keep``. The known-item fast path (top-1 fusion dominance) returns the fused order
     without calling the model. A candidate whose payload has no ``text`` still scores
     (cross-encoders handle empty passages) — it just tends to rank last.
@@ -132,9 +140,7 @@ def rerank_candidates(
     subset = candidates[: params.top_n]
     scores = reranker.score(query, [_candidate_text(c) for c in subset])
     if len(scores) != len(subset):
-        raise RerankError(
-            f"reranker returned {len(scores)} scores for {len(subset)} passages"
-        )
+        raise RerankError(f"reranker returned {len(scores)} scores for {len(subset)} passages")
     rescored = [replace(c, score=float(s)) for c, s in zip(subset, scores, strict=True)]
     # Stable sort: ties (e.g. every NoOp score) keep their fusion order.
     rescored.sort(key=lambda c: c.score, reverse=True)
@@ -217,9 +223,12 @@ class BgeReranker:
         tokenizer.enable_truncation(max_length=max_length, strategy="only_second")
         tokenizer.enable_padding(pad_id=pad_id if pad_id is not None else 1, pad_token="<pad>")
 
-        log.info("rerank.loaded", model=repo_id, file=model_file, inputs=sorted(
-            i.name for i in session.get_inputs()
-        ))
+        log.info(
+            "rerank.loaded",
+            model=repo_id,
+            file=model_file,
+            inputs=sorted(i.name for i in session.get_inputs()),
+        )
         return cls(session=session, tokenizer=tokenizer, model=repo_id, batch_size=batch_size)
 
     @property

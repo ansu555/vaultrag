@@ -8,7 +8,29 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P0 is DONE — code-complete AND acceptance-complete.** Steps 0 (scaffold) + 1
+- **Phase:** **P1 IN PROGRESS — Stage 1 (reranker) code-complete + eval'd.** The rerank
+  stage (retrieval stage 4) is built, wired, green (234 tests, ruff, mypy), and run against
+  the live `vaultrag-design` index. `retrieval/rerank.py`: `Reranker` protocol + `BgeReranker`
+  (bge-reranker-v2-m3 ONNX-int8, loaded directly via `onnxruntime` from
+  `onnx-community/bge-reranker-v2-m3-ONNX`, tokenized with `tokenizers` — no torch/transformers,
+  verified working) + `NoOpReranker` graceful fallback + `load_reranker` composition helper.
+  Inserted into `retrieval/pipeline.py` after RRF fusion (fetch widens k→top_n=50, rerank,
+  threshold, cut to k), config knobs added, wired through `mcp/server.py` + `cli.py mcp`.
+  Minimal golden set + eval harness live at `tests/eval/` (decision 3; 20 pairs, recall@10/MRR@5,
+  manual-run only). **Key finding (see 2026-07-16 log):** the eval caught that the vault's
+  **0.3 rerank threshold regresses retrieval** (recall@10 1.00→0.90) — bge-v2-m3's sigmoid
+  scores relevant chunks at ~0.02–0.25, so a fixed floor evicts them. A full threshold sweep
+  confirmed 0.3 is the worst point and **0.0 (no floor) the best**; the threshold default is
+  now **0.0**, superseding the vault's 0.3 pending ratification of
+  `../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md` (Anik's insight:
+  score-distribution thresholds must be per-vault/auto-calibrated, not one global number).
+  **Rerank is DISABLED by default** (`rerank_enabled=False`, Anik's call): fusion-only beat
+  rerank at every threshold on this golden set, so we don't ship a measured regression on by
+  default — the stage is code-complete behind the flag (`VAULTRAG_RERANK_ENABLED=true`).
+  **Next: Stage 2 (parent-child + parent-swap)** — or, before flipping rerank on, build the
+  harder/paraphrase golden set the note calls for (this set is too title-matchy to show
+  rerank's value; even at 0 floor it's marginally < fusion on it).
+- **(P0 archive)** **P0 was DONE — code-complete AND acceptance-complete.** Steps 0 (scaffold) + 1
   (models) + 2 (store) + 3 (scan) + 4 (parsing) + 5 (chunking) + 6 (embedding) + 7 (Qdrant
   vector store) + 8 (reindex pipeline) + 9 (hybrid retrieval read path) + **10 (FastMCP
   `search`/`open` + `vaultrag mcp` — the P0 finish line) DONE**, and on **2026-07-16 the last
@@ -78,6 +100,47 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-16 — P1 Stage 1 (reranker) implemented + eval'd; threshold finding → default 0.3→0.0
+- **Did:** Implemented Stage 1 end-to-end. New `retrieval/rerank.py`: `Reranker` protocol,
+  `BgeReranker` (bge-reranker-v2-m3 ONNX-int8 via `onnxruntime`+`tokenizers`+`huggingface_hub`,
+  no torch/transformers — **verified reachable and correct**: model inputs `input_ids`+
+  `attention_mask`, one logit→sigmoid, relevant passages score high / off-topic ~0), `NoOpReranker`
+  fallback, `rerank_candidates` stage (top_n prefetch, threshold, keep=k, dominant-top-1 fast
+  path), `load_reranker` (disabled→None, load-fail→NoOp). Wired into `retrieval/pipeline.py`
+  (stage 4, fetch widens to top_n only when reranking), `mcp/server.py`, `cli.py mcp`. Added 6
+  config knobs (`config.py`). Declared the ML deps directly in `pyproject.toml` (+ mypy
+  overrides). Built the **minimal golden set + eval harness** (`tests/eval/golden.json` 20 pairs,
+  `run_eval.py`) per decision 3. Added `tests/test_rerank.py` + rerank cases in `test_retrieval.py`
+  + `FakeReranker`. **Ran the eval on the live index** and found rerank **regressed** vs fusion
+  (recall@10 1.00→0.90, MRR@5 0.825→0.767). Diagnosed: the vault's **0.3 threshold** evicts
+  relevant chunks (bge-v2-m3 sigmoid scores relevant design-doc chunks at ~0.02–0.25; a #3-ranked
+  correct note scored only 0.2145 and got cut). A **threshold sweep** (rerank once, evaluate all
+  thresholds in memory) confirmed 0.3 is the worst point and **0.0 (no floor) the best** (recall
+  1.00, MRR 0.796). Set the threshold default to **0.0** (`rerank.py` `DEFAULT_THRESHOLD`,
+  `config.py`). Even at 0 floor rerank is marginally < fusion on this *title-matchy* set —
+  expected, the set is too easy to show rerank's value (dominant fast-path skips most queries).
+  **Per Anik, then set `rerank_enabled=False` (rerank OFF by default):** fusion currently scores
+  higher, so we don't ship a measured regression on; the stage is code-complete behind the flag.
+- **Why:** Anik: *"lets implement the phase 1 stage 1"*; then, on seeing the regression, confirmed
+  a broader insight — **hardcoded score-distribution thresholds can't be optimal per-vault, and
+  open-source users won't get good results from my number**; asked to (a) write it to the vault for
+  the future and (b) test whether reducing the threshold performs better (it does).
+- **Files:** `src/vaultrag/retrieval/rerank.py` (new), `retrieval/pipeline.py`, `retrieval/__init__.py`,
+  `mcp/server.py`, `cli.py`, `config.py`, `pyproject.toml`; `tests/test_rerank.py` (new),
+  `tests/test_retrieval.py`, `tests/fakes.py`, `tests/eval/{__init__,golden.json,run_eval}.py` (new).
+  **Vault:** `../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md` (new — the
+  durable design ask: distribution-free default gate + opt-in `vaultrag calibrate` + per-project
+  persisted settings; supersedes the "0.3" line in `reranking.md`/`reranker-bge-v2-m3.md`/arch §12).
+- **Next / handoff:** **For Anik to rule on:** ratify the per-vault-threshold note (esp. *where
+  per-project settings live*). Default posture is **settled: rerank OFF by default** (Anik's call —
+  fusion wins on this set); re-enable via `VAULTRAG_RERANK_ENABLED=true` per-vault. **Then:** either
+  build the harder/paraphrase golden set to get a real rerank verdict (the thing that would justify
+  flipping it on), or proceed to **Stage 2 (parent-child + parent-swap)**. Note: rerank
+  on CPU is slow here (~50 long candidates ≈ 20–50 s/query, int8, no GPU) — a real latency
+  observation vs arch's 100–400 ms target (GPU/tuning is the arch's answer). Working tree: many
+  `src/` + `tests/` edits, untracked `tests/eval/` + `state/`; vault got 1 new agent-inbox note.
+  Commit when Anik asks.
 
 ### 2026-07-16 — P1 plan reviewed + all 4 open decisions settled (plan-note edits only, no code)
 - **Did:** Anik asked to verify `p1-step-plan.md` was written correctly and to settle the open

@@ -58,7 +58,7 @@ from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
 from vaultrag.models import BlockType, OpenResult, SearchResult
 from vaultrag.parsing import heading_section, parse_document
-from vaultrag.retrieval import DEFAULT_BUDGET_TOKENS, DEFAULT_K, RerankParams, Reranker
+from vaultrag.retrieval import DEFAULT_BUDGET_TOKENS, DEFAULT_K, Reranker, RerankParams
 from vaultrag.retrieval import search as retrieval_search
 from vaultrag.retrieval.pipeline import pack_budget
 

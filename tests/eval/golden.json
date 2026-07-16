@@ -1,0 +1,26 @@
+{
+  "_comment": "Minimal golden set for P1 Stages 1-2 (decision 3 of projects/vaultrag/p1-step-plan.md). Hand-written (query -> expected vault-relative path) pairs over the vaultrag-design vault, a forward-compatible subset of projects/vaultrag/evaluation-framework.md (the full 50-150 pair set + CI gate is P2). Run manually via `uv run python -m tests.eval.run_eval` before/after a retrieval change; NOT a pytest/CI gate (needs live Qdrant + Ollama + the reranker model).",
+  "project": "vaultrag-design",
+  "cases": [
+    {"query": "why did we choose Qdrant as the vector store", "expected_path": "decisions/vector-search-qdrant.md"},
+    {"query": "why BM25 sparse vectors in Qdrant instead of Elasticsearch", "expected_path": "decisions/sparse-bm25-not-elasticsearch.md"},
+    {"query": "why heading-tree chunking instead of fixed-size chunks", "expected_path": "decisions/chunking-heading-tree-not-fixed-size.md"},
+    {"query": "which dense embedding model do we use and why Qwen3", "expected_path": "decisions/dense-embeddings-qwen3.md"},
+    {"query": "why is the reranker bge-reranker-v2-m3", "expected_path": "decisions/reranker-bge-v2-m3.md"},
+    {"query": "why return snippets instead of synthesized answers by default", "expected_path": "decisions/snippets-not-answers-by-default.md"},
+    {"query": "why MCP-first instead of REST-first", "expected_path": "decisions/mcp-first-not-rest-first.md"},
+    {"query": "why in-process asyncio jobs instead of Redis or Celery", "expected_path": "decisions/in-process-jobs-not-redis-celery.md"},
+    {"query": "why payload partitioning for tenants instead of a collection per project", "expected_path": "decisions/payload-partitioning-not-collection-per-project.md"},
+    {"query": "why not full GraphRAG", "expected_path": "decisions/no-full-graphrag.md"},
+    {"query": "how does hybrid search fuse dense and sparse results with RRF", "expected_path": "projects/vaultrag/hybrid-search.md"},
+    {"query": "what are the stages of the retrieval pipeline and their latency budget", "expected_path": "projects/vaultrag/retrieval-pipeline.md"},
+    {"query": "how does the cross-encoder reranking stage work, top-50 to top-8", "expected_path": "projects/vaultrag/reranking.md"},
+    {"query": "how are token budget and context compression handled, MMR and near-dupe drop", "expected_path": "projects/vaultrag/context-compression.md"},
+    {"query": "write-back safety, base_hash lock, git auto-commit and agent-inbox", "expected_path": "projects/vaultrag/write-back-design.md"},
+    {"query": "the ingestion pipeline watchdog debounce and manifest diff for renames", "expected_path": "projects/vaultrag/ingestion-pipeline.md"},
+    {"query": "the Qdrant payload metadata schema fields for a chunk", "expected_path": "reference/reference-metadata-schema.md"},
+    {"query": "the MCP tool signatures for search and open", "expected_path": "reference/reference-mcp-tools.md"},
+    {"query": "the security model, tenancy enforcement and secret redaction", "expected_path": "reference/reference-security-model.md"},
+    {"query": "the SQLite database schema for documents chunks links and jobs", "expected_path": "reference/reference-database-schema.md"}
+  ]
+}

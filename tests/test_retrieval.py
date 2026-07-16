@@ -11,11 +11,19 @@ correctly, forward ``project_id``/``filters``/``k``/``prefetch_limit`` untouched
 
 from __future__ import annotations
 
-from tests.fakes import PROJECT, FakeEmbedder, FakeSparse, FakeVectorStore, make_hit
+from tests.fakes import (
+    PROJECT,
+    FakeEmbedder,
+    FakeReranker,
+    FakeSparse,
+    FakeVectorStore,
+    make_hit,
+)
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters
 from vaultrag.retrieval import search
 from vaultrag.retrieval.pipeline import DEFAULT_K, DEFAULT_PREFETCH_LIMIT
+from vaultrag.retrieval.rerank import RerankParams
 
 
 # ---------------------------------------------------------------------------
@@ -205,3 +213,57 @@ def test_budget_packing_always_keeps_the_top_hit_even_if_oversized() -> None:
     assert [s.chunk_id for s in result.snippets] == ["a"]
     assert result.total_tokens == 5000
     assert result.truncated is True
+
+
+# ---------------------------------------------------------------------------
+# Rerank stage 4 (P1 Stage 1) — wiring into the pipeline
+# ---------------------------------------------------------------------------
+def test_search_without_a_reranker_fetches_only_k() -> None:
+    """No reranker → the P0 path: the store is asked for exactly k, not top_n."""
+    store = FakeVectorStore(hits=[make_hit()])
+    search(
+        "q",
+        project_id=PROJECT,
+        vector_store=store,
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        k=7,
+    )
+    assert store.calls[0]["limit"] == 7
+
+
+def test_search_with_a_reranker_widens_the_fetch_to_top_n() -> None:
+    """Rerank needs a deeper candidate pool: the store is asked for rerank.top_n, then the
+    stage narrows back to k."""
+    store = FakeVectorStore(hits=[make_hit(point_id=str(i), text=f"body {i}") for i in range(50)])
+    search(
+        "q",
+        project_id=PROJECT,
+        vector_store=store,
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        k=10,
+        reranker=FakeReranker(default=0.9),
+        rerank=RerankParams(top_n=40, dominant_ratio=0),
+    )
+    assert store.calls[0]["limit"] == 40
+
+
+def test_search_reranks_snippets_into_cross_encoder_order() -> None:
+    """The snippet the cross-encoder likes best is returned first, over fusion order."""
+    hits = [
+        make_hit(point_id="a", score=0.9, text="off-topic"),
+        make_hit(point_id="b", score=0.5, text="the-good-answer"),
+    ]
+    result = search(
+        "q",
+        project_id=PROJECT,
+        vector_store=FakeVectorStore(hits=hits),
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        reranker=FakeReranker({"the-good-answer": 0.95}, default=0.1),
+        rerank=RerankParams(dominant_ratio=0),
+    )
+    # "b" promoted over the fusion-#1 "a"; with the default no-floor threshold "a" is kept
+    # (reordered), not dropped.
+    assert [s.chunk_id for s in result.snippets] == ["b", "a"]

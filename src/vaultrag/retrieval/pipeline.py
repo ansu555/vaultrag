@@ -23,7 +23,7 @@ from __future__ import annotations
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, VectorStore
 from vaultrag.models import SearchResult, Snippet
-from vaultrag.retrieval.rerank import RerankParams, Reranker, rerank_candidates
+from vaultrag.retrieval.rerank import Reranker, RerankParams, rerank_candidates
 
 DEFAULT_K = 10
 DEFAULT_PREFETCH_LIMIT = 100
