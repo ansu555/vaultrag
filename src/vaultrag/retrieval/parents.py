@@ -68,6 +68,8 @@ class ParentSection:
     heading: str  # the parent heading's own text (as written)
     anchor: str  # normalized parent-heading key, for citations / open()
     heading_path: list[str]  # the parent section's own trail (ancestors + its heading)
+    line_start: int  # 1-based source line span of the reconstructed section (for citations)
+    line_end: int
     text: str
     tokens: int
 
@@ -132,6 +134,8 @@ class VaultParentResolver:
             heading=block.text,
             anchor=normalize_heading(block.text),
             heading_path=[*block.heading_path, block.text],
+            line_start=start,
+            line_end=end,
             text=body,
             tokens=count_tokens(body),
         )
@@ -223,6 +227,8 @@ def _parent_snippet(
         title=_as_str(rep_payload.get("title")),
         heading_path=list(section.heading_path),
         anchor=section.anchor,
+        line_start=section.line_start,
+        line_end=section.line_end,
         text=section.text,
         score=score,
         tokens=section.tokens,

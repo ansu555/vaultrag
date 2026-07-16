@@ -9,6 +9,7 @@ query against the Step 7 :class:`~vaultrag.index.base.VectorStore` → budget-pa
 from __future__ import annotations
 
 from vaultrag.index.base import SearchFilters
+from vaultrag.retrieval.cite import cite, obsidian_uri
 from vaultrag.retrieval.parents import (
     DEFAULT_PARENT_MAX_TOKENS,
     ParentResolver,
@@ -46,7 +47,9 @@ __all__ = [
     "Reranker",
     "SearchFilters",
     "VaultParentResolver",
+    "cite",
     "load_reranker",
+    "obsidian_uri",
     "parent_swap",
     "rerank_candidates",
     "search",

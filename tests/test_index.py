@@ -118,6 +118,8 @@ def make_chunk(
         contextual_prefix=f"{project_id} ▸ {path} ▸ Design",
         heading_path=["Design"],
         anchor="design",
+        line_start=3,
+        line_end=7,
         tags=tags or ["component/qdrant"],
         langs=["python"],
         has_code=True,
@@ -371,6 +373,8 @@ def test_payload_carries_the_metadata_schema_fields(store: QdrantVectorStore) ->
     assert payload["text"] == chunk.text
     assert payload["heading_path"] == ["Design"]
     assert payload["anchor"] == "design"
+    assert payload["line_start"] == 3
+    assert payload["line_end"] == 7
     assert payload["tags"] == ["component/qdrant"]
     assert payload["type"] == "note"
     assert payload["langs"] == ["python"]

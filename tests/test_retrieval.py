@@ -24,7 +24,7 @@ from tests.fakes import (
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters
 from vaultrag.models import SearchResult
-from vaultrag.retrieval import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, search
+from vaultrag.retrieval import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, obsidian_uri, search
 from vaultrag.retrieval.pipeline import DEFAULT_K, DEFAULT_PREFETCH_LIMIT
 from vaultrag.retrieval.rerank import RerankParams
 
@@ -389,3 +389,82 @@ def test_root_level_content_is_never_swapped() -> None:
     )
     assert result.snippets[0].text == "root body"
     assert resolver.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Cite stage 8 (P1 Stage 3) — line range + obsidian:// URI on every snippet
+# ---------------------------------------------------------------------------
+def test_child_snippet_carries_the_line_range_from_the_payload() -> None:
+    hit = make_hit(line_start=12, line_end=34)
+    result = search(
+        "q",
+        project_id=PROJECT,
+        vector_store=FakeVectorStore(hits=[hit]),
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+    )
+    snip = result.snippets[0]
+    assert (snip.line_start, snip.line_end) == (12, 34)
+
+
+def test_missing_line_range_in_payload_leaves_it_none() -> None:
+    """An older point indexed before Stage 3 (no line fields) must not crash — line range None."""
+    result = search(
+        "q",
+        project_id=PROJECT,
+        vector_store=FakeVectorStore(hits=[make_hit()]),  # no line_start/line_end in payload
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+    )
+    snip = result.snippets[0]
+    assert snip.line_start is None
+    assert snip.line_end is None
+
+
+def test_search_stamps_an_obsidian_uri_when_a_vault_name_is_given() -> None:
+    result = search(
+        "q",
+        project_id=PROJECT,
+        vector_store=FakeVectorStore(hits=[make_hit(path="a/b.md")]),
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        vault_name="Rag",
+    )
+    assert result.snippets[0].uri == obsidian_uri("Rag", "a/b.md")
+
+
+def test_search_omits_the_uri_without_a_vault_name() -> None:
+    result = search(
+        "q",
+        project_id=PROJECT,
+        vector_store=FakeVectorStore(hits=[make_hit()]),
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+    )
+    assert result.snippets[0].uri is None
+
+
+def test_parent_swapped_snippet_is_cited_at_the_section_line_range_and_uri() -> None:
+    """A swapped-in parent cites the *section's* line span (not the child's) and its own URI."""
+    parent = make_parent(
+        path=HS_PATH,
+        anchor="design",
+        text="the whole design section",
+        tokens=60,
+        line_start=5,
+        line_end=42,
+    )
+    resolver = FakeParentResolver({(HS_PATH, "design"): parent})
+    child = make_hit(text="child", tokens=5, line_start=7, line_end=9)
+    result = search(
+        "q",
+        project_id=PROJECT,
+        vector_store=FakeVectorStore(hits=[child]),
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        parent_resolver=resolver,
+        vault_name="Rag",
+    )
+    snip = result.snippets[0]
+    assert (snip.line_start, snip.line_end) == (5, 42)  # the section span, not the child's 7..9
+    assert snip.uri == obsidian_uri("Rag", HS_PATH)

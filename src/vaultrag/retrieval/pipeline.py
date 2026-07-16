@@ -23,6 +23,7 @@ from __future__ import annotations
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, VectorStore
 from vaultrag.models import SearchResult, Snippet
+from vaultrag.retrieval.cite import cite
 from vaultrag.retrieval.parents import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, parent_swap
 from vaultrag.retrieval.rerank import Reranker, RerankParams, rerank_candidates
 
@@ -46,6 +47,7 @@ def search(
     rerank: RerankParams | None = None,
     parent_resolver: ParentResolver | None = None,
     parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
+    vault_name: str | None = None,
 ) -> SearchResult:
     """Run the hybrid read path for one query, scoped to ``project_id``.
 
@@ -65,6 +67,10 @@ def search(
     parent snippet, capped at ``min(parent_max_tokens, budget_tokens)`` (a parent that
     won't fit falls back to the child — ``retrieval/parents.py``). Without a resolver the
     hits become child snippets unchanged.
+
+    When ``vault_name`` is given, stage 8 (cite) stamps each snippet with a working
+    ``obsidian://open`` URI into that vault (``retrieval/cite.py``); without it, ``uri``
+    stays ``None`` (a caller not serving an Obsidian client, e.g. the eval harness).
     """
     stripped = query.strip()
     if not stripped:
@@ -94,6 +100,9 @@ def search(
         snippets = parent_swap(hits, parent_resolver, _to_snippet, cap_tokens=cap)
     else:
         snippets = [_to_snippet(hit) for hit in hits]
+    # Stage 8: attach the obsidian:// citation URI (no-op when vault_name is unset). Done
+    # before packing so the kept snippets carry it; the URI isn't text, so it costs no budget.
+    snippets = cite(snippets, vault_name=vault_name)
     packed, total_tokens, truncated = pack_budget(snippets, budget_tokens)
     return SearchResult(
         query=query,
@@ -114,6 +123,8 @@ def _to_snippet(hit: ScoredChunk) -> Snippet:
         title=_as_str(payload.get("title")),
         heading_path=[str(h) for h in heading_path] if isinstance(heading_path, list) else [],
         anchor=_as_str(payload.get("anchor")),
+        line_start=_as_int(payload.get("line_start")),
+        line_end=_as_int(payload.get("line_end")),
         text=str(payload.get("text", "")),
         score=hit.score,
         tokens=int(tokens) if isinstance(tokens, (int, float)) else 0,
@@ -124,6 +135,11 @@ def _to_snippet(hit: ScoredChunk) -> Snippet:
 
 def _as_str(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _as_int(value: object) -> int | None:
+    # bool is an int subclass; a stray True/False in the payload isn't a line number.
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def pack_budget(snippets: list[Snippet], budget_tokens: int) -> tuple[list[Snippet], int, bool]:

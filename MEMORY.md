@@ -8,7 +8,30 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P1 IN PROGRESS — Stage 2 (parent-child + parent-swap) code-complete + live-verified.**
+- **Phase:** **P1 IN PROGRESS — Stage 3 (`obsidian://` citations, retrieval stage 8) code-complete +
+  live-verified.** New `retrieval/cite.py`: `obsidian_uri(vault_name, path)` builds
+  `obsidian://open?vault=…&file=…` (both parts percent-encoded, `safe=""` so subfolder `/`→`%2F` and
+  round-trips) + a `cite(snippets, vault_name)` stage that stamps each `Snippet.uri` (no-op without a
+  name → `uri` stays `None`). **Line range** now flows end-to-end: chunker records each chunk's
+  `line_start`/`line_end` (`chunking/chunker._line_span`, min/max over its blocks) → Qdrant payload
+  (`index/payload.py`, impl-level like `text`) → `_to_snippet` reads them back; a **parent-swapped**
+  snippet instead cites its reconstructed *section's* span (`ParentSection` gained `line_start`/`line_end`
+  from `heading_section`). Added `Snippet.uri`/`line_start`/`line_end` and `Chunk.line_start`/`line_end`
+  (`models.py`). New `Settings.vault_name` (Obsidian display name — **not** derivable from the path);
+  `cli.py mcp` falls back to `vault_path.resolve().name`; threaded `vault_name` through
+  `build_mcp_server` → `retrieval.search`. Cite runs before budget-pack (URI isn't text, costs no budget).
+  **Correction:** the plan said `Snippet` "already reserves the URI field as P1" — it did **not**; added now.
+  Green: **269 tests** (+17: `test_cite.py` new, plus cite/line cases in retrieval/chunking/parents/mcp/index),
+  ruff, ruff format, mypy (37 src files incl. `cite.py`). **Live-verified**: wiped `state/vaultrag.db`
+  (chunk/doc hashes unchanged by these edits → a plain reindex would skip everything, so a manifest wipe was
+  needed to backfill the new payload fields) and full-reindexed `vaultrag-design` (55 docs, 143 chunks); a
+  direct in-process `search(..., vault_name="Rag")` returned working URIs, parent-swapped hits citing the exact
+  section span (Stage 3 section → lines 82–91), and a plain child hit carrying its payload line range.
+  **NOTE:** the *registered* `vaultrag` MCP connection still returned the pre-Stage-3 shape (no `uri`/line
+  keys) — Claude Code bound that stdio subprocess before these edits; it serves new code on the next fresh
+  spawn. The in-process script is the authoritative proof (same code path, live index/vault).
+  **Next: Stage 4 (single-file `ingest_path` + watchdog live-watch).**
+- **(Stage 2 archive)** **Stage 2 (parent-child + parent-swap) code-complete + live-verified.**
   Retrieval **stage 5** is built, wired, green (252 tests, ruff, mypy), and driven against the
   live `vaultrag-design` index. **Chunker** (`chunking/chunker.py`) now sets each child's
   `parent_id` to a **pointer** `<path>#<anchor>` at the enclosing H1/H2 section (shared helper
@@ -77,8 +100,8 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   has no ONNX; `tokenizers` from fastembed tokenizes, no torch/transformers); parent-rep =
   reconstruct from vault (`parent_id` = pointer); eval = pull a minimal golden set forward for
   Stages 1–2 (full harness/CI stays P2); watcher = `serve`/indexer owns it, `mcp --watch` opt-in.
-  **Stages 1 (rerank) + 2 (parent-swap) are DONE.** **Next: Stage 3 (`obsidian://` citations,
-  retrieval stage 8) → 4 (watchdog + single-file ingest) → 5 (write-back).** The `vaultrag` MCP server is now
+  **Stages 1 (rerank) + 2 (parent-swap) + 3 (`obsidian://` citations) are DONE.** **Next: Stage 4
+  (watchdog + single-file ingest) → 5 (write-back).** The `vaultrag` MCP server is now
   registered in this project's local Claude Code config and pointed at the live
   `vaultrag-design` index, so **dogfooding is available right now**: as you build P1, use
   `search`/`open` against `../Rag` and treat any bad retrieval as a real bug report (repo
@@ -115,6 +138,50 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-16 — P1 Stage 3 (`obsidian://` citations, retrieval stage 8) implemented + live-verified
+- **Did:** Implemented Stage 3 end-to-end. (1) New pure `retrieval/cite.py`: `obsidian_uri(vault_name,
+  path)` → `obsidian://open?vault=…&file=…`, both parts `quote(..., safe="")`-encoded so spaces (`%20`)
+  and subfolder slashes (`%2F`) round-trip; `cite(snippets, *, vault_name)` returns copies with `Snippet.uri`
+  stamped (no name → returns the list unchanged, `uri` stays `None`). (2) **Line range** wired through the
+  whole path: `chunking/chunker._line_span` sets each chunk's `line_start`/`line_end` (min/max over its
+  blocks); `index/payload.py` carries them; `retrieval/pipeline._to_snippet` reads them (`_as_int` guards
+  bool/None); `ParentSection` gained `line_start`/`line_end` (from `heading_section`) so a swapped-in parent
+  cites the *section* span, not the child's. (3) Models: `Snippet` gained `uri`/`line_start`/`line_end`,
+  `Chunk` gained `line_start`/`line_end`. (4) `Settings.vault_name` (default `None`); `cli.py mcp` resolves
+  `settings.vault_name or vault_path.resolve().name` and threads it via `build_mcp_server` →
+  `retrieval.search(..., vault_name=…)` → `cite` (run before `pack_budget`; a URI isn't text so it costs no
+  budget). Exported `cite`/`obsidian_uri` from `retrieval/__init__`. Tests: new `tests/test_cite.py` (URI
+  shape/encoding/round-trip + cite no-op/no-mutate), + line-range/URI cases in `test_retrieval.py`,
+  `test_chunking.py` (chunk line span), `test_parents.py` (section span), `test_mcp.py` (served URI wiring),
+  `test_index.py` (payload line fields); `fakes.make_parent` + `make_chunk` gained line params. Also reflowed
+  one **pre-existing** over-long comment in `config.py` (rerank block) that was failing `ruff check` on HEAD.
+  Green: **269 tests**, ruff, ruff format, mypy (37 src files).
+- **Why:** Anik: *"impleinmt the next stage"* — Stage 3 of `../Rag/projects/vaultrag/p1-step-plan.md`
+  (arch §10-stage8). URIs make every citation one click from Obsidian; the line range + `path#heading` let an
+  agent `open(path, lines=[…])` precisely.
+- **Live verify:** wiped `state/vaultrag.db` (backup in the session scratchpad) because these edits don't
+  change chunk/doc hashes — a plain reindex would skip every doc, so the manifest wipe forces a full re-upsert
+  that backfills the new payload fields. Reindexed `vaultrag-design` (55 docs / 143 chunks). A direct
+  in-process `search(..., vault_name="Rag")` against live Qdrant+Ollama+vault returned working
+  `obsidian://open?vault=Rag&file=…%2F…` URIs on every hit, parent-swapped hits citing the exact section line
+  range (Stage 3 section → lines 82–91; verified against the file), and a plain child hit with its payload line
+  range. **Caveat:** the registered `vaultrag` MCP tool still returned the old snippet shape (no `uri`/line
+  keys) — its stdio subprocess was spawned before these edits this session; a fresh spawn (next session) serves
+  the new code. The in-process script is the faithful proof.
+- **Files:** `src/vaultrag/`: `retrieval/cite.py` (new), `retrieval/pipeline.py`, `retrieval/parents.py`,
+  `retrieval/__init__.py`, `chunking/chunker.py`, `index/payload.py`, `models.py`, `config.py`,
+  `mcp/server.py`, `cli.py`. Tests: `tests/test_cite.py` (new), `test_retrieval.py`, `test_chunking.py`,
+  `test_parents.py`, `test_mcp.py`, `test_index.py`, `fakes.py`. **Vault:** `p1-step-plan.md` Log (Stage 3
+  done). `state/vaultrag.db` rebuilt.
+- **Next / handoff:** **Stage 4 — single-file `ingest_path`/`remove_path` primitive + watchdog live-watch**
+  (`indexer/watch.py`, extract the primitive from `reindex_vault`; 1.5 s debounce, `jobs` table, worker pool;
+  `serve`/indexer owns the watcher, `mcp --watch` opt-in). Stage 4 must land before Stage 5 (write-back reuses
+  `ingest_path`). Minor: `Snippet.uri` is base `obsidian://open` only (no heading/line jump — that needs the
+  Advanced-URI community plugin); the heading+line range travel as separate snippet fields, matching arch
+  §10-stage8. Consider a tiny `../Rag/agent-inbox/` note that the payload now also carries `line_start`/
+  `line_end` (impl-level, like the existing `payload-carries-chunk-text.md`). Working tree: many `src/`+`tests/`
+  edits; `state/` rebuilt; vault plan note edited (separate repo). Commit when Anik asks.
 
 ### 2026-07-16 — P1 Stage 2 (parent-child + parent-swap) implemented + live-verified; superset guard added
 - **Did:** Implemented Stage 2 end-to-end (retrieval stage 5). (1) **Chunker parent linkage**:

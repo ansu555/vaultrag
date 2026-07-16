@@ -35,6 +35,13 @@ class Settings(BaseSettings):
         default="default",
         description="Tenant/project scope for this index (payload-partitioned in Qdrant).",
     )
+    vault_name: str | None = Field(
+        default=None,
+        description="Obsidian display name of the vault, for the obsidian://open citation "
+        "URIs (retrieval stage 8). Not derivable from vault_path — the app names a vault "
+        "independently of its folder — so it's configured; falls back to the vault "
+        "directory name at the composition root. Unset (and no fallback) → no URI is emitted.",
+    )
 
     # --- local state (derived cache; safe to delete + reindex) ----------------
     state_dir: Path = Field(
@@ -83,8 +90,8 @@ class Settings(BaseSettings):
     # 2026-07-16 on the Stage-2 index: fusion recall@10 1.00 / MRR@5 0.775 vs rerank 0.95 /
     # 0.743 — rerank even drops a note out of recall@10). Exact numbers drift with the index;
     # the ordering (fusion > rerank on this title-matchy set) is the stable finding. We don't
-    # ship a measured regression on by default. The stage is code-complete behind this flag; flip on with
-    # VAULTRAG_RERANK_ENABLED=true once it beats fusion on a harder golden set. See
+    # ship a measured regression on by default. The stage is code-complete behind this flag;
+    # flip on with VAULTRAG_RERANK_ENABLED=true once it beats fusion on a harder golden set. See
     # ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md. When on, a
     # missing/unfetchable model degrades gracefully to a no-op reranker (fusion order).
     rerank_enabled: bool = Field(

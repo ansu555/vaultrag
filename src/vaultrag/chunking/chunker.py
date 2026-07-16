@@ -76,6 +76,7 @@ def chunk_document(document: Document, *, project_id: str) -> list[Chunk]:
     chunks: list[Chunk] = []
     for ix, piece in enumerate(pieces):
         text = _piece_text(piece.blocks)
+        line_start, line_end = _line_span(piece.blocks)
         chunks.append(
             Chunk(
                 project_id=project_id,
@@ -86,6 +87,8 @@ def chunk_document(document: Document, *, project_id: str) -> list[Chunk]:
                 contextual_prefix=_contextual_prefix(project_id, document, piece.heading_path),
                 heading_path=piece.heading_path,
                 anchor=piece.heading_path[-1] if piece.heading_path else None,
+                line_start=line_start,
+                line_end=line_end,
                 tags=document.metadata.tags,
                 langs=_langs(piece.blocks),
                 has_code=any(b.type == BlockType.code for b in piece.blocks),
@@ -205,6 +208,19 @@ def _parent_pointer(path: str, heading_path: list[str]) -> str | None:
 
 def _piece_text(blocks: list[Block]) -> str:
     return "\n\n".join(block.text for block in blocks)
+
+
+def _line_span(blocks: list[Block]) -> tuple[int | None, int | None]:
+    """The chunk's 1-based source line range: earliest block start → latest block end.
+
+    Feeds retrieval stage 8's citation line range (arch §10-stage8). Blocks in a piece are
+    contiguous and source-ordered, but ``min``/``max`` are taken explicitly so the span is
+    still correct if a block ever carries no line info (parser edge — returns ``None`` for
+    that bound rather than guessing).
+    """
+    starts = [b.line_start for b in blocks if b.line_start is not None]
+    ends = [b.line_end for b in blocks if b.line_end is not None]
+    return (min(starts) if starts else None, max(ends) if ends else None)
 
 
 def _langs(blocks: list[Block]) -> list[str]:

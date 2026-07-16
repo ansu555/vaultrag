@@ -106,6 +106,8 @@ def make_parent(
     tokens: int = 40,
     heading: str | None = None,
     heading_path: Sequence[str] | None = None,
+    line_start: int = 1,
+    line_end: int = 5,
 ) -> ParentSection:
     """One canned reconstructed parent section (``retrieval/parents.py``)."""
     return ParentSection(
@@ -113,6 +115,8 @@ def make_parent(
         heading=heading or anchor,
         anchor=anchor,
         heading_path=list(heading_path) if heading_path is not None else [anchor],
+        line_start=line_start,
+        line_end=line_end,
         text=text,
         tokens=tokens,
     )

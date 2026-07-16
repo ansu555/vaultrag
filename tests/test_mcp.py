@@ -34,6 +34,7 @@ from vaultrag.index.base import ScoredChunk, SearchFilters
 from vaultrag.indexer.scan import ExclusionReason
 from vaultrag.mcp import build_mcp_server
 from vaultrag.mcp.server import _EXCLUSION_MESSAGES, SearchFiltersParam, _apply_cap
+from vaultrag.retrieval import obsidian_uri
 
 # ---------------------------------------------------------------------------
 # Harness
@@ -102,6 +103,7 @@ def build(
     default_k: int = 10,
     default_budget_tokens: int = 2000,
     parent_swap_enabled: bool = False,
+    vault_name: str | None = None,
 ) -> tuple[FastMCP, FakeVectorStore, FakeEmbedder, FakeSparse]:
     store = store if store is not None else FakeVectorStore(hits=hits)
     embedder = embedder or FakeEmbedder()
@@ -115,6 +117,7 @@ def build(
         default_k=default_k,
         default_budget_tokens=default_budget_tokens,
         parent_swap_enabled=parent_swap_enabled,
+        vault_name=vault_name,
     )
     return server, store, embedder, sparse
 
@@ -154,6 +157,19 @@ def test_search_returns_cited_snippets(vault: Path) -> None:
     assert snippet["anchor"] == "design"
     assert snippet["text"].startswith("Dense catches")
     assert snippet["score"] == 1.0
+
+
+def test_search_stamps_obsidian_uris_when_a_vault_name_is_configured(vault: Path) -> None:
+    """Stage 8 wired through the server: a served snippet carries a one-click obsidian:// URI."""
+    server, _, _, _ = build(vault, hits=[make_hit(path="a/b.md")], vault_name="My Vault")
+    result = call(server, "search", {"query": "q"})
+    assert result["snippets"][0]["uri"] == obsidian_uri("My Vault", "a/b.md")
+
+
+def test_search_omits_uris_when_no_vault_name_is_configured(vault: Path) -> None:
+    server, _, _, _ = build(vault, hits=[make_hit()])  # vault_name defaults to None
+    result = call(server, "search", {"query": "q"})
+    assert result["snippets"][0]["uri"] is None
 
 
 def test_search_lists_both_tools(vault: Path) -> None:

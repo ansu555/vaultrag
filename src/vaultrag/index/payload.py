@@ -79,6 +79,10 @@ def chunk_payload(
         "text": chunk.text,
         "heading_path": list(chunk.heading_path),
         "anchor": chunk.anchor,
+        # source line range — the read path cites it (retrieval stage 8, arch §10-stage8);
+        # like `text`, an impl-level field the reference omits (it enumerates filters only).
+        "line_start": chunk.line_start,
+        "line_end": chunk.line_end,
         # filters
         "tags": list(chunk.tags),
         "type": str(chunk.type),

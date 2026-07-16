@@ -171,6 +171,10 @@ def mcp(
                 ),
                 parent_swap_enabled=settings.parent_swap_enabled,
                 parent_max_tokens=settings.parent_max_tokens,
+                # Obsidian display name for citation URIs (stage 8): configured value, else
+                # the vault directory name — the common case (a vault named after its folder).
+                # resolve() so a relative/'.'-style --vault still yields a real folder name.
+                vault_name=settings.vault_name or vault_path.resolve().name,
             )
         # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
         # client that resolves/binds something at construction. Either way the fix is

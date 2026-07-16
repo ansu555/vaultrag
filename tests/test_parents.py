@@ -56,6 +56,9 @@ def test_resolves_a_section_including_its_nested_subsections() -> None:
     assert "Nested under setup." in section.text  # the ### Details subsection rolls up too
     assert "Call search first." not in section.text  # stops before the next same-level heading
     assert section.tokens > 0
+    # Line span (for the stage-8 citation): the '## Setup' line through the line before
+    # '## Usage' — i.e. the whole section including its nested ### Details subsection.
+    assert (section.line_start, section.line_end) == (5, 13)
 
 
 def test_missing_or_gated_note_resolves_to_none() -> None:

@@ -162,6 +162,7 @@ def build_mcp_server(
     rerank_params: RerankParams | None = None,
     parent_swap_enabled: bool = False,
     parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
+    vault_name: str | None = None,
 ) -> FastMCP:
     """Assemble the VaultRAG MCP server around already-built dependencies.
 
@@ -177,6 +178,10 @@ def build_mcp_server(
     enclosing section, reconstructed live from the vault through ``open``'s *own* gated
     reader — so parent-swap can never surface a file ``open`` would refuse (CLAUDE.md §6).
     It runs in ``snippets`` mode only; ``compact`` (browse-by-preview) skips the vault reads.
+
+    ``vault_name`` is the Obsidian display name used to build ``obsidian://open`` citation
+    URIs (retrieval stage 8); ``None`` omits them. The CLI resolves it from settings, falling
+    back to the vault directory name so a served snippet is always one click from Obsidian.
     """
     vault_root = vault_path.resolve()
 
@@ -279,6 +284,7 @@ def build_mcp_server(
                 rerank=rerank_params,
                 parent_resolver=parent_resolver,
                 parent_max_tokens=parent_max_tokens,
+                vault_name=vault_name,
                 # Compact mode budgets the *previews*, not the full texts: packing full
                 # texts first would silently drop hits the agent asked to browse (k),
                 # so retrieval runs unbounded and _compact re-packs to the real budget.

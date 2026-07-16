@@ -177,6 +177,28 @@ def test_top_level_child_points_to_its_h1_not_an_h2() -> None:
 
 
 # ---------------------------------------------------------------------------
+# line_start/line_end: source line span for citations (P1 Stage 3, retrieval stage 8)
+# ---------------------------------------------------------------------------
+def test_chunk_carries_its_source_line_span() -> None:
+    # Heading on line 1, blank line 2, a 2-line paragraph on lines 3-4. The chunk body is
+    # the paragraph (headings contribute no chunk text), so the span is the paragraph's.
+    chunks = _chunks("n.md", "# H\n\nbody line one\nbody line two\n")
+    assert len(chunks) == 1
+    assert (chunks[0].line_start, chunks[0].line_end) == (3, 4)
+
+
+def test_line_spans_track_each_section_and_advance_down_the_file() -> None:
+    filler = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do. " * 8
+    body = f"# Root\n\n## A\n{filler}\n\n## B\n{filler}\n\n## C\n{filler}\n"
+    chunks = _chunks("n.md", body)
+    assert len(chunks) == 3
+    spans = [(c.line_start, c.line_end) for c in chunks]
+    # Every chunk has a real span, and later chunks sit further down the file than earlier ones.
+    assert all(s is not None and e is not None and s <= e for s, e in spans)
+    assert spans == sorted(spans)  # non-decreasing top-to-bottom, matching source order
+
+
+# ---------------------------------------------------------------------------
 # Identity: doc_id / point_id / chunk_hash
 # ---------------------------------------------------------------------------
 def test_doc_id_and_point_id_are_deterministic() -> None:

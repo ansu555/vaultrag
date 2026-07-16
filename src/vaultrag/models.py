@@ -170,6 +170,8 @@ class Chunk(_Base):
     contextual_prefix: str = ""
     heading_path: list[str] = Field(default_factory=list)
     anchor: str | None = None  # heading slug | ^block — for open()/citations
+    line_start: int | None = None  # 1-based source line span (min/max over the chunk's blocks)
+    line_end: int | None = None  # → citation line range (retrieval stage 8)
 
     # payload / filters (reference-metadata-schema.md)
     tags: list[str] = Field(default_factory=list)
@@ -205,17 +207,22 @@ class Chunk(_Base):
 class Snippet(_Base):
     """One cited result. The agent gets snippets, not answers (principle #4).
 
-    ``path`` + ``anchor`` (or ``heading_path``) are enough to re-open the exact
-    section via ``open(...)`` and, later, to build an ``obsidian://`` link (P1).
+    Carries everything retrieval stage 8 cites (arch §10-stage8): ``path`` + ``anchor``
+    (or ``heading_path``) to re-open the exact section via ``open(...)``; ``line_start`` /
+    ``line_end`` (the source line range); and ``uri``, a one-click ``obsidian://open``
+    link into the vault (stamped only when a vault display name is configured — P1 Stage 3).
     """
 
     path: str
     title: str | None = None
     heading_path: list[str] = Field(default_factory=list)
     anchor: str | None = None
+    line_start: int | None = None  # 1-based source line range of the cited text
+    line_end: int | None = None
     text: str
     score: float
     tokens: int
+    uri: str | None = None  # obsidian://open?vault=…&file=… — None until a vault_name is set
     doc_id: str | None = None
     chunk_id: str | None = None
 
