@@ -27,9 +27,17 @@ Algorithm, in three passes over ``Document.blocks``:
 
 ``Chunk.heading_path`` can only hold one path (models.py), so a merged chunk
 always inherits the *earlier* piece's path; the later piece's content is still
-present in ``text``, just not separately labeled. ``parent_id`` is left ``None``:
-P0 doesn't materialize parent-section records to point at (parent-swap is P1,
-explicitly deferred in ``p0-step-plan.md``), so wiring it now would dangle.
+present in ``text``, just not separately labeled.
+
+``parent_id`` (P1 Stage 2) is a **pointer**, not a stored record: ``<path>#<anchor>``
+where ``anchor`` is the enclosing H1/H2 section's normalized heading
+(:func:`~vaultrag.parsing.sections.parent_anchor`). No parent *text* is materialized —
+children are the only indexed vectors; the retrievable parent is reconstructed on the
+fly from the vault at swap time (retrieval stage 5), so the vault stays the source of
+truth (CLAUDE.md §6 #1, ``../Rag/projects/vaultrag/chunking-strategy.md``). All children
+of one section share the same pointer, which is what lets stage 5 dedupe them into a
+single parent snippet. Root-level content (empty ``heading_path``) has no enclosing
+section, so its ``parent_id`` stays ``None``.
 """
 
 from __future__ import annotations
@@ -41,6 +49,7 @@ from blake3 import blake3
 
 from vaultrag.chunking.tokens import count_tokens
 from vaultrag.models import Block, BlockType, Chunk, Document, chunk_point_id, document_id
+from vaultrag.parsing.sections import parent_anchor
 
 # Section 6 / chunking-strategy.md: target ~300 tok, hard max 512, merge tiny
 # siblings until >=120 tok.
@@ -85,7 +94,7 @@ def chunk_document(document: Document, *, project_id: str) -> list[Chunk]:
                 modified_ts=document.metadata.modified_ts,
                 chunk_hash=blake3(text.encode("utf-8")).hexdigest(),
                 tokens=piece.tokens,
-                parent_id=None,
+                parent_id=_parent_pointer(document.path, piece.heading_path),
                 prev_id=point_ids[ix - 1] if ix > 0 else None,
                 next_id=point_ids[ix + 1] if ix < len(pieces) - 1 else None,
             )
@@ -182,6 +191,18 @@ def _same_parent(a: list[str], b: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 # Chunk field derivation
 # ---------------------------------------------------------------------------
+def _parent_pointer(path: str, heading_path: list[str]) -> str | None:
+    """``<path>#<anchor>`` pointer to the child's enclosing H1/H2 section, or ``None``.
+
+    Not a chunk id (unlike ``prev_id``/``next_id``): retrieval never dereferences this
+    string, it reconstructs the parent section from ``path`` + ``heading_path`` at swap
+    time. The stored pointer is the durable record of the linkage (SQLite ``chunks.parent_id``)
+    and the human-readable key two same-section children share.
+    """
+    anchor = parent_anchor(heading_path)
+    return f"{path}#{anchor}" if anchor is not None else None
+
+
 def _piece_text(blocks: list[Block]) -> str:
     return "\n\n".join(block.text for block in blocks)
 

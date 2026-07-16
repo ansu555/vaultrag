@@ -23,6 +23,7 @@ from __future__ import annotations
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, VectorStore
 from vaultrag.models import SearchResult, Snippet
+from vaultrag.retrieval.parents import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, parent_swap
 from vaultrag.retrieval.rerank import Reranker, RerankParams, rerank_candidates
 
 DEFAULT_K = 10
@@ -43,6 +44,8 @@ def search(
     prefetch_limit: int = DEFAULT_PREFETCH_LIMIT,
     reranker: Reranker | None = None,
     rerank: RerankParams | None = None,
+    parent_resolver: ParentResolver | None = None,
+    parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
 ) -> SearchResult:
     """Run the hybrid read path for one query, scoped to ``project_id``.
 
@@ -56,6 +59,12 @@ def search(
     ``rerank.top_n`` candidates, cross-encoder-reranked, thresholded, and cut back to
     ``k`` before budget packing (``../Rag/projects/vaultrag/reranking.md``). Without a
     reranker the path is P0's fusion-order-then-pack.
+
+    When ``parent_resolver`` is given, stage 5 runs after rerank: a surviving child is
+    swapped for its enclosing H1/H2 section and same-section children are deduped into one
+    parent snippet, capped at ``min(parent_max_tokens, budget_tokens)`` (a parent that
+    won't fit falls back to the child — ``retrieval/parents.py``). Without a resolver the
+    hits become child snippets unchanged.
     """
     stripped = query.strip()
     if not stripped:
@@ -78,7 +87,13 @@ def search(
     )
     hits = rerank_candidates(stripped, hits, reranker, keep=k, params=rerank_params)
 
-    snippets = [_to_snippet(hit) for hit in hits]
+    if parent_resolver is not None:
+        # Cap the swap at the smaller of the ~2k parent cap and the response budget: a
+        # section that can't fit the budget should fall back to the child, not evict it.
+        cap = min(parent_max_tokens, budget_tokens)
+        snippets = parent_swap(hits, parent_resolver, _to_snippet, cap_tokens=cap)
+    else:
+        snippets = [_to_snippet(hit) for hit in hits]
     packed, total_tokens, truncated = pack_budget(snippets, budget_tokens)
     return SearchResult(
         query=query,

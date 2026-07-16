@@ -79,9 +79,11 @@ class Settings(BaseSettings):
     # --- reranker (retrieval stage 4; P1 Stage 1) -----------------------------
     # bge-reranker-v2-m3 ONNX-int8, loaded directly via onnxruntime (no torch/transformers).
     # See ../Rag/decisions/reranker-bge-v2-m3.md and projects/vaultrag/reranking.md.
-    # DISABLED by default: on the P1 golden set, fusion-only beat rerank at every threshold
-    # (recall@10 1.00 / MRR@5 0.825 vs rerank's best 1.00 / 0.796) — we don't ship a measured
-    # regression on by default. The stage is code-complete behind this flag; flip it on with
+    # DISABLED by default: on the P1 golden set, fusion-only beats rerank (re-measured
+    # 2026-07-16 on the Stage-2 index: fusion recall@10 1.00 / MRR@5 0.775 vs rerank 0.95 /
+    # 0.743 — rerank even drops a note out of recall@10). Exact numbers drift with the index;
+    # the ordering (fusion > rerank on this title-matchy set) is the stable finding. We don't
+    # ship a measured regression on by default. The stage is code-complete behind this flag; flip on with
     # VAULTRAG_RERANK_ENABLED=true once it beats fusion on a harder golden set. See
     # ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md. When on, a
     # missing/unfetchable model degrades gracefully to a no-op reranker (fusion order).
@@ -113,6 +115,24 @@ class Settings(BaseSettings):
         default=1.5,
         description="Skip reranking when the top-1 fusion score is at least this multiple "
         "of the top-2 (known-item fast path). Set to 0 to always rerank.",
+    )
+
+    # --- parent-swap (retrieval stage 5; P1 Stage 2) --------------------------
+    # After rerank, swap a child for its enclosing H1/H2 section and dedupe same-section
+    # children into one parent snippet, reconstructing the parent live from the vault (the
+    # index stays derived; vault is truth — CLAUDE.md §6 #1). See
+    # ../Rag/projects/vaultrag/chunking-strategy.md and arch §6/§10-stage5. ON by default:
+    # unlike rerank it doesn't move which notes rank (it repackages within a note), so it's
+    # golden-set-neutral while giving the agent coherent sections instead of fragments.
+    parent_swap_enabled: bool = Field(
+        default=True,
+        description="Swap retrieved children for their enclosing section (retrieval stage "
+        "5). Reconstructs the parent from the vault at query time; no parent text is stored.",
+    )
+    parent_max_tokens: int = Field(
+        default=2000,
+        description="Largest enclosing section (tokens) eligible for parent-swap; a bigger "
+        "section is too coarse, so its child is kept instead (the ~2k cap, arch §6).",
     )
 
     # --- logging --------------------------------------------------------------

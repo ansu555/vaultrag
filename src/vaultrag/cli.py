@@ -169,6 +169,8 @@ def mcp(
                     threshold=settings.rerank_threshold,
                     dominant_ratio=settings.rerank_dominant_ratio,
                 ),
+                parent_swap_enabled=settings.parent_swap_enabled,
+                parent_max_tokens=settings.parent_max_tokens,
             )
         # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
         # client that resolves/binds something at construction. Either way the fix is

@@ -8,28 +8,43 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P1 IN PROGRESS — Stage 1 (reranker) code-complete + eval'd.** The rerank
-  stage (retrieval stage 4) is built, wired, green (234 tests, ruff, mypy), and run against
-  the live `vaultrag-design` index. `retrieval/rerank.py`: `Reranker` protocol + `BgeReranker`
-  (bge-reranker-v2-m3 ONNX-int8, loaded directly via `onnxruntime` from
-  `onnx-community/bge-reranker-v2-m3-ONNX`, tokenized with `tokenizers` — no torch/transformers,
-  verified working) + `NoOpReranker` graceful fallback + `load_reranker` composition helper.
-  Inserted into `retrieval/pipeline.py` after RRF fusion (fetch widens k→top_n=50, rerank,
-  threshold, cut to k), config knobs added, wired through `mcp/server.py` + `cli.py mcp`.
-  Minimal golden set + eval harness live at `tests/eval/` (decision 3; 20 pairs, recall@10/MRR@5,
-  manual-run only). **Key finding (see 2026-07-16 log):** the eval caught that the vault's
-  **0.3 rerank threshold regresses retrieval** (recall@10 1.00→0.90) — bge-v2-m3's sigmoid
-  scores relevant chunks at ~0.02–0.25, so a fixed floor evicts them. A full threshold sweep
-  confirmed 0.3 is the worst point and **0.0 (no floor) the best**; the threshold default is
-  now **0.0**, superseding the vault's 0.3 pending ratification of
-  `../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md` (Anik's insight:
-  score-distribution thresholds must be per-vault/auto-calibrated, not one global number).
-  **Rerank is DISABLED by default** (`rerank_enabled=False`, Anik's call): fusion-only beat
-  rerank at every threshold on this golden set, so we don't ship a measured regression on by
-  default — the stage is code-complete behind the flag (`VAULTRAG_RERANK_ENABLED=true`).
-  **Next: Stage 2 (parent-child + parent-swap)** — or, before flipping rerank on, build the
-  harder/paraphrase golden set the note calls for (this set is too title-matchy to show
-  rerank's value; even at 0 floor it's marginally < fusion on it).
+- **Phase:** **P1 IN PROGRESS — Stage 2 (parent-child + parent-swap) code-complete + live-verified.**
+  Retrieval **stage 5** is built, wired, green (252 tests, ruff, mypy), and driven against the
+  live `vaultrag-design` index. **Chunker** (`chunking/chunker.py`) now sets each child's
+  `parent_id` to a **pointer** `<path>#<anchor>` at the enclosing H1/H2 section (shared helper
+  `parsing/sections.parent_anchor`, depth ≤ 2) — no parent text stored; verified in SQLite
+  (`chunks.parent_id`). **Retrieval** (`retrieval/parents.py`, new): `ParentResolver` protocol +
+  `VaultParentResolver` (reconstructs the section **live from the vault** via `open`'s own gated
+  reader → `parse_document` → `heading_section`, so it can never surface a file `open` would
+  refuse) + `parent_swap` policy — group reranked hits by parent pointer, swap each to its
+  section, **dedupe same-section children into one parent snippet**. Inserted after rerank in
+  `pipeline.py`; wired through `mcp/server.py` (fresh resolver per call = per-call cache + freshness;
+  snippets mode only, compact skips it) + `cli.py`; config knobs `parent_swap_enabled` (**ON by
+  default**) + `parent_max_tokens` (2000). **Key finding (see 2026-07-16 log):** the live dogfood
+  caught that a **tiny-sibling-merge child mislabels its section** — its `heading_path` names only
+  the *first* merged section, so reconstructing that section is *smaller* than the child and would
+  **lose content** (e.g. a 220-tok child → 38-tok "parent"). Fix: a **superset guard** — swap only
+  when the reconstructed parent is `≥` the biggest child in the group (and `≤ min(parent_max_tokens,
+  budget_tokens)`); otherwise keep the child. Parent-swap is now **strictly non-lossy**.
+  **Real number (re-measured 2026-07-16 on the Stage-2-reindexed live index):** shipping
+  **fusion-only** baseline is recall@10 **1.000** / MRR@5 **0.775** (both > targets 0.9/0.75).
+  Parent-swap is neutral **by construction** — it repackages *within* a note and the superset
+  guard keeps each path's first-occurrence rank, so path-recall/MRR@5 can't move; the committed
+  `run_eval.py` harness calls `search()` *without* a `parent_resolver`, so it measures fusion-vs-
+  rerank and does **not** exercise parent-swap (the earlier "0.767→0.767 with swap on/off" line
+  came from an ad-hoc modified harness on the pre-reindex index — superseded). Fusion drifted
+  0.825→0.775 vs Stage 1 purely because the index was rebuilt with the Stage 2 chunker (parent-id
+  pointers + tiny-sibling merges shifted a few chunk boundaries); still clears both targets, so
+  parent-swap ON by default ships no regression (unlike Stage 1 rerank).
+  **Next: Stage 3 (`obsidian://` citations, retrieval stage 8).**
+- **(Stage 1 archive)** **Rerank (stage 4) code-complete behind a flag, DISABLED by default.**
+  `retrieval/rerank.py`: `Reranker` protocol + `BgeReranker` (bge-reranker-v2-m3 ONNX-int8 via
+  `onnxruntime` from `onnx-community/bge-reranker-v2-m3-ONNX` + `tokenizers`, no torch/transformers)
+  + `NoOpReranker` fallback + `load_reranker`. Threshold default **0.0** (no floor): the vault's 0.3
+  was measured to regress recall (bge-v2-m3 sigmoids relevant chunks at ~0.02–0.25), superseded
+  pending `../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md`. `rerank_enabled=False`
+  (Anik's call): fusion beat rerank at every threshold on this title-matchy golden set; flip on per-vault
+  with `VAULTRAG_RERANK_ENABLED=true` once a harder golden set shows it winning.
 - **(P0 archive)** **P0 was DONE — code-complete AND acceptance-complete.** Steps 0 (scaffold) + 1
   (models) + 2 (store) + 3 (scan) + 4 (parsing) + 5 (chunking) + 6 (embedding) + 7 (Qdrant
   vector store) + 8 (reindex pipeline) + 9 (hybrid retrieval read path) + **10 (FastMCP
@@ -62,8 +77,8 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   has no ONNX; `tokenizers` from fastembed tokenizes, no torch/transformers); parent-rep =
   reconstruct from vault (`parent_id` = pointer); eval = pull a minimal golden set forward for
   Stages 1–2 (full harness/CI stays P2); watcher = `serve`/indexer owns it, `mcp --watch` opt-in.
-  **Ready to start Stage 1 (reranker).** Nothing implemented yet. P0's
-  acceptance dogfood is **done** (2026-07-16 session log). The `vaultrag` MCP server is now
+  **Stages 1 (rerank) + 2 (parent-swap) are DONE.** **Next: Stage 3 (`obsidian://` citations,
+  retrieval stage 8) → 4 (watchdog + single-file ingest) → 5 (write-back).** The `vaultrag` MCP server is now
   registered in this project's local Claude Code config and pointed at the live
   `vaultrag-design` index, so **dogfooding is available right now**: as you build P1, use
   `search`/`open` against `../Rag` and treat any bad retrieval as a real bug report (repo
@@ -100,6 +115,62 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-16 — P1 Stage 2 (parent-child + parent-swap) implemented + live-verified; superset guard added
+- **Did:** Implemented Stage 2 end-to-end (retrieval stage 5). (1) **Chunker parent linkage**:
+  `chunking/chunker.py` now sets `parent_id` to a pointer `<path>#<anchor>` at the enclosing H1/H2
+  section via a new shared pure helper `parsing/sections.parent_anchor(heading_path)` (depth ≤ 2:
+  a deeper child rolls up to its H2). No parent text stored — the pointer is a record, retrieval
+  reconstructs. (2) **`retrieval/parents.py` (new)**: `ParentSection`, `ParentResolver` protocol,
+  `VaultParentResolver` (read note via injected gated reader → `parse_document` → `heading_section`
+  → slice raw lines → `count_tokens`; memoizes parses per instance), and the `parent_swap` policy
+  (group hits by `(path, parent-anchor)` derived from each hit's `heading_path`; resolve each parent
+  once; swap + dedupe same-section children into one parent snippet inheriting the best child's rank).
+  (3) Inserted into `retrieval/pipeline.py` after rerank (`search` gained `parent_resolver` +
+  `parent_max_tokens`); (4) wired `mcp/server.py` (builds a **fresh** `VaultParentResolver` per search
+  call reusing `open`'s `_read_note` — per-call cache **and** freshness; **snippets mode only**,
+  compact skips the vault reads) + `cli.py`; (5) config `parent_swap_enabled` (**default ON**) +
+  `parent_max_tokens` (2000). Tests: rewrote `test_chunking` parent_id cases, added parent-swap cases
+  to `test_retrieval` (swap/dedupe/cap-fallback/unresolved-fallback/different-sections/root-no-swap/
+  **superset guard**), new `test_parents.py` (resolver reconstruct/missing/unknown-heading/parse-once),
+  new `test_mcp` cases (reconstruct-from-real-vault, **secret-gated note → falls back to child**,
+  compact-skips-swap). Green: **252 tests**, ruff, ruff format, mypy (35 files).
+  **Live-verified against the running index** (reindex → SQLite parent_id check → live `search`).
+- **Why:** Anik: *"impliment p1 - s2"* — Stage 2 of `../Rag/projects/vaultrag/p1-step-plan.md`.
+  Default ON (unlike Stage 1's OFF) because it's a **core** stage and — with the guard below — a
+  **measured non-regression**: on the re-run harness (2026-07-16) the shipping fusion baseline is
+  recall@10 **1.000** / MRR@5 **0.775** (both > targets), and parent-swap can't move path-recall/
+  MRR@5 **by construction** — it repackages *within* a note and the parent inherits the child's
+  first-occurrence rank; dedup still fires. (The committed `run_eval.py` doesn't pass a
+  `parent_resolver`, so it measures fusion-vs-rerank, not swap on/off — the neutrality is a
+  structural argument, not a harness column.)
+- **Key finding — superset guard (the live dogfood earned its keep):** the first live run swapped
+  *every* hit, and several parents came back **smaller than the child** (e.g. a 220-tok
+  `decisions/vector-search-qdrant.md` child → a 38-tok "Decision" parent). Cause: a **tiny-sibling
+  merge** (chunker Pass 3) folds several small H2 sections into one chunk but keeps only the *first*
+  section's `heading_path`, so reconstructing "that section" is a strict *subset* of the child and
+  the swap **loses content**. Fix: swap only when `max(child tokens in group) ≤ parent tokens ≤
+  min(parent_max_tokens, budget_tokens)` — i.e. the parent must be a genuine superset. Parent-swap
+  is now **strictly non-lossy**: it enriches (bigger coherent section) or keeps the child, never
+  shrinks. On this vault most small notes correctly keep their child; big multi-section notes
+  (`p0-step-plan`, `p1-step-plan`, architecture §-sections) genuinely swap + dedupe.
+- **Files:** `src/vaultrag/`: `chunking/chunker.py`, `parsing/sections.py` (+`parent_anchor`,
+  `PARENT_MAX_DEPTH`), `parsing/__init__.py`, `retrieval/parents.py` (new), `retrieval/pipeline.py`,
+  `retrieval/__init__.py`, `config.py`, `mcp/server.py`, `cli.py`. Tests: `tests/fakes.py`
+  (+`FakeParentResolver`, `make_parent`), `tests/test_chunking.py`, `tests/test_retrieval.py`,
+  `tests/test_parents.py` (new), `tests/test_mcp.py`. **Vault plan note** `p1-step-plan.md` Log
+  updated (Stage 2 done + superset-guard finding).
+- **Next / handoff:** **Stage 3 — `obsidian://` citations (retrieval stage 8)**: per snippet emit a
+  working `obsidian://open?vault=<name>&file=<url-encoded path>` URI (+ line range); needs a
+  `vault_name` config knob; `Snippet` already reserves the URI field. **Possible vault write-back
+  for Anik:** the superset-guard finding is a durable chunking/retrieval nuance (a tiny-sibling-merge
+  chunk's `heading_path` under-labels it) — consider a note in `../Rag/agent-inbox/`; a cleaner
+  future fix would relabel a merged chunk with the common-ancestor heading, but the guard is the
+  correct P1 answer. Note: reindex re-chunked only the 4 *new/changed* notes (idempotency), so the
+  51 unchanged docs still have `parent_id=NULL` in SQLite — parent-swap doesn't care (it derives the
+  pointer from `heading_path` in the Qdrant payload), but a `reindex` after a chunker change won't
+  backfill unchanged docs without a state wipe. Working tree: many `src/`+`tests/` edits, `state/`
+  rebuilt. Commit when Anik asks.
 
 ### 2026-07-16 — P1 Stage 1 (reranker) implemented + eval'd; threshold finding → default 0.3→0.0
 - **Did:** Implemented Stage 1 end-to-end. New `retrieval/rerank.py`: `Reranker` protocol,
