@@ -30,6 +30,7 @@ from vaultrag.index.sparse import Bm25Embedder
 from vaultrag.indexer.pipeline import reindex_vault
 from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
+from vaultrag.retrieval import RerankParams, load_reranker
 from vaultrag.store.sqlite import SQLiteMetaStore
 
 app = typer.Typer(
@@ -146,6 +147,14 @@ def mcp(
         try:
             vector_store = QdrantVectorStore.from_settings(settings)
             embedder = OllamaEmbedder.from_settings(settings)
+            # Built at startup so the (possibly first-run) model download blocks here,
+            # visibly, not mid-query. load_reranker never raises: a fetch/load failure
+            # degrades to a no-op reranker so the server still serves (rerank-off).
+            reranker = load_reranker(
+                enabled=settings.rerank_enabled,
+                repo_id=settings.rerank_model,
+                model_file=settings.rerank_model_file,
+            )
             server = build_mcp_server(
                 project_id=project_id,
                 vault_path=vault_path,
@@ -154,6 +163,12 @@ def mcp(
                 sparse=Bm25Embedder(),
                 default_k=settings.default_top_k,
                 default_budget_tokens=settings.budget_tokens,
+                reranker=reranker,
+                rerank_params=RerankParams(
+                    top_n=settings.rerank_top_n,
+                    threshold=settings.rerank_threshold,
+                    dominant_ratio=settings.rerank_dominant_ratio,
+                ),
             )
         # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
         # client that resolves/binds something at construction. Either way the fix is

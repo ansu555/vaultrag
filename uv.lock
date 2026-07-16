@@ -2155,12 +2155,16 @@ dependencies = [
     { name = "fastembed" },
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "huggingface-hub" },
     { name = "markdown-it-py" },
+    { name = "numpy" },
+    { name = "onnxruntime" },
     { name = "pathspec" },
     { name = "pydantic-settings" },
     { name = "python-frontmatter" },
     { name = "qdrant-client" },
     { name = "structlog" },
+    { name = "tokenizers" },
     { name = "typer" },
 ]
 
@@ -2178,12 +2182,16 @@ requires-dist = [
     { name = "fastembed", specifier = ">=0.5" },
     { name = "fastmcp", specifier = ">=3.4.4" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "huggingface-hub", specifier = ">=0.26" },
     { name = "markdown-it-py", specifier = ">=4.2.0" },
+    { name = "numpy", specifier = ">=2.0" },
+    { name = "onnxruntime", specifier = ">=1.20" },
     { name = "pathspec", specifier = ">=1.1.1" },
     { name = "pydantic-settings", specifier = ">=2.5" },
     { name = "python-frontmatter", specifier = ">=1.3.0" },
     { name = "qdrant-client", specifier = ">=1.12" },
     { name = "structlog", specifier = ">=24.4" },
+    { name = "tokenizers", specifier = ">=0.20" },
     { name = "typer", specifier = ">=0.12" },
 ]
 

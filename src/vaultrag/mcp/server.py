@@ -58,7 +58,7 @@ from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
 from vaultrag.models import BlockType, OpenResult, SearchResult
 from vaultrag.parsing import heading_section, parse_document
-from vaultrag.retrieval import DEFAULT_BUDGET_TOKENS, DEFAULT_K
+from vaultrag.retrieval import DEFAULT_BUDGET_TOKENS, DEFAULT_K, RerankParams, Reranker
 from vaultrag.retrieval import search as retrieval_search
 from vaultrag.retrieval.pipeline import pack_budget
 
@@ -151,12 +151,18 @@ def build_mcp_server(
     sparse: SparseEmbedder,
     default_k: int = DEFAULT_K,
     default_budget_tokens: int = DEFAULT_BUDGET_TOKENS,
+    reranker: Reranker | None = None,
+    rerank_params: RerankParams | None = None,
 ) -> FastMCP:
     """Assemble the VaultRAG MCP server around already-built dependencies.
 
     ``default_k``/``default_budget_tokens`` come from :class:`~vaultrag.config.Settings`
     at the composition root, so the served defaults are env-configurable — the tool
     schema advertises the *parameters*; the running server owns their defaults.
+
+    ``reranker`` (+ ``rerank_params``) is the stage-4 cross-encoder; ``None`` runs the
+    fusion-only P0 path. The CLI builds it from settings and degrades to a no-op reranker
+    if the model can't be loaded, so the server always comes up.
     """
     vault_root = vault_path.resolve()
 
@@ -247,6 +253,8 @@ def build_mcp_server(
                 sparse=sparse,
                 k=k if k is not None else default_k,
                 filters=filters.to_filters() if filters is not None else None,
+                reranker=reranker,
+                rerank=rerank_params,
                 # Compact mode budgets the *previews*, not the full texts: packing full
                 # texts first would silently drop hits the agent asked to browse (k),
                 # so retrieval runs unbounded and _compact re-packs to the real budget.

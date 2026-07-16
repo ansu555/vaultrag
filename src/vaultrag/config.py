@@ -76,6 +76,37 @@ class Settings(BaseSettings):
         description="Default token budget a search response must respect.",
     )
 
+    # --- reranker (retrieval stage 4; P1 Stage 1) -----------------------------
+    # bge-reranker-v2-m3 ONNX-int8, loaded directly via onnxruntime (no torch/transformers).
+    # See ../Rag/decisions/reranker-bge-v2-m3.md and projects/vaultrag/reranking.md.
+    # Enabled by default (the biggest single accuracy lever, arch §12); if the model can't
+    # be fetched/loaded, retrieval degrades gracefully to a no-op reranker (fusion order).
+    rerank_enabled: bool = Field(
+        default=True,
+        description="Run the cross-encoder rerank stage after RRF fusion.",
+    )
+    rerank_model: str = Field(
+        default="onnx-community/bge-reranker-v2-m3-ONNX",
+        description="Hugging Face repo id of the reranker (ONNX int8, no torch/transformers).",
+    )
+    rerank_model_file: str = Field(
+        default="onnx/model_int8.onnx",
+        description="Model file within the rerank repo (int8 export for CPU).",
+    )
+    rerank_top_n: int = Field(
+        default=50,
+        description="Number of top fused candidates fed to the cross-encoder (top-50 → top-k).",
+    )
+    rerank_threshold: float = Field(
+        default=0.3,
+        description="Drop candidates whose rerank score is below this (garbage, not padding).",
+    )
+    rerank_dominant_ratio: float = Field(
+        default=1.5,
+        description="Skip reranking when the top-1 fusion score is ≥ this × the top-2 "
+        "(known-item fast path). Set to 0 to always rerank.",
+    )
+
     # --- logging --------------------------------------------------------------
     log_level: str = Field(
         default="INFO",

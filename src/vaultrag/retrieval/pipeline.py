@@ -23,6 +23,7 @@ from __future__ import annotations
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, VectorStore
 from vaultrag.models import SearchResult, Snippet
+from vaultrag.retrieval.rerank import RerankParams, Reranker, rerank_candidates
 
 DEFAULT_K = 10
 DEFAULT_PREFETCH_LIMIT = 100
@@ -40,6 +41,8 @@ def search(
     filters: SearchFilters | None = None,
     budget_tokens: int = DEFAULT_BUDGET_TOKENS,
     prefetch_limit: int = DEFAULT_PREFETCH_LIMIT,
+    reranker: Reranker | None = None,
+    rerank: RerankParams | None = None,
 ) -> SearchResult:
     """Run the hybrid read path for one query, scoped to ``project_id``.
 
@@ -48,10 +51,19 @@ def search(
     can never widen past it — the same rule :meth:`VectorStore.query` enforces one layer
     down. An empty/whitespace-only query returns an empty result rather than embedding
     nothing meaningful.
+
+    When ``reranker`` is given, stage 4 runs: the fused prefetch is widened from ``k`` to
+    ``rerank.top_n`` candidates, cross-encoder-reranked, thresholded, and cut back to
+    ``k`` before budget packing (``../Rag/projects/vaultrag/reranking.md``). Without a
+    reranker the path is P0's fusion-order-then-pack.
     """
     stripped = query.strip()
     if not stripped:
         return SearchResult(query=query, project_id=project_id)
+
+    rerank_params = rerank if rerank is not None else RerankParams()
+    # Widen the fetch only when we'll actually rerank — no point pulling 50 to keep 10.
+    fetch_limit = rerank_params.top_n if reranker is not None else k
 
     dense_vector = embedder.embed_query(stripped)
     sparse_vector = sparse.embed_query(stripped)
@@ -60,10 +72,11 @@ def search(
         project_id=project_id,
         dense=dense_vector,
         sparse=sparse_vector,
-        limit=k,
+        limit=fetch_limit,
         prefetch_limit=prefetch_limit,
         filters=filters,
     )
+    hits = rerank_candidates(stripped, hits, reranker, keep=k, params=rerank_params)
 
     snippets = [_to_snippet(hit) for hit in hits]
     packed, total_tokens, truncated = pack_budget(snippets, budget_tokens)

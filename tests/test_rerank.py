@@ -1,0 +1,162 @@
+"""P1 Stage 1 verify: the cross-encoder rerank stage (``retrieval/rerank.py``).
+
+The real model (bge-reranker-v2-m3 ONNX) is exercised end-to-end by hand during
+dogfooding; here we pin the *stage policy* with a fake reranker — reordering, the 0.3
+threshold, the known-item fast path, `keep` capping, and graceful degradation — plus the
+composition-root `load_reranker` fallback. Nothing here touches the network or a model.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from tests.fakes import FakeReranker
+from vaultrag.index.base import ScoredChunk
+from vaultrag.retrieval.rerank import (
+    NoOpReranker,
+    RerankError,
+    RerankParams,
+    load_reranker,
+    rerank_candidates,
+)
+
+
+def _cand(point_id: str, score: float, text: str) -> ScoredChunk:
+    return ScoredChunk(point_id=point_id, score=score, payload={"text": text})
+
+
+# ---------------------------------------------------------------------------
+# Reordering
+# ---------------------------------------------------------------------------
+def test_rerank_reorders_a_fused_set_by_cross_encoder_score() -> None:
+    """The best fusion hit is not the best rerank hit — rerank must reorder."""
+    cands = [
+        _cand("a", 0.30, "off-topic paragraph about compose files"),
+        _cand("b", 0.20, "the answer: dense plus bm25 fused by rrf"),
+        _cand("c", 0.10, "another off-topic note"),
+    ]
+    reranker = FakeReranker({"the answer: dense plus bm25 fused by rrf": 0.9})
+    # dominant_ratio=0 disables the fast path so we always exercise the model.
+    out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0))
+    assert [c.point_id for c in out] == ["b", "a", "c"]
+    assert out[0].score == pytest.approx(0.9)
+
+
+def test_exact_identifier_query_still_ranks_first_after_rerank() -> None:
+    """A verbatim identifier chunk the cross-encoder scores highest lands at #1."""
+    cands = [
+        _cand("prose", 0.40, "some prose that vaguely mentions errors"),
+        _cand("ident", 0.35, "raise VectorStoreError('cannot reach Qdrant')"),
+    ]
+    reranker = FakeReranker({"raise VectorStoreError('cannot reach Qdrant')": 0.95}, default=0.5)
+    out = rerank_candidates(
+        "VectorStoreError", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0)
+    )
+    assert out[0].point_id == "ident"
+
+
+# ---------------------------------------------------------------------------
+# Threshold — drop garbage, do not pad
+# ---------------------------------------------------------------------------
+def test_sub_threshold_candidates_are_dropped_not_padded() -> None:
+    cands = [_cand("a", 0.5, "good"), _cand("b", 0.4, "garbage"), _cand("c", 0.3, "more garbage")]
+    reranker = FakeReranker({"good": 0.8}, default=0.05)  # b, c below 0.3
+    out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0))
+    assert [c.point_id for c in out] == ["a"]
+
+
+def test_all_below_threshold_returns_empty_an_honest_no_result() -> None:
+    cands = [_cand("a", 0.5, "x"), _cand("b", 0.4, "y")]
+    reranker = FakeReranker(default=0.1)
+    out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=0))
+    assert out == []
+
+
+def test_keep_caps_the_number_of_survivors() -> None:
+    cands = [_cand(str(i), 0.5, f"body {i}") for i in range(5)]
+    reranker = FakeReranker(default=0.9)  # all pass threshold
+    out = rerank_candidates("q", cands, reranker, keep=2, params=RerankParams(dominant_ratio=0))
+    assert len(out) == 2
+
+
+# ---------------------------------------------------------------------------
+# Known-item fast path
+# ---------------------------------------------------------------------------
+def test_dominant_top1_fusion_score_skips_the_model() -> None:
+    cands = [_cand("a", 1.0, "x"), _cand("b", 0.4, "y"), _cand("c", 0.2, "z")]
+    reranker = FakeReranker()
+    out = rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=1.5))
+    assert reranker.calls == []  # model never called
+    assert [c.point_id for c in out] == ["a", "b", "c"]  # fusion order preserved
+
+
+def test_non_dominant_top1_does_not_trigger_the_fast_path() -> None:
+    cands = [_cand("a", 0.50, "x"), _cand("b", 0.45, "y")]  # ratio 1.11 < 1.5
+    reranker = FakeReranker(default=0.9)
+    rerank_candidates("q", cands, reranker, keep=10, params=RerankParams(dominant_ratio=1.5))
+    assert len(reranker.calls) == 1  # model was called
+
+
+# ---------------------------------------------------------------------------
+# Graceful / passthrough paths
+# ---------------------------------------------------------------------------
+def test_none_reranker_passes_candidates_through_trimmed_to_keep() -> None:
+    cands = [_cand(str(i), 1.0 - i * 0.1, f"b{i}") for i in range(5)]
+    out = rerank_candidates("q", cands, None, keep=3, params=RerankParams())
+    assert [c.point_id for c in out] == ["0", "1", "2"]
+
+
+def test_noop_reranker_preserves_fusion_order_and_drops_nothing() -> None:
+    cands = [_cand("a", 0.9, "x"), _cand("b", 0.5, "y"), _cand("c", 0.1, "z")]
+    out = rerank_candidates(
+        "q", cands, NoOpReranker(), keep=10, params=RerankParams(dominant_ratio=0)
+    )
+    assert [c.point_id for c in out] == ["a", "b", "c"]
+    assert all(c.score == 1.0 for c in out)
+
+
+def test_single_candidate_is_returned_without_calling_the_model() -> None:
+    reranker = FakeReranker()
+    out = rerank_candidates("q", [_cand("a", 0.5, "x")], reranker, keep=10, params=RerankParams())
+    assert [c.point_id for c in out] == ["a"]
+    assert reranker.calls == []
+
+
+def test_top_n_bounds_what_is_sent_to_the_model() -> None:
+    cands = [_cand(str(i), 0.5, f"b{i}") for i in range(10)]
+    reranker = FakeReranker(default=0.9)
+    rerank_candidates(
+        "q", cands, reranker, keep=10, params=RerankParams(top_n=3, dominant_ratio=0)
+    )
+    _, passages = reranker.calls[0]
+    assert passages == ["b0", "b1", "b2"]
+
+
+def test_score_count_mismatch_raises() -> None:
+    class BrokenReranker:
+        model = "broken"
+
+        def score(self, query: str, passages: list[str]) -> list[float]:
+            return [0.5]  # wrong length
+
+    cands = [_cand("a", 0.5, "x"), _cand("b", 0.4, "y")]
+    with pytest.raises(RerankError):
+        rerank_candidates(
+            "q", cands, BrokenReranker(), keep=10, params=RerankParams(dominant_ratio=0)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Composition-root loader
+# ---------------------------------------------------------------------------
+def test_load_reranker_returns_none_when_disabled() -> None:
+    assert load_reranker(enabled=False) is None
+
+
+def test_load_reranker_falls_back_to_noop_when_the_model_cannot_load() -> None:
+    # A repo id that cannot resolve makes BgeReranker.load raise RerankError; the loader
+    # must swallow it into a NoOpReranker so the server still comes up (graceful degrade).
+    reranker = load_reranker(
+        enabled=True, repo_id="vaultrag/does-not-exist-xyz", model_file="onnx/model_int8.onnx"
+    )
+    assert isinstance(reranker, NoOpReranker)

@@ -58,6 +58,28 @@ class FakeSparse:
         return SparseVector(indices=[1], values=[1.0])
 
 
+class FakeReranker:
+    """Scores passages by a caller-supplied ``text -> score`` map (default 0.0).
+
+    Records the ``(query, passages)`` it was asked to score so tests can assert the stage
+    called it (or didn't, on the dominant fast path). Satisfies
+    :class:`~vaultrag.retrieval.rerank.Reranker`.
+    """
+
+    def __init__(self, scores: dict[str, float] | None = None, *, default: float = 0.0) -> None:
+        self._scores = scores or {}
+        self._default = default
+        self.calls: list[tuple[str, list[str]]] = []
+
+    @property
+    def model(self) -> str:
+        return "fake-reranker"
+
+    def score(self, query: str, passages: Sequence[str]) -> list[float]:
+        self.calls.append((query, list(passages)))
+        return [self._scores.get(p, self._default) for p in passages]
+
+
 class FakeVectorStore:
     """Records the kwargs ``.query()`` was called with; returns a preset hit list."""
 

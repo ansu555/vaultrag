@@ -15,11 +15,27 @@ from vaultrag.retrieval.pipeline import (
     DEFAULT_PREFETCH_LIMIT,
     search,
 )
+from vaultrag.retrieval.rerank import (
+    BgeReranker,
+    NoOpReranker,
+    RerankError,
+    RerankParams,
+    Reranker,
+    load_reranker,
+    rerank_candidates,
+)
 
 __all__ = [
     "DEFAULT_BUDGET_TOKENS",
     "DEFAULT_K",
     "DEFAULT_PREFETCH_LIMIT",
+    "BgeReranker",
+    "NoOpReranker",
+    "RerankError",
+    "RerankParams",
+    "Reranker",
     "SearchFilters",
+    "load_reranker",
+    "rerank_candidates",
     "search",
 ]
