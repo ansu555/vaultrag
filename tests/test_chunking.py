@@ -142,11 +142,38 @@ def test_prev_next_stitching_across_sibling_chunks() -> None:
 
 
 # ---------------------------------------------------------------------------
-# parent_id: deferred to P1 (parent-swap not built yet)
+# parent_id: pointer to the enclosing H1/H2 section (P1 Stage 2, parent-swap)
 # ---------------------------------------------------------------------------
-def test_parent_id_is_none_in_p0() -> None:
+def test_parent_id_points_to_the_enclosing_section() -> None:
     chunks = _chunks("n.md", "# H\n\nbody\n")
-    assert all(c.parent_id is None for c in chunks)
+    assert len(chunks) == 1
+    # <path>#<normalized-heading> — a pointer, not a chunk id (nothing dereferences it).
+    assert chunks[0].parent_id == "n.md#h"
+
+
+def test_root_level_content_has_no_parent_pointer() -> None:
+    # No enclosing section above root content, so nothing to swap to.
+    chunks = _chunks("plain.md", "Just a plain paragraph, no heading at all.\n")
+    assert chunks[0].heading_path == []
+    assert chunks[0].parent_id is None
+
+
+def test_children_of_one_section_share_a_parent_pointer() -> None:
+    # A directly-under-H2 child and a deeper H3 child both roll up to the H2 section, so
+    # they share one pointer — which is what lets retrieval dedupe them into one parent.
+    body = "# Root\n\n## Section\n\nlead paragraph here.\n\n### Sub\n\nnested detail here.\n"
+    chunks = _chunks("n.md", body)
+    assert len(chunks) == 2
+    assert chunks[0].heading_path == ["Root", "Section"]
+    assert chunks[1].heading_path == ["Root", "Section", "Sub"]
+    assert chunks[0].parent_id == chunks[1].parent_id == "n.md#section"
+
+
+def test_top_level_child_points_to_its_h1_not_an_h2() -> None:
+    # Content directly under an H1 (no H2 between) rolls up to that H1.
+    chunks = _chunks("n.md", "# Root\n\ncontent directly under root.\n")
+    assert chunks[0].heading_path == ["Root"]
+    assert chunks[0].parent_id == "n.md#root"
 
 
 # ---------------------------------------------------------------------------

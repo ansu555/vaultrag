@@ -7,6 +7,6 @@ Public entry points: :func:`parse_document` (file text → ``Document``) and
 """
 
 from vaultrag.parsing.markdown import parse_document
-from vaultrag.parsing.sections import heading_section, normalize_heading
+from vaultrag.parsing.sections import heading_section, normalize_heading, parent_anchor
 
-__all__ = ["heading_section", "normalize_heading", "parse_document"]
+__all__ = ["heading_section", "normalize_heading", "parent_anchor", "parse_document"]

@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseVector, VectorStoreError
 from vaultrag.models import Chunk, Document
+from vaultrag.retrieval import ParentSection
 
 PROJECT = "vaultrag-design"
 
@@ -78,6 +79,43 @@ class FakeReranker:
     def score(self, query: str, passages: Sequence[str]) -> list[float]:
         self.calls.append((query, list(passages)))
         return [self._scores.get(p, self._default) for p in passages]
+
+
+class FakeParentResolver:
+    """Returns a preset :class:`ParentSection` per ``(path, anchor)``; records every lookup.
+
+    A ``(path, anchor)`` with no entry resolves to ``None`` — the "parent unavailable" case
+    that must degrade to keeping the child. Satisfies
+    :class:`~vaultrag.retrieval.parents.ParentResolver` without touching a vault.
+    """
+
+    def __init__(self, sections: Mapping[tuple[str, str], ParentSection] | None = None) -> None:
+        self._sections = dict(sections or {})
+        self.calls: list[tuple[str, str]] = []
+
+    def resolve(self, path: str, anchor: str) -> ParentSection | None:
+        self.calls.append((path, anchor))
+        return self._sections.get((path, anchor))
+
+
+def make_parent(
+    *,
+    path: str,
+    anchor: str,
+    text: str = "Full enclosing section body.",
+    tokens: int = 40,
+    heading: str | None = None,
+    heading_path: Sequence[str] | None = None,
+) -> ParentSection:
+    """One canned reconstructed parent section (``retrieval/parents.py``)."""
+    return ParentSection(
+        path=path,
+        heading=heading or anchor,
+        anchor=anchor,
+        heading_path=list(heading_path) if heading_path is not None else [anchor],
+        text=text,
+        tokens=tokens,
+    )
 
 
 class FakeVectorStore:

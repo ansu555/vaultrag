@@ -58,7 +58,14 @@ from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
 from vaultrag.models import BlockType, OpenResult, SearchResult
 from vaultrag.parsing import heading_section, parse_document
-from vaultrag.retrieval import DEFAULT_BUDGET_TOKENS, DEFAULT_K, Reranker, RerankParams
+from vaultrag.retrieval import (
+    DEFAULT_BUDGET_TOKENS,
+    DEFAULT_K,
+    DEFAULT_PARENT_MAX_TOKENS,
+    Reranker,
+    RerankParams,
+    VaultParentResolver,
+)
 from vaultrag.retrieval import search as retrieval_search
 from vaultrag.retrieval.pipeline import pack_budget
 
@@ -153,6 +160,8 @@ def build_mcp_server(
     default_budget_tokens: int = DEFAULT_BUDGET_TOKENS,
     reranker: Reranker | None = None,
     rerank_params: RerankParams | None = None,
+    parent_swap_enabled: bool = False,
+    parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
 ) -> FastMCP:
     """Assemble the VaultRAG MCP server around already-built dependencies.
 
@@ -163,6 +172,11 @@ def build_mcp_server(
     ``reranker`` (+ ``rerank_params``) is the stage-4 cross-encoder; ``None`` runs the
     fusion-only P0 path. The CLI builds it from settings and degrades to a no-op reranker
     if the model can't be loaded, so the server always comes up.
+
+    ``parent_swap_enabled`` turns on retrieval stage 5: a retrieved child is swapped for its
+    enclosing section, reconstructed live from the vault through ``open``'s *own* gated
+    reader — so parent-swap can never surface a file ``open`` would refuse (CLAUDE.md §6).
+    It runs in ``snippets`` mode only; ``compact`` (browse-by-preview) skips the vault reads.
     """
     vault_root = vault_path.resolve()
 
@@ -244,6 +258,14 @@ def build_mcp_server(
             )
         t0 = time.perf_counter()
         effective_budget = budget_tokens if budget_tokens is not None else default_budget_tokens
+        # Fresh resolver per call: its parse cache dedupes reads *within* one search but must
+        # not persist across calls, or an edited note would resolve stale (open re-reads too).
+        # Skipped in compact mode — browsing by preview shouldn't pay for section reconstruction.
+        parent_resolver = (
+            VaultParentResolver(read_note=lambda p: _read_note(vault_root, p)[1])
+            if parent_swap_enabled and mode == "snippets"
+            else None
+        )
         try:
             result = retrieval_search(
                 query,
@@ -255,6 +277,8 @@ def build_mcp_server(
                 filters=filters.to_filters() if filters is not None else None,
                 reranker=reranker,
                 rerank=rerank_params,
+                parent_resolver=parent_resolver,
+                parent_max_tokens=parent_max_tokens,
                 # Compact mode budgets the *previews*, not the full texts: packing full
                 # texts first would silently drop hits the agent asked to browse (k),
                 # so retrieval runs unbounded and _compact re-packs to the real budget.

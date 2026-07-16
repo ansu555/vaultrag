@@ -14,14 +14,17 @@ from __future__ import annotations
 from tests.fakes import (
     PROJECT,
     FakeEmbedder,
+    FakeParentResolver,
     FakeReranker,
     FakeSparse,
     FakeVectorStore,
     make_hit,
+    make_parent,
 )
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters
-from vaultrag.retrieval import search
+from vaultrag.models import SearchResult
+from vaultrag.retrieval import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, search
 from vaultrag.retrieval.pipeline import DEFAULT_K, DEFAULT_PREFETCH_LIMIT
 from vaultrag.retrieval.rerank import RerankParams
 
@@ -267,3 +270,122 @@ def test_search_reranks_snippets_into_cross_encoder_order() -> None:
     # "b" promoted over the fusion-#1 "a"; with the default no-floor threshold "a" is kept
     # (reordered), not dropped.
     assert [s.chunk_id for s in result.snippets] == ["b", "a"]
+
+
+# ---------------------------------------------------------------------------
+# Parent-swap stage 5 (P1 Stage 2) — wiring into the pipeline
+# ---------------------------------------------------------------------------
+HS_PATH = "projects/vaultrag/hybrid-search.md"
+
+
+def _search(
+    hits: list[ScoredChunk],
+    *,
+    parent_resolver: ParentResolver | None = None,
+    parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
+) -> SearchResult:
+    return search(
+        "q",
+        project_id=PROJECT,
+        vector_store=FakeVectorStore(hits=hits),
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        parent_resolver=parent_resolver,
+        parent_max_tokens=parent_max_tokens,
+    )
+
+
+def test_no_resolver_returns_child_snippets_unchanged() -> None:
+    """Without a resolver stage 5 is off: the hit stays a child snippet (the P0 shape)."""
+    result = _search([make_hit(text="child body")])
+    assert result.snippets[0].text == "child body"
+    assert result.snippets[0].chunk_id == "point-1"
+
+
+def test_parent_swap_replaces_a_child_with_its_reconstructed_section() -> None:
+    parent = make_parent(
+        path=HS_PATH,
+        anchor="design",
+        text="## Design\n\nThe whole design section, children and all.",
+        tokens=60,
+        heading_path=["Design"],
+    )
+    resolver = FakeParentResolver({(HS_PATH, "design"): parent})
+    result = _search([make_hit(text="a small child chunk", tokens=5)], parent_resolver=resolver)
+
+    assert len(result.snippets) == 1
+    snip = result.snippets[0]
+    assert "whole design section" in snip.text
+    assert snip.anchor == "design"  # cites the parent heading, so open() reopens the section
+    assert snip.heading_path == ["Design"]
+    assert snip.tokens == 60  # measured on the reconstructed body, not the child
+    assert snip.score == 1.0  # inherits the child's rank/position
+    assert snip.chunk_id is None  # reconstructed, not an indexed point
+    assert resolver.calls == [(HS_PATH, "design")]
+
+
+def test_two_children_of_one_section_collapse_into_one_parent() -> None:
+    parent = make_parent(path=HS_PATH, anchor="design", text="parent section text", tokens=30)
+    resolver = FakeParentResolver({(HS_PATH, "design"): parent})
+    hits = [make_hit(point_id="a", score=0.9, text="child A"), make_hit(point_id="b", score=0.5)]
+    result = _search(hits, parent_resolver=resolver)
+
+    assert len(result.snippets) == 1  # deduped
+    assert result.snippets[0].text == "parent section text"
+    assert result.snippets[0].score == 0.9  # takes the best child's rank
+    assert resolver.calls == [(HS_PATH, "design")]  # resolved once for the whole group
+
+
+def test_children_of_different_sections_each_swap_to_their_own_parent() -> None:
+    hits = [
+        make_hit(point_id="a", score=0.9, text="a-child", heading_path=["Alpha"], anchor="alpha"),
+        make_hit(point_id="b", score=0.5, text="b-child", heading_path=["Beta"], anchor="beta"),
+    ]
+    resolver = FakeParentResolver(
+        {
+            (HS_PATH, "alpha"): make_parent(path=HS_PATH, anchor="alpha", text="ALPHA section"),
+            (HS_PATH, "beta"): make_parent(path=HS_PATH, anchor="beta", text="BETA section"),
+        }
+    )
+    result = _search(hits, parent_resolver=resolver)
+    assert [s.text for s in result.snippets] == ["ALPHA section", "BETA section"]
+
+
+def test_parent_over_the_cap_falls_back_to_children() -> None:
+    """A section too big for the cap is not swapped — its children are kept individually."""
+    parent = make_parent(path=HS_PATH, anchor="design", text="a huge section", tokens=5000)
+    resolver = FakeParentResolver({(HS_PATH, "design"): parent})
+    hits = [make_hit(point_id="a", text="child A"), make_hit(point_id="b", text="child B")]
+    result = _search(hits, parent_resolver=resolver, parent_max_tokens=100)
+
+    assert [s.chunk_id for s in result.snippets] == ["a", "b"]
+    assert all("child" in s.text for s in result.snippets)
+
+
+def test_parent_smaller_than_the_child_is_not_swapped() -> None:
+    """A tiny-sibling-merge child names only its first section; reconstructing that one
+    section would be smaller than the child, so the swap is refused (no content loss)."""
+    parent = make_parent(path=HS_PATH, anchor="design", text="just the first section", tokens=30)
+    resolver = FakeParentResolver({(HS_PATH, "design"): parent})
+    result = _search([make_hit(text="a big merged child", tokens=200)], parent_resolver=resolver)
+    assert result.snippets[0].text == "a big merged child"  # kept — the parent would shrink it
+    assert result.snippets[0].chunk_id == "point-1"
+
+
+def test_unresolved_parent_falls_back_to_the_child() -> None:
+    """Parent missing/gone/excluded (resolver returns None) → keep the child, don't fail."""
+    resolver = FakeParentResolver()  # empty → every resolve() returns None
+    result = _search([make_hit(text="child body")], parent_resolver=resolver)
+    assert result.snippets[0].text == "child body"
+    assert result.snippets[0].chunk_id == "point-1"
+
+
+def test_root_level_content_is_never_swapped() -> None:
+    """Root content (no enclosing heading) has no parent, so the resolver is never consulted."""
+    parent = make_parent(path=HS_PATH, anchor="design")
+    resolver = FakeParentResolver({(HS_PATH, "design"): parent})
+    result = _search(
+        [make_hit(text="root body", heading_path=[], anchor=None)], parent_resolver=resolver
+    )
+    assert result.snippets[0].text == "root body"
+    assert resolver.calls == []

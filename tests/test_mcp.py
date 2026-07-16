@@ -101,6 +101,7 @@ def build(
     sparse: FakeSparse | None = None,
     default_k: int = 10,
     default_budget_tokens: int = 2000,
+    parent_swap_enabled: bool = False,
 ) -> tuple[FastMCP, FakeVectorStore, FakeEmbedder, FakeSparse]:
     store = store if store is not None else FakeVectorStore(hits=hits)
     embedder = embedder or FakeEmbedder()
@@ -113,6 +114,7 @@ def build(
         sparse=sparse,
         default_k=default_k,
         default_budget_tokens=default_budget_tokens,
+        parent_swap_enabled=parent_swap_enabled,
     )
     return server, store, embedder, sparse
 
@@ -295,6 +297,57 @@ def test_search_surfaces_engine_failure_as_actionable_tool_error(vault: Path) ->
     message = call_expecting_error(server, "search", {"query": "q"})
     assert "search failed" in message
     assert "docker compose up -d qdrant" in message
+
+
+# ---------------------------------------------------------------------------
+# search — parent-swap (stage 5, P1 Stage 2)
+# ---------------------------------------------------------------------------
+def test_search_parent_swap_returns_the_reconstructed_section(vault: Path) -> None:
+    """With parent-swap on, a child hit comes back as its whole enclosing section, read
+    live from the vault through ``open``'s own gated reader."""
+    hit = make_hit(
+        path="notes/guide.md",
+        text="Install uv.",  # a small child; the reconstructed Setup section is larger
+        tokens=3,
+        heading_path=["Guide", "Setup"],
+        anchor="setup",
+    )
+    server, _, _, _ = build(vault, hits=[hit], parent_swap_enabled=True)
+    snip = call(server, "search", {"query": "how do I set up"})["snippets"][0]
+    assert snip["anchor"] == "setup"
+    assert "Install uv." in snip["text"]
+    assert "Nested content under Setup." in snip["text"]  # the ### Details subsection rolls up
+    assert "Quick Start" not in snip["text"]  # stops at the next same-level heading
+    assert snip["chunk_id"] is None  # a reconstructed section, not an indexed point
+
+
+def test_search_parent_swap_falls_back_when_the_note_is_secret_gated(vault: Path) -> None:
+    """Parent-swap reuses ``open``'s gates: a section in a secret-bearing note is refused,
+    so the child is kept rather than reconstructed (the read-side twin of open withholding)."""
+    hit = make_hit(
+        path="leaky.md",
+        text="the original child body",
+        heading_path=["Oops"],
+        anchor="oops",
+    )
+    server, _, _, _ = build(vault, hits=[hit], parent_swap_enabled=True)
+    snip = call(server, "search", {"query": "q"})["snippets"][0]
+    assert snip["text"] == "the original child body"  # fell back to the child
+    assert snip["chunk_id"] == "point-1"
+
+
+def test_search_compact_mode_skips_parent_swap(vault: Path) -> None:
+    """Compact is browse-by-preview: it must not pay for section reconstruction, so the
+    one-liner is the child's first line, not a swapped-in parent."""
+    hit = make_hit(
+        path="notes/guide.md",
+        text="Install uv.\nRun docker.",
+        heading_path=["Guide", "Setup"],
+        anchor="setup",
+    )
+    server, _, _, _ = build(vault, hits=[hit], parent_swap_enabled=True)
+    snip = call(server, "search", {"query": "q", "mode": "compact"})["snippets"][0]
+    assert snip["text"] == "Install uv."  # the child preview, no swap
 
 
 # ---------------------------------------------------------------------------

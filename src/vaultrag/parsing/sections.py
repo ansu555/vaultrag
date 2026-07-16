@@ -11,8 +11,15 @@ already knows it isn't a heading).
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 from vaultrag.models import Block, BlockType, Document
+
+# Parent-swap (retrieval stage 5) rolls a child up to its enclosing H1/H2 section —
+# the heading at heading-tree depth <= 2. A child nested deeper (H3/H4...) still rolls
+# up to that H2, so all children of one section share one parent pointer and can be
+# deduped into a single parent snippet (chunking-strategy.md, arch §6/§10-stage5).
+PARENT_MAX_DEPTH = 2
 
 
 def normalize_heading(text: str) -> str:
@@ -48,3 +55,18 @@ def heading_section(
                 break
         return block.line_start, end, block
     return None
+
+
+def parent_anchor(heading_path: Sequence[str]) -> str | None:
+    """Normalized anchor of the enclosing H1/H2 section a child at ``heading_path`` swaps to.
+
+    The parent for parent-swap is the section at heading-tree depth :data:`PARENT_MAX_DEPTH`
+    (the H2) when the child is nested that deep, else its top (H1) heading. Root-level
+    content (empty ``heading_path``) has no enclosing section, so it returns ``None`` and
+    never swaps. The key is normalized here so the pointer the chunker stores and the anchor
+    retrieval hands :func:`heading_section` are the same forgiving form.
+    """
+    if not heading_path:
+        return None
+    depth = min(len(heading_path), PARENT_MAX_DEPTH)
+    return normalize_heading(heading_path[depth - 1])
