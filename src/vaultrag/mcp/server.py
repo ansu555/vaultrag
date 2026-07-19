@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from blake3 import blake3
 from fastmcp import FastMCP
@@ -56,7 +56,7 @@ from vaultrag.index.base import SearchFilters, SparseEmbedder, VectorStore, Vect
 from vaultrag.indexer.scan import ExclusionReason, exclusion_reason, load_ignore_spec
 from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
-from vaultrag.models import BlockType, OpenResult, SearchResult
+from vaultrag.models import BlockType, OpenResult, SearchResult, WriteResult
 from vaultrag.parsing import heading_section, parse_document
 from vaultrag.retrieval import (
     DEFAULT_BUDGET_TOKENS,
@@ -68,8 +68,13 @@ from vaultrag.retrieval import (
 )
 from vaultrag.retrieval import search as retrieval_search
 from vaultrag.retrieval.pipeline import pack_budget
+from vaultrag.writeback import NoteWriter, WriteConflict, WriteRefused
 
 log = get_logger(__name__)
+
+# How much of a conflicting note's current content the 409 error echoes back, so the agent
+# can rebase without a second round-trip while a huge note can't detonate its context.
+_CONFLICT_PREVIEW_CHARS = 4_000
 
 # Compact mode: one preview line per hit, hard-capped so a pathological first line
 # can't defeat the point of the mode.
@@ -163,6 +168,7 @@ def build_mcp_server(
     parent_swap_enabled: bool = False,
     parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
     vault_name: str | None = None,
+    writer: NoteWriter | None = None,
 ) -> FastMCP:
     """Assemble the VaultRAG MCP server around already-built dependencies.
 
@@ -182,6 +188,11 @@ def build_mcp_server(
     ``vault_name`` is the Obsidian display name used to build ``obsidian://open`` citation
     URIs (retrieval stage 8); ``None`` omits them. The CLI resolves it from settings, falling
     back to the vault directory name so a served snippet is always one click from Obsidian.
+
+    ``writer`` turns on the P1 Stage 5 write tools (``write_note`` / ``append_section`` /
+    ``patch_frontmatter``): with a :class:`~vaultrag.writeback.NoteWriter`, an agent can
+    record what it learns and retrieve it the same session (the memory loop). ``None`` keeps
+    the server read-only — a deployment that shouldn't accept writes simply passes nothing.
     """
     vault_root = vault_path.resolve()
 
@@ -397,7 +408,154 @@ def build_mcp_server(
         )
         return result
 
+    if writer is not None:
+        _register_write_tools(mcp, writer)
+
     return mcp
+
+
+# ---------------------------------------------------------------------------
+# Write tools (P1 Stage 5) — registered only when a NoteWriter is supplied.
+# ---------------------------------------------------------------------------
+def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
+    """Attach ``write_note`` / ``append_section`` / ``patch_frontmatter`` to ``mcp``.
+
+    Each tool is a thin boundary over the :class:`~vaultrag.writeback.NoteWriter`: it
+    translates a :class:`~vaultrag.writeback.WriteRefused` into a plain ``ToolError`` (the
+    message is written for the agent) and a :class:`~vaultrag.writeback.WriteConflict` into
+    a 409-style error that echoes the current hash + content so the agent can rebase and
+    retry — no second read needed (``../Rag/projects/vaultrag/write-back-design.md``).
+    """
+
+    @mcp.tool
+    def write_note(
+        title: Annotated[
+            str,
+            Field(
+                description="Human-readable note title. Becomes the H1/frontmatter title and "
+                "the slugified filename (e.g. 'JWT refresh decision' → 'jwt-refresh-decision.md'). "
+                "VaultRAG adds provenance frontmatter (author, via: vaultrag, created)."
+            ),
+        ],
+        content: Annotated[
+            str,
+            Field(
+                description="The note body in Markdown (no frontmatter — VaultRAG writes that). "
+                "For agent memory, record what/why/files-touched so a future search retrieves it."
+            ),
+        ],
+        folder: Annotated[
+            str | None,
+            Field(
+                description="Vault-relative folder to create the note in. Defaults to the "
+                "write root (agent-inbox/). Must be within the server's write allowlist."
+            ),
+        ] = None,
+        tags: Annotated[
+            list[str] | None,
+            Field(description="Optional tags written to frontmatter (e.g. ['decision', 'auth'])."),
+        ] = None,
+    ) -> WriteResult:
+        """Create a new note in the vault (defaults to agent-inbox/), committed + indexed.
+
+        Use this to persist a decision/fix/finding so future sessions can `search` it — the
+        line that turns this index into long-term memory. Refuses to overwrite an existing
+        note: pick a different title, or use append_section/patch_frontmatter. The result's
+        `hash` is the `base_hash` for a later patch; `uri` opens the note in Obsidian.
+        """
+        try:
+            return writer.write_note(title=title, content=content, folder=folder, tags=tags)
+        except WriteConflict as exc:
+            raise ToolError(_conflict_message(exc)) from exc
+        except WriteRefused as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool
+    def append_section(
+        path: Annotated[
+            str,
+            Field(
+                description="Vault-relative path of the existing note to edit, exactly as a "
+                "search citation gave it (e.g. 'agent-inbox/auth-notes.md')."
+            ),
+        ],
+        heading: Annotated[
+            str,
+            Field(
+                description="Heading whose section to append to (matched leniently, like open's "
+                "`heading`: 'quick-start' matches 'Quick Start'). The block is inserted at the "
+                "end of that section, before the next same-or-higher heading."
+            ),
+        ],
+        content: Annotated[
+            str,
+            Field(description="Markdown block to append to the section."),
+        ],
+    ) -> WriteResult:
+        """Append a Markdown block to a heading's section in an existing note, then reindex.
+
+        Additive: it inserts at the section's end without rewriting the rest, so it needs no
+        base_hash lock. Use it to grow a running note (a log, a checklist). Fails if the
+        heading isn't found (the error lists the note's real headings).
+        """
+        try:
+            return writer.append_section(path=path, heading=heading, content=content)
+        except WriteConflict as exc:
+            raise ToolError(_conflict_message(exc)) from exc
+        except WriteRefused as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool
+    def patch_frontmatter(
+        path: Annotated[
+            str,
+            Field(
+                description="Vault-relative path of the existing note whose frontmatter to edit."
+            ),
+        ],
+        updates: Annotated[
+            dict[str, Any],
+            Field(
+                description="Frontmatter keys to set/overwrite, e.g. {'status': 'accepted', "
+                "'tags': ['decision']}. Body text is left untouched."
+            ),
+        ],
+        base_hash: Annotated[
+            str,
+            Field(
+                description="The note's current content hash (the `hash` a prior search/open/"
+                "write returned). Guards against clobbering a concurrent edit: if it no longer "
+                "matches, the call fails and returns the current hash + content to rebase on."
+            ),
+        ],
+    ) -> WriteResult:
+        """Set frontmatter keys on an existing note under an optimistic lock, then reindex.
+
+        Pass the `base_hash` you last saw. On a mismatch (someone else edited the note) the
+        call fails with the current hash and content — re-read, merge, and retry with the new
+        base_hash. This is the only write tool that requires the lock (it mutates in place).
+        """
+        try:
+            return writer.patch_frontmatter(path=path, updates=updates, base_hash=base_hash)
+        except WriteConflict as exc:
+            raise ToolError(_conflict_message(exc)) from exc
+        except WriteRefused as exc:
+            raise ToolError(str(exc)) from exc
+
+
+def _conflict_message(exc: WriteConflict) -> str:
+    """The 409 text: name the live hash and echo (bounded) current content to rebase on."""
+    preview = exc.current_text[:_CONFLICT_PREVIEW_CHARS]
+    elided = (
+        ""
+        if len(exc.current_text) <= _CONFLICT_PREVIEW_CHARS
+        else "\n… (truncated; open the note for the rest)"
+    )
+    return (
+        f"{exc.path!r} changed since base_hash was taken — no silent overwrite. Its current "
+        f"hash is {exc.current_hash}. Re-read, merge your change, and retry with "
+        f"base_hash={exc.current_hash}. Current content:\n---\n{preview}{elided}"
+    )
 
 
 # ---------------------------------------------------------------------------

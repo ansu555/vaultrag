@@ -159,6 +159,47 @@ class Settings(BaseSettings):
         "parallel (per-path work still runs serially; last write wins).",
     )
 
+    # --- write-back (MCP write tools + git auto-commit; P1 Stage 5) ------------
+    # Agents create/edit notes through VaultRAG and the write is committed + reindexed
+    # so it's retrievable the same session — this closes the memory loop (arch §17,
+    # ../Rag/projects/vaultrag/write-back-design.md, ../Rag/reference/reference-security-
+    # model.md). The guardrails below are the config surface of CLAUDE.md §6's write
+    # safety; every default is deliberately conservative and per-vault overridable (no
+    # baked-in magic — an open-source user tunes these, they aren't hardcoded cutoffs).
+    writeback_enabled: bool = Field(
+        default=True,
+        description="Expose the write tools (write_note/append_section/patch_frontmatter). "
+        "On by default — the memory loop is the point of P1. A read-only deployment sets "
+        "this false (or `vaultrag mcp --no-write`); then no MetaStore is opened for writing.",
+    )
+    writeback_allow_roots: list[str] = Field(
+        default_factory=lambda: ["agent-inbox"],
+        description="Vault-relative folders writes may target (realpath must resolve under "
+        "one of them). The default write root `agent-inbox/` is the first entry; add e.g. "
+        "'decisions' to let agents edit those directly. Empty list disables all writes.",
+    )
+    writeback_author: str = Field(
+        default="claude-code",
+        description="Agent identity stamped into provenance frontmatter (author:) and used "
+        "as the git commit author, so agent writes are distinguishable from a human's.",
+    )
+    writeback_max_bytes: int = Field(
+        default=1_000_000,
+        description="Largest note (UTF-8 bytes) a single write may produce — a runaway "
+        "write is refused rather than indexed. Raise per-vault for genuinely large notes.",
+    )
+    writeback_max_writes_per_minute: int = Field(
+        default=30,
+        description="Per-session sliding-window cap on accepted writes; over it, writes are "
+        "refused until the window clears. Guards against a looping agent flooding the vault.",
+    )
+    writeback_git_enabled: bool = Field(
+        default=True,
+        description="Auto-commit each accepted write to the vault's git repo "
+        "(`agent(<author>): <what>`). Best-effort: a non-git vault still gets the write + "
+        "index, the commit is just skipped. The vault, not git, is the source of truth.",
+    )
+
     # --- logging --------------------------------------------------------------
     log_level: str = Field(
         default="INFO",

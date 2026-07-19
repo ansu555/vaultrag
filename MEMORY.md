@@ -8,7 +8,46 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P1 IN PROGRESS — Stage 4 (single-file ingest + watchdog live-watch) code-complete +
+- **Phase:** **P1 CODE-COMPLETE — Stage 5 (write-back + MCP write tools + git auto-commit) done +
+  LIVE-verified (real Ollama + Qdrant + real vault). All 5 P1 stages are done; the memory loop is
+  closed.** New **`writeback/`** package. **`NoteWriter`** (`writeback/writer.py`) backs the three
+  MCP write tools and runs every accepted write through one gauntlet (repo `CLAUDE.md` §6 /
+  `write-back-design.md`): **(1) containment** — target realpath (`resolve()` first, so symlinks
+  can't tunnel out) must stay under the vault root; **(2) write allowlist** — must sit under one of
+  `writeback_allow_roots` (default just `agent-inbox/`; per-vault config opens e.g. `decisions/` — the
+  configurable half of "default write root agent-inbox/", *not* a hardcoded folder, per Anik's
+  no-magic-constant steer); **(3) index gates** — the *same* `exclusion_reason` (secret filename /
+  `.ragignore` / unsupported / pruned) **and** `scan_for_secrets(content)`, so a note whose body is
+  key material is **unwritable AND (ingest_path re-gates) never indexed** — the write-side twin of P0
+  Step 3's planted-secret test; **(4) size + rate caps** (`writeback_max_bytes` 1 MB;
+  `writeback_max_writes_per_minute` 30, sliding window); **(5) optimistic lock** — `patch_frontmatter`
+  requires the `base_hash` the agent last saw → mismatch raises `WriteConflict` carrying the *current*
+  hash + content (the "409 + current content"); `append_section` is additive (inserts at the section's
+  end via `heading_section`) so it takes no lock, matching the `reference-mcp-tools.md` signatures.
+  Then it **writes → git-commits (best-effort) → synchronous `ingest_path`** (Stage 4's primitive) so
+  the note is retrievable the same session. **git** (`writeback/git.py`): auto-commits each write to the
+  *vault's* repo as `agent(<author>): <what>`, attributed to the agent identity via `-c user.name/email`
+  (no repo-config mutation); **best-effort** — a non-git vault / missing git still gets the write +
+  index (`committed=False`), the vault is the source of truth. **Index-failure is non-fatal**: if Qdrant/
+  Ollama are down at write time the note is still written + committed and `WriteResult{indexed=False,
+  warning=…}` says so (a later reindex/watch recovers it). New `WriteResult` model (`models.py`); 3 MCP
+  tools registered in `build_mcp_server` only when a `writer` is passed (`mcp/server.py`), with
+  model-facing descriptions + `WriteRefused`/`WriteConflict`→`ToolError`. CLI: `vaultrag mcp` opens the
+  SQLite store + builds a `NoteWriter` **by default** (write-back on — the memory loop is the point;
+  `--no-write` or `VAULTRAG_WRITEBACK_ENABLED=false` serves read-only), sharing the store with `--watch`.
+  6 new config knobs. **Green: 315 tests** (+27: `test_writeback.py` [20], `test_mcp.py` [+5 write-tool],
+  `test_cli.py` [+2]); ruff, ruff format, mypy (41 src files). **Verify:** unit tests drive the real
+  writer against real SQLite + in-memory Qdrant + fake embedder (create/append/patch, conflict, all
+  guardrails incl. **planted-secret-content unwritable+not-indexed**, real-git commit in a tmp repo,
+  index-failure-nonfatal); **a full Ollama-backed dogfood against the live `vaultrag-design` vault PASSED**
+  (`scratchpad/writeback_dogfood.py`, git disabled so the user's Rag history is untouched): reconciled
+  `../Rag` (count 145), `write_note` → real embed, `indexed chunks=1` (145→146), **a real hybrid `search`
+  for its token ranked the just-written note #1** with a working `obsidian://` URI, `append_section` +
+  `patch_frontmatter` (stale `base_hash`→409, correct→patched), then deleted + evicted — vault + index
+  left clean (Rag git status shows only the pre-existing p1-step-plan.md edit).
+  **Next: P2** (Docling PDFs, Excalidraw/Mermaid, OCR, `related`/graph-expand, full eval harness + CI
+  gate, Prometheus). See `CLAUDE.md` §4.
+- **(Stage 4 archive)** **Stage 4 (single-file ingest + watchdog live-watch) code-complete +
   LIVE-verified (real Ollama + Qdrant + real vault).** Two pieces. (1) **Extracted the single-file primitive** from `reindex_vault`
   (`indexer/pipeline.py`): a new `IngestContext` bundles `(project, vault, store, vector_store, embedder)`, and
   public **`ingest_path(ctx, path, *, ignore=None)` / `remove_path(ctx, path)`** reconcile ONE vault-relative
@@ -137,8 +176,9 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   has no ONNX; `tokenizers` from fastembed tokenizes, no torch/transformers); parent-rep =
   reconstruct from vault (`parent_id` = pointer); eval = pull a minimal golden set forward for
   Stages 1–2 (full harness/CI stays P2); watcher = `serve`/indexer owns it, `mcp --watch` opt-in.
-  **Stages 1 (rerank) + 2 (parent-swap) + 3 (`obsidian://` citations) + 4 (single-file ingest +
-  watchdog live-watch) are DONE.** **Next: Stage 5 (write-back + git auto-commit).** The `vaultrag` MCP server is now
+  **All 5 P1 stages are DONE: 1 (rerank) + 2 (parent-swap) + 3 (`obsidian://` citations) + 4 (single-file
+  ingest + watchdog live-watch) + 5 (write-back + MCP write tools + git auto-commit). P1 is
+  code-complete and the memory loop is closed.** **Next: P2.** The `vaultrag` MCP server is now
   registered in this project's local Claude Code config and pointed at the live
   `vaultrag-design` index, so **dogfooding is available right now**: as you build P1, use
   `search`/`open` against `../Rag` and treat any bad retrieval as a real bug report (repo
@@ -175,6 +215,56 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-19 — P1 Stage 5 (write-back + MCP write tools + git auto-commit) implemented + live-verified
+- **Did:** Built the write-back mechanism — the last P1 stage — closing the memory loop. New **`writeback/`**
+  package: `errors.py` (`WriteRefused`+`RefusalReason`, `WriteConflict` carrying current hash+content),
+  `git.py` (best-effort `commit_paths` to the *vault's* repo, agent identity via `-c`, never mutates git
+  config), `writer.py` (**`NoteWriter`** with `write_note`/`append_section`/`patch_frontmatter`). Every
+  accepted write runs one gauntlet: containment (realpath under vault root, symlink-safe) → write allowlist
+  (`writeback_allow_roots`, default `agent-inbox/`) → the *same* index gates as the scanner
+  (`exclusion_reason` + `scan_for_secrets` on content) → size/rate caps → optimistic lock (patch only) →
+  **write → git-commit → synchronous `ingest_path`** (reuses Stage 4's primitive). `append_section` is
+  additive/unlocked (inserts at the section end via `heading_section`); `patch_frontmatter` requires
+  `base_hash` (409 = `WriteConflict` + current content). Index-failure is non-fatal (note still written +
+  committed; `WriteResult{indexed=False, warning}`). Added `WriteResult` (`models.py`); wired 3 tools into
+  `build_mcp_server(writer=…)` (registered only when a writer is supplied) with model-facing descriptions +
+  `WriteRefused`/`WriteConflict`→`ToolError`; `cli.py mcp` opens the store + builds a `NoteWriter` **by
+  default** (`--no-write` / `VAULTRAG_WRITEBACK_ENABLED=false` → read-only), shared with `--watch`. 6 config
+  knobs (`writeback_enabled`, `writeback_allow_roots`, `writeback_author`, `writeback_max_bytes`,
+  `writeback_max_writes_per_minute`, `writeback_git_enabled`). Green: **315 tests** (+27:
+  `test_writeback.py` new [20], `test_mcp.py` [+5], `test_cli.py` [+2]), ruff, ruff format, mypy (41 src).
+- **Why:** Anik: *"implimnet stage 5"* — Stage 5 of `../Rag/projects/vaultrag/p1-step-plan.md` (arch §17;
+  `write-back-design.md`; `reference-security-model.md`). This is the line that turns the search index into
+  agent long-term memory (`reference-mcp-tools.md`): after a decision/fix an agent `write_note`s a record
+  and a future session `search`es it.
+- **Verify:** (1) unit tests drive the real `NoteWriter` against real SQLite + in-memory Qdrant + a fake
+  embedder — create/append/patch actually parse→chunk→embed→upsert→retrievable; guardrails incl. the
+  first-class **planted-secret-content unwritable AND never indexed** (write-side twin of P0 Step 3),
+  path-traversal, allowlist, `base_hash` 409, size/rate caps, a **real git commit in a throwaway repo**
+  (asserts author + `agent(claude-code): created …` subject), and index-failure-is-nonfatal (monkeypatched
+  Qdrant/Ollama failure → write survives). (2) **A full Ollama-backed dogfood against the live
+  `vaultrag-design` vault PASSED** (`scratchpad/writeback_dogfood.py`, `git_enabled=False` so the user's Rag
+  git history is never touched — git is already proven in the unit test): reconciled `../Rag` (count 145),
+  `write_note` → real embed → `indexed chunks=1` (145→146), **a real hybrid `search` for the token ranked
+  the freshly-written note #1** with `obsidian://open?vault=Rag&file=agent-inbox%2F…`; `append_section`
+  landed + reindexed; `patch_frontmatter` conflicted on a stale `base_hash` then patched on the live one;
+  then the note was deleted + evicted (count back to 145). Confirmed the Rag vault git status shows only the
+  pre-existing `p1-step-plan.md` edit — no stray file, no new commit.
+- **Files:** `src/vaultrag/`: `writeback/{__init__,errors,git,writer}.py` (new), `models.py` (WriteResult),
+  `config.py` (6 knobs), `mcp/server.py` (writer param + 3 tools + `_register_write_tools`/`_conflict_message`),
+  `cli.py` (store-for-writeback + `--write/--no-write`). Tests: `tests/test_writeback.py` (new),
+  `test_mcp.py`, `test_cli.py`. **Vault:** `p1-step-plan.md` Log (Stage 5 done).
+- **Next / handoff:** **P1 is code-complete — the whole roadmap moves to P2** (`CLAUDE.md` §4): Docling PDFs,
+  Excalidraw/Mermaid extraction, OCR, `related`/graph-expand (retrieval stage 6), the **full** eval harness
+  + merge-blocking CI gate (only a *minimal* golden set exists so far), Prometheus. Open write-back polish
+  for later (not blockers): the write allowlist + rate cap are per-*server-session* (no api_keys/tenancy yet
+  — that's P3); `write_note` treats `content` as pure body and owns the frontmatter (a body that itself
+  starts with `---` would double up — document/guard if it ever bites); `.ragignore` is re-read per write
+  (correctness over speed). Consider promoting the hardened `WriteResult` shape into
+  `../Rag/reference/reference-mcp-tools.md` (still params-only). Working tree: new `src/vaultrag/writeback/`
+  + `tests/test_writeback.py`, edits across models/config/mcp/cli + test_mcp/test_cli; vault plan note edited
+  (separate repo). Commit when Anik asks.
 
 ### 2026-07-19 — P1 Stage 4 (single-file ingest + watchdog live-watch) implemented + mechanism-verified
 - **Did:** Implemented Stage 4 end-to-end. (1) **Primitive extraction** (`indexer/pipeline.py`): added

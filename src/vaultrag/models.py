@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import uuid
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -255,3 +255,31 @@ class OpenResult(_Base):
     text: str
     tokens: int
     truncated: bool = False  # hard safety cap hit — narrow with heading= or lines=
+
+
+# ---------------------------------------------------------------------------
+# Write contract (write-back Stage 5 — the memory loop close)
+# ---------------------------------------------------------------------------
+class WriteResult(_Base):
+    """The response for an accepted write tool call (``write_note`` / ``append_section`` /
+    ``patch_frontmatter``).
+
+    Reports what actually landed: the note ``path`` and its new content ``hash`` (pass
+    this as the next ``base_hash`` to edit safely), whether a git audit commit was made,
+    and whether the synchronous reindex made it retrievable in this same session
+    (``../Rag/projects/vaultrag/write-back-design.md``). ``indexed=False`` with a
+    ``warning`` means the note is safely on disk + committed but the index lagged (e.g.
+    Qdrant was down) — the vault is the source of truth, so a later reindex/watch recovers
+    it. ``uri`` is the one-click ``obsidian://open`` link to the written note.
+    """
+
+    path: str
+    action: Literal["created", "appended", "patched"]
+    hash: str  # BLAKE3 of the new file content — the base_hash for a subsequent edit
+    bytes_written: int
+    committed: bool = False  # a git commit was made (False = non-git vault / commit skipped)
+    commit: str | None = None  # short commit SHA when committed
+    indexed: bool = False  # the synchronous reindex succeeded → searchable now
+    chunks: int = 0  # chunks (re)written by that reindex
+    uri: str | None = None  # obsidian://open?vault=…&file=… (when a vault_name is configured)
+    warning: str | None = None  # non-fatal note (index lagged / git skipped), else None

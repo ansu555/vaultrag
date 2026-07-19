@@ -34,6 +34,7 @@ from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
 from vaultrag.retrieval import RerankParams, load_reranker
 from vaultrag.store.sqlite import SQLiteMetaStore
+from vaultrag.writeback import NoteWriter
 
 app = typer.Typer(
     name="vaultrag",
@@ -206,8 +207,17 @@ def mcp(
             "solo dogfooding). Off by default — serve/indexer own the watcher.",
         ),
     ] = False,
+    write: Annotated[
+        bool,
+        typer.Option(
+            "--write/--no-write",
+            help="Expose the write tools (write_note/append_section/patch_frontmatter). "
+            "On by default (the memory loop); --no-write serves read-only. Also gated by "
+            "VAULTRAG_WRITEBACK_ENABLED.",
+        ),
+    ] = True,
 ) -> None:
-    """Serve the MCP tools (search/open) over stdio.
+    """Serve the MCP tools (search/open, and write_note/… unless --no-write) over stdio.
 
     stdout is the JSON-RPC channel, so nothing here may print to it — logs go to
     stderr (see ``vaultrag.logging``) and the FastMCP banner is disabled. Register
@@ -223,11 +233,13 @@ def mcp(
         typer.echo(f"mcp failed: vault path is not a directory: {vault_path}", err=True)
         raise typer.Exit(code=1)
 
-    # No MetaStore here by default: search reads only Qdrant, open reads only the vault.
-    # Neither client connects at construction time, so the server comes up instantly and a
-    # down Qdrant/Ollama surfaces as an actionable per-call tool error instead. --watch is
-    # the one exception: live-watch needs the SQLite manifest/jobs + an embedder, so it
-    # opens a store and runs one VaultWatcher in a background daemon thread (opt-in, solo).
+    # By default search reads only Qdrant and open reads only the vault, and neither client
+    # connects at construction time, so a read-only server comes up instantly (a down
+    # Qdrant/Ollama surfaces as an actionable per-call error). Two features need more: the
+    # write tools (write_note/…) and --watch both drive the single-file pipeline, so they
+    # open the SQLite manifest/jobs store and reuse the raw embedder for document ingest.
+    write_enabled = write and settings.writeback_enabled
+    vault_root = vault_path.resolve()
     vector_store: QdrantVectorStore | None = None
     embedder: OllamaEmbedder | None = None
     store: SQLiteMetaStore | None = None
@@ -244,6 +256,34 @@ def mcp(
                 repo_id=settings.rerank_model,
                 model_file=settings.rerank_model_file,
             )
+            # Obsidian display name for citation URIs (stage 8) + write-back note links:
+            # configured value, else the vault directory name (a vault named after its folder).
+            resolved_vault_name = settings.vault_name or vault_root.name
+
+            # One store, shared by write-back and --watch (SQLite serializes its own writes;
+            # opened check_same_thread=False for exactly this multi-thread reuse).
+            if write_enabled or watch:
+                store = SQLiteMetaStore.from_settings(settings)
+
+            writer: NoteWriter | None = None
+            if write_enabled:
+                assert store is not None  # opened just above when write_enabled
+                writer = NoteWriter(
+                    IngestContext(
+                        project_id=project_id,
+                        vault_path=vault_root,
+                        store=store,
+                        vector_store=vector_store,
+                        embedder=embedder,
+                    ),
+                    author=settings.writeback_author,
+                    allow_roots=settings.writeback_allow_roots,
+                    max_bytes=settings.writeback_max_bytes,
+                    max_writes_per_minute=settings.writeback_max_writes_per_minute,
+                    git_enabled=settings.writeback_git_enabled,
+                    vault_name=resolved_vault_name,
+                )
+
             server = build_mcp_server(
                 project_id=project_id,
                 vault_path=vault_path,
@@ -260,20 +300,17 @@ def mcp(
                 ),
                 parent_swap_enabled=settings.parent_swap_enabled,
                 parent_max_tokens=settings.parent_max_tokens,
-                # Obsidian display name for citation URIs (stage 8): configured value, else
-                # the vault directory name — the common case (a vault named after its folder).
-                # resolve() so a relative/'.'-style --vault still yields a real folder name.
-                vault_name=settings.vault_name or vault_path.resolve().name,
+                vault_name=resolved_vault_name,
+                writer=writer,
             )
             if watch:
-                # Reuse the raw OllamaEmbedder (not the QueryEmbedder wrapper) for document
-                # ingest. The observer + dispatcher are daemon threads that die with this
-                # stdio process; stop() in the finally drains them on a clean detach.
-                store = SQLiteMetaStore.from_settings(settings)
+                # The observer + dispatcher are daemon threads that die with this stdio
+                # process; stop() in the finally drains them on a clean detach.
+                assert store is not None  # opened above when watch is set
                 watcher = VaultWatcher(
                     IngestContext(
                         project_id=project_id,
-                        vault_path=vault_path.resolve(),
+                        vault_path=vault_root,
                         store=store,
                         vector_store=vector_store,
                         embedder=embedder,
@@ -284,7 +321,7 @@ def mcp(
                 watcher.start()
         # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
         # client that resolves/binds something at construction; sqlite3.Error = an
-        # unopenable --watch store. Either way the fix is the operator's, so fail with a
+        # unopenable write/watch store. Either way the fix is the operator's, so fail with a
         # readable line rather than a stdio traceback.
         except (ValueError, OSError, sqlite3.Error) as exc:
             log.error("mcp.failed", project=project_id, error=str(exc))
@@ -296,6 +333,7 @@ def mcp(
             vault=str(vault_path),
             transport="stdio",
             watching=watch,
+            writing=write_enabled,
         )
         try:
             server.run(transport="stdio", show_banner=False)  # blocks until client detaches

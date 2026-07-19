@@ -19,6 +19,7 @@ from typing import Any, get_args
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
+from qdrant_client import QdrantClient
 
 from tests.fakes import (
     PROJECT,
@@ -30,11 +31,15 @@ from tests.fakes import (
 )
 from vaultrag.chunking.tokens import count_tokens
 from vaultrag.embedding.cache import QueryEmbedder
+from vaultrag.index import QdrantVectorStore
 from vaultrag.index.base import ScoredChunk, SearchFilters
+from vaultrag.indexer.pipeline import IngestContext
 from vaultrag.indexer.scan import ExclusionReason
 from vaultrag.mcp import build_mcp_server
 from vaultrag.mcp.server import _EXCLUSION_MESSAGES, SearchFiltersParam, _apply_cap
 from vaultrag.retrieval import obsidian_uri
+from vaultrag.store.sqlite import SQLiteMetaStore
+from vaultrag.writeback import NoteWriter
 
 # ---------------------------------------------------------------------------
 # Harness
@@ -553,3 +558,134 @@ def test_open_has_a_refusal_message_for_every_indexer_gate() -> None:
     agent instead of refusing cleanly, so the two must move together.
     """
     assert set(get_args(ExclusionReason)) == set(_EXCLUSION_MESSAGES)
+
+
+# ---------------------------------------------------------------------------
+# write tools (P1 Stage 5) — registered only when a NoteWriter is supplied
+# ---------------------------------------------------------------------------
+def build_with_writer(
+    vault: Path, **writer_kwargs: object
+) -> tuple[FastMCP, SQLiteMetaStore, QdrantVectorStore]:
+    """A server with the real write tools wired to a real store + in-memory Qdrant."""
+    store = SQLiteMetaStore(vault.parent / "state" / "vaultrag.db")
+    store.upsert_project(PROJECT, name=PROJECT, vault_path=str(vault))
+    vstore = QdrantVectorStore(
+        dims=4, collection="chunks", client=QdrantClient(":memory:"), sparse=WriteFakeSparse()
+    )
+    vstore.ensure_collection()
+    writer = NoteWriter(
+        IngestContext(
+            project_id=PROJECT,
+            vault_path=vault,
+            store=store,
+            vector_store=vstore,
+            embedder=WriteFakeEmbedder(),
+        ),
+        vault_name="Vault",
+        git_enabled=False,  # keep the MCP boundary tests off subprocess git
+        **writer_kwargs,  # type: ignore[arg-type]
+    )
+    server = build_mcp_server(
+        project_id=PROJECT,
+        vault_path=vault,
+        vector_store=vstore,
+        embedder=QueryEmbedder(WriteFakeEmbedder()),
+        sparse=WriteFakeSparse(),
+        writer=writer,
+    )
+    return server, store, vstore
+
+
+class WriteFakeSparse:
+    @property
+    def model(self) -> str:
+        return "fake-bm25"
+
+    def embed_documents(self, texts: Sequence[str]) -> list[Any]:
+        from vaultrag.index import SparseVector
+
+        return [SparseVector(indices=[1], values=[float(len(t))]) for t in texts]
+
+    def embed_query(self, text: str) -> Any:
+        from vaultrag.index import SparseVector
+
+        return SparseVector(indices=[1], values=[1.0])
+
+
+class WriteFakeEmbedder:
+    @property
+    def model(self) -> str:
+        return "fake-embed-model"
+
+    @property
+    def dims(self) -> int:
+        return 4
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return [[float(len(t) + i) for i in range(4)] for t in texts]
+
+    def close(self) -> None:
+        pass
+
+
+def test_write_tools_are_absent_without_a_writer(vault: Path) -> None:
+    """A read-only server (no writer) exposes only search + open — no write surface."""
+    server, _, _, _ = build(vault)
+
+    async def _run() -> set[str]:
+        async with Client(server) as client:
+            return {t.name for t in await client.list_tools()}
+
+    assert asyncio.run(_run()) == {"search", "open"}
+
+
+def test_write_tools_are_registered_with_a_writer(vault: Path) -> None:
+    server, _store, _vs = build_with_writer(vault)
+
+    async def _run() -> set[str]:
+        async with Client(server) as client:
+            return {t.name for t in await client.list_tools()}
+
+    assert asyncio.run(_run()) == {
+        "search",
+        "open",
+        "write_note",
+        "append_section",
+        "patch_frontmatter",
+    }
+
+
+def test_write_note_tool_round_trips_and_returns_a_result(vault: Path) -> None:
+    server, store, _vs = build_with_writer(vault)
+    result = call(
+        server,
+        "write_note",
+        {"title": "MCP Memory", "content": "## What\n\nremember this\n", "tags": ["memo"]},
+    )
+    assert result["action"] == "created"
+    assert result["path"] == "agent-inbox/mcp-memory.md"
+    assert result["indexed"] is True and result["chunks"] >= 1
+    assert result["uri"] == obsidian_uri("Vault", result["path"])
+    # It actually landed in the vault + index.
+    assert (vault / result["path"]).is_file()
+    assert store.get_document(PROJECT, result["path"]) is not None
+
+
+def test_write_note_refusal_surfaces_as_a_tool_error(vault: Path) -> None:
+    server, _store, _vs = build_with_writer(vault)
+    message = call_expecting_error(
+        server, "write_note", {"title": "Elsewhere", "content": "x\n", "folder": "decisions"}
+    )
+    assert "write allowlist" in message
+
+
+def test_patch_frontmatter_conflict_surfaces_current_hash(vault: Path) -> None:
+    server, _store, _vs = build_with_writer(vault)
+    created = call(server, "write_note", {"title": "Lockme", "content": "## B\n\nbody\n"})
+    message = call_expecting_error(
+        server,
+        "patch_frontmatter",
+        {"path": created["path"], "updates": {"status": "x"}, "base_hash": "stale"},
+    )
+    assert created["hash"] in message  # 409 echoes the live hash to rebase on
+    assert "body" in message  # …and the current content

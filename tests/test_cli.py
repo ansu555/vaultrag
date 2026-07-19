@@ -185,12 +185,14 @@ def test_mcp_watch_starts_and_stops_the_watcher(
 def test_mcp_composes_a_stdio_server_and_closes_its_clients(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The composition root's contract, with `run()` stubbed so nothing binds stdio.
+    """The read-only (`--no-write`) composition contract, with `run()` stubbed.
 
     Pins the two properties that break the protocol silently rather than loudly:
     `transport="stdio"` and `show_banner=False` (a banner would print to stdout — the
     JSON-RPC channel — and corrupt the stream). Also pins that both clients get closed,
     since the `finally` is the only thing preventing a leaked httpx/Qdrant connection.
+    With `--no-write` no MetaStore is opened, so search-reads-Qdrant/open-reads-vault
+    stays the whole story.
     """
     vault_dir = tmp_path / "vault"
     vault_dir.mkdir()
@@ -207,10 +209,61 @@ def test_mcp_composes_a_stdio_server_and_closes_its_clients(
 
     result = runner.invoke(
         app,
-        ["mcp", "--project", "test-proj", "--vault", str(vault_dir)],
+        ["mcp", "--no-write", "--project", "test-proj", "--vault", str(vault_dir)],
         # A port nothing listens on: construction must not need a live service.
-        env={"VAULTRAG_QDRANT_URL": "http://127.0.0.1:1"},
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
     )
     assert result.exit_code == 0, result.output
     assert captured["kwargs"] == {"transport": "stdio", "show_banner": False}
     assert sorted(closed) == ["ollama", "qdrant"]
+    # --no-write means no manifest store was ever opened.
+    assert not (tmp_path / "state" / "vaultrag.db").exists()
+
+
+def test_mcp_opens_a_store_for_write_back_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default `mcp` (write-back on) opens the manifest store the write tools need, and
+    closes it in the finally alongside the Qdrant/Ollama clients."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    events: list[str] = []
+
+    monkeypatch.setattr(FastMCP, "run", lambda self, **kwargs: events.append("ran"))
+    monkeypatch.setattr(SQLiteMetaStore, "close", lambda self: events.append("close-store"))
+
+    result = runner.invoke(
+        app,
+        ["mcp", "--project", "test-proj", "--vault", str(vault_dir)],
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert "ran" in events  # the server was served
+    assert "close-store" in events  # a store was opened for write-back and closed
+
+
+def test_mcp_write_back_disabled_by_env_opens_no_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`VAULTRAG_WRITEBACK_ENABLED=false` disables the write tools even without --no-write."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    monkeypatch.setattr(FastMCP, "run", lambda self, **kwargs: None)
+
+    result = runner.invoke(
+        app,
+        ["mcp", "--project", "test-proj", "--vault", str(vault_dir)],
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+            "VAULTRAG_WRITEBACK_ENABLED": "false",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "state" / "vaultrag.db").exists()
