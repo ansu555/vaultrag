@@ -13,6 +13,8 @@ from vaultrag import __version__
 from vaultrag.cli import app
 from vaultrag.embedding.ollama import OllamaEmbedder
 from vaultrag.index.qdrant import QdrantVectorStore
+from vaultrag.indexer.watch import VaultWatcher
+from vaultrag.store.sqlite import SQLiteMetaStore
 
 runner = CliRunner()
 
@@ -22,6 +24,7 @@ def test_help_lists_subcommands() -> None:
     assert result.exit_code == 0
     assert "reindex" in result.output
     assert "mcp" in result.output
+    assert "watch" in result.output
 
 
 def test_version() -> None:
@@ -114,6 +117,69 @@ def test_mcp_fails_gracefully_on_bad_embed_dims(tmp_path: Path) -> None:
     )
     assert result.exit_code == 1
     assert "mcp failed" in result.output.lower()
+
+
+def test_watch_fails_gracefully_when_vault_is_missing(tmp_path: Path) -> None:
+    """A missing vault path exits 1 with a message before touching any service."""
+    result = runner.invoke(
+        app,
+        ["watch", "--vault", str(tmp_path / "nope")],
+        env={"VAULTRAG_PROJECT_ID": "test"},
+    )
+    assert result.exit_code == 1
+    assert "watch failed" in result.output.lower()
+
+
+def test_watch_fails_gracefully_when_services_are_down(tmp_path: Path) -> None:
+    """The boot reconcile needs Qdrant; when it's down, exit 1 cleanly (no traceback)."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    result = runner.invoke(
+        app,
+        ["watch"],
+        env={
+            "VAULTRAG_VAULT_PATH": str(vault_dir),
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_PROJECT_ID": "test",
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 1
+    assert "watch failed" in result.output.lower()
+
+
+def test_mcp_watch_starts_and_stops_the_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`mcp --watch` opens a store, starts one VaultWatcher, and stops+closes on exit.
+
+    The watcher's threads are stubbed (start/stop recorded) so nothing real is scheduled;
+    what's pinned is the composition-root contract: with --watch the store is opened and
+    closed, and the watcher is both started and stopped in the finally.
+    """
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    events: list[str] = []
+
+    monkeypatch.setattr(FastMCP, "run", lambda self, **kwargs: events.append("ran"))
+    monkeypatch.setattr(VaultWatcher, "start", lambda self: events.append("watch-start"))
+    monkeypatch.setattr(VaultWatcher, "stop", lambda self, **kw: events.append("watch-stop"))
+    monkeypatch.setattr(QdrantVectorStore, "close", lambda self: events.append("close-qdrant"))
+    monkeypatch.setattr(OllamaEmbedder, "close", lambda self: events.append("close-ollama"))
+    monkeypatch.setattr(SQLiteMetaStore, "close", lambda self: events.append("close-store"))
+
+    result = runner.invoke(
+        app,
+        ["mcp", "--watch", "--project", "test-proj", "--vault", str(vault_dir)],
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    # started before run(), stopped after; the store is opened and closed.
+    assert events.index("watch-start") < events.index("ran") < events.index("watch-stop")
+    assert "close-store" in events
 
 
 def test_mcp_composes_a_stdio_server_and_closes_its_clients(

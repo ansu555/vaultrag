@@ -142,6 +142,23 @@ class Settings(BaseSettings):
         "section is too coarse, so its child is kept instead (the ~2k cap, arch §6).",
     )
 
+    # --- live watch (indexer; P1 Stage 4) -------------------------------------
+    # watchdog Observer → per-path debounce → worker pool → ingest_path. Owned by
+    # serve/indexer and `vaultrag watch`; `vaultrag mcp` runs it only with --watch (a
+    # daemon thread, solo dogfooding). See ../Rag/projects/vaultrag/ingestion-pipeline.md
+    # and decisions/in-process-jobs-not-redis-celery.md.
+    watch_debounce_seconds: float = Field(
+        default=1.5,
+        description="Per-path quiet window before a changed file is (re)ingested. "
+        "Obsidian saves via temp files; the debounce collapses one save's event storm "
+        "into a single ingest.",
+    )
+    watch_workers: int = Field(
+        default=4,
+        description="Live-watch worker-pool size — how many distinct files ingest in "
+        "parallel (per-path work still runs serially; last write wins).",
+    )
+
     # --- logging --------------------------------------------------------------
     log_level: str = Field(
         default="INFO",

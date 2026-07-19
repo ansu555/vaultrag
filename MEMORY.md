@@ -8,7 +8,44 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P1 IN PROGRESS — Stage 3 (`obsidian://` citations, retrieval stage 8) code-complete +
+- **Phase:** **P1 IN PROGRESS — Stage 4 (single-file ingest + watchdog live-watch) code-complete +
+  LIVE-verified (real Ollama + Qdrant + real vault).** Two pieces. (1) **Extracted the single-file primitive** from `reindex_vault`
+  (`indexer/pipeline.py`): a new `IngestContext` bundles `(project, vault, store, vector_store, embedder)`, and
+  public **`ingest_path(ctx, path, *, ignore=None)` / `remove_path(ctx, path)`** reconcile ONE vault-relative
+  path against disk → `IngestOutcome{status: indexed|unchanged|removed|skipped, chunks, reason}`. This is the
+  unit live-watch and (Stage 5) write-back both drive. `ingest_path` **re-applies the boot-scan gates** —
+  path-level `exclusion_reason` (secret filename / `.ragignore` / unsupported / pruned) **and** content-level
+  `scan_for_secrets` — so a single-file event can never index what a full `reindex` would withhold (CLAUDE.md
+  §6); a note that *becomes* a secret / gets `.ragignore`d / vanishes is **evicted**. It hashes the **raw
+  bytes** (matches scan's `_hash_file`) then decodes for parse/secret-scan, so live-watch manifest hashes stay
+  consistent with a later `reindex`, and skips re-embed when the hash is unchanged. `reindex_vault` keeps its
+  exact signature + `ReindexStats` and now shares the inner `_ingest_file`/`_delete_file` work (all 269 prior
+  tests still green). (2) **`indexer/watch.py` — `VaultWatcher`**: `watchdog` `Observer` → per-path **1.5 s
+  debounce** (collapses Obsidian's temp-file save storm into one ingest) → **`ThreadPoolExecutor` (default 4)**
+  → `ingest_path`, with a `jobs` row per path and **retry 3× exponential backoff → park `dead`** (one bad note
+  can't kill the watcher). Thread-based (the pipeline is sync, watchdog already threads): the observer only
+  marks paths dirty; a dispatcher thread moves quiet paths to the pool; an in-flight path isn't re-dispatched
+  until it finishes → per-path serial, last-write-wins. Directory delete/move fans out by manifest prefix + a
+  dest-subtree walk. **Process model (per plan Decisions):** `vaultrag watch` = boot-reconcile then watch
+  (standalone, indexer role); `vaultrag mcp --watch` runs one watcher in a **daemon thread** that dies with the
+  stdio process; plain `mcp` stays watcher-free. New config knobs `watch_debounce_seconds` (1.5) +
+  `watch_workers` (4). Added `watchdog>=4.0` dep. **Green: 288 tests** (+19: `test_ingest_primitive.py` [10:
+  index/unchanged/evict + secret-content/secret-name/ragignore/unsupported gates], `test_watch.py` [6: debounce
+  coalescing, retry→dead, flush, **real-`watchdog`-Observer e2e** write→indexed / delete→evicted],
+  `test_cli.py` [3: watch help/failure + `mcp --watch` start/stop wiring]); ruff, ruff format, mypy (39 src
+  files). **Verification:** (a) the real-`watchdog`-Observer e2e test drives the *actual* observer → debounce →
+  worker pool → `ingest_path` against real SQLite + real Qdrant(`:memory:`); (b) **a full Ollama-backed dogfood
+  against the live `vaultrag-design` vault PASSED** (Ollama + Qdrant both up later in the session; `qwen3-
+  embedding:0.6b` present). The dogfood (`scratchpad/watch_dogfood.py`): boot-reconciled `../Rag`, started a
+  `VaultWatcher`, **created a throwaway `agent-inbox/` note → watcher logged `status=indexed chunks=1`, Qdrant
+  count 145→146**; a **real hybrid `search` for its unique token returned that note as the #1 hit** with a
+  working `obsidian://open?vault=Rag&file=agent-inbox%2F…` URI (Stage 3 wired too); then **deleted it → watcher
+  logged `status=removed`, count back to 145** — vault + index left clean. Bonus: the observer fired on
+  `.obsidian/workspace.json` and correctly `status=skipped` it (live gate works); a follow-up `status=unchanged`
+  re-fire confirmed idempotency held under the save storm.
+  **Next: Stage 5 (write-back + MCP write tools + git auto-commit) — reuses this `ingest_path` primitive for
+  the synchronous same-session reindex.**
+- **(Stage 3 archive)** **Stage 3 (`obsidian://` citations, retrieval stage 8) code-complete +
   live-verified.** New `retrieval/cite.py`: `obsidian_uri(vault_name, path)` builds
   `obsidian://open?vault=…&file=…` (both parts percent-encoded, `safe=""` so subfolder `/`→`%2F` and
   round-trips) + a `cite(snippets, vault_name)` stage that stamps each `Snippet.uri` (no-op without a
@@ -100,8 +137,8 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   has no ONNX; `tokenizers` from fastembed tokenizes, no torch/transformers); parent-rep =
   reconstruct from vault (`parent_id` = pointer); eval = pull a minimal golden set forward for
   Stages 1–2 (full harness/CI stays P2); watcher = `serve`/indexer owns it, `mcp --watch` opt-in.
-  **Stages 1 (rerank) + 2 (parent-swap) + 3 (`obsidian://` citations) are DONE.** **Next: Stage 4
-  (watchdog + single-file ingest) → 5 (write-back).** The `vaultrag` MCP server is now
+  **Stages 1 (rerank) + 2 (parent-swap) + 3 (`obsidian://` citations) + 4 (single-file ingest +
+  watchdog live-watch) are DONE.** **Next: Stage 5 (write-back + git auto-commit).** The `vaultrag` MCP server is now
   registered in this project's local Claude Code config and pointed at the live
   `vaultrag-design` index, so **dogfooding is available right now**: as you build P1, use
   `search`/`open` against `../Rag` and treat any bad retrieval as a real bug report (repo
@@ -138,6 +175,55 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-19 — P1 Stage 4 (single-file ingest + watchdog live-watch) implemented + mechanism-verified
+- **Did:** Implemented Stage 4 end-to-end. (1) **Primitive extraction** (`indexer/pipeline.py`): added
+  `IngestContext` (bundles `project/vault/store/vector_store/embedder`) and public `ingest_path` / `remove_path`
+  returning `IngestOutcome{status, chunks, reason}` (`IngestStatus` = indexed/unchanged/removed/skipped;
+  `SkipReason` = excluded/secret/gone). `ingest_path` reconciles one path against disk and **re-applies both
+  boot-scan gates** (`exclusion_reason` + `scan_for_secrets`) so live-watch/write-back can't index what a
+  reindex withholds, evicting a path that became gated/secret/gone; it hashes **raw bytes** (matches scan) and
+  skips re-embed on an unchanged hash. Refactored `reindex_vault`'s `_process_*` to take `ctx` and share
+  `_ingest_file`/`_delete_file`; public signature + `ReindexStats` unchanged (269 prior tests stayed green).
+  (2) **`indexer/watch.py`** (new): `VaultWatcher` = `watchdog` Observer → per-path 1.5 s debounce → dispatcher
+  thread → `ThreadPoolExecutor(4)` → `ingest_path`, jobs-table row per path, retry 3× exp-backoff → `dead`.
+  Per-path serial (in-flight not re-dispatched), parallel across paths. Dir delete/move → prefix-evict +
+  dest-subtree walk. Test hooks: `process_path`, `flush`, `wait_idle`, injectable `clock`/`sleep`. (3) **CLI**
+  (`cli.py`): new `watch` command (boot-reconcile then watch, blocks on Ctrl-C) + `mcp --watch` (daemon-thread
+  watcher, opens a `SQLiteMetaStore`, stops+closes in the finally). (4) **config**: `watch_debounce_seconds`
+  (1.5) + `watch_workers` (4). (5) Added `watchdog>=4.0` to `pyproject.toml` (`watchdog==6.0.0`). Tests:
+  `test_ingest_primitive.py` (new, 10), `test_watch.py` (new, 6 incl. real-Observer e2e + save-storm
+  coalescing + retry→dead), `test_cli.py` (+3). Green: **288 tests**, ruff, ruff format, mypy (39 src files).
+- **Why:** Anik: *"impliemt the the next stage"* — Stage 4 of `../Rag/projects/vaultrag/p1-step-plan.md`
+  (arch §4). Closes the freshness half of P1: an edit is searchable within ~2 s with no manual reindex, and the
+  same `ingest_path` primitive is what Stage 5 (write-back) will call for its synchronous same-session reindex.
+- **Verify:** two levels. (1) The **real-`watchdog`-Observer e2e** test
+  (`test_watch.py::test_live_watch_indexes_then_evicts_a_file`) drives the actual observer → debounce → worker
+  pool → `ingest_path` against real SQLite + real Qdrant(`:memory:`): writing a note indexes it within the
+  debounce; deleting it evicts it. Plus the **planted-secret-content-never-indexed** guardrail (write-side twin
+  of P0 Step 3's). (2) **A full Ollama-backed dogfood against the live `vaultrag-design` vault PASSED** — Ollama
+  came up mid-session (`qwen3-embedding:0.6b` present), Qdrant up. `scratchpad/watch_dogfood.py`: reconciled
+  `../Rag`, started a `VaultWatcher`, wrote a throwaway `agent-inbox/` note → `status=indexed chunks=1` (Qdrant
+  145→146) via real Ollama embed; a **real hybrid `search` for its token ranked it #1** with a working
+  `obsidian://open?vault=Rag&file=…%2F…` URI; deleting it → `status=removed` (count back to 145); vault + index
+  left clean. The observer also fired on `.obsidian/workspace.json` and correctly `status=skipped` it (live gate
+  proof), and a `status=unchanged` re-fire showed idempotency under a save storm. So the embed-call piece
+  (the only thing the e2e faked) is now proven live too.
+- **Files:** `src/vaultrag/`: `indexer/pipeline.py` (primitive + ctx), `indexer/watch.py` (new), `cli.py`
+  (watch cmd + `mcp --watch`), `config.py` (2 knobs), `pyproject.toml`/`uv.lock` (watchdog). Tests:
+  `tests/test_ingest_primitive.py` (new), `tests/test_watch.py` (new), `tests/test_cli.py`. **Vault:**
+  `../Rag/projects/vaultrag/p1-step-plan.md` Log (Stage 4 done).
+- **Next / handoff:** **Stage 5 — write-back + MCP write tools + git auto-commit** (`writeback/*` new,
+  `mcp/server.py` +3 tools `write_note`/`append_section`/`patch_frontmatter`, `cli.py`). Reuses Stage 4's
+  `ingest_path` for the synchronous post-write reindex. Guardrails (CLAUDE.md §6): realpath containment under
+  vault root, `agent-inbox/` default write root, `base_hash` optimistic lock (409 + current content), size/rate
+  caps, `.ragignore`d paths unwritable, per-file `agent(<name>): <what>` git commit, and a **planted-secret
+  path unwritable + never indexed** test (the write-side twin, now also covered on the ingest side). Minor
+  Stage-4 notes: (a) `.ragignore` is loaded **once** at watcher start (edit it → restart the watcher);
+  (b) `mcp --watch` opens a second SQLite connection on the same file as any running `watch`/indexer — solo
+  dogfooding only, per the settled Decisions. Consider a tiny `../Rag/agent-inbox/` note that `ingest_path`
+  hashes raw bytes (parity with scan) — impl-level, like the existing payload notes. Working tree: `src/` +
+  `tests/` edits, `pyproject.toml`/`uv.lock` changed; vault plan note edited (separate repo). Commit when Anik asks.
 
 ### 2026-07-16 — P1 Stage 3 (`obsidian://` citations, retrieval stage 8) implemented + live-verified
 - **Did:** Implemented Stage 3 end-to-end. (1) New pure `retrieval/cite.py`: `obsidian_uri(vault_name,

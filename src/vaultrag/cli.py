@@ -14,6 +14,7 @@ Later phases add ``serve`` (HTTP) and ``eval``. See
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Annotated
 
@@ -27,7 +28,8 @@ from vaultrag.embedding.ollama import OllamaEmbedder
 from vaultrag.index.base import VectorStoreError
 from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.index.sparse import Bm25Embedder
-from vaultrag.indexer.pipeline import reindex_vault
+from vaultrag.indexer.pipeline import IngestContext, reindex_vault
+from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
 from vaultrag.retrieval import RerankParams, load_reranker
@@ -114,6 +116,81 @@ def reindex(
 
 
 @app.command()
+def watch(
+    project: Annotated[
+        str | None, typer.Option("--project", help="Project/tenant scope to index.")
+    ] = None,
+    vault: Annotated[
+        Path | None, typer.Option("--vault", help="Path to the vault to watch.")
+    ] = None,
+) -> None:
+    """Live-watch a vault: reconcile once, then (re)index each edit as it happens.
+
+    First runs a boot reconcile (catching anything changed while the watcher was down),
+    then starts the watchdog observer and blocks until Ctrl-C. Owned by the indexer role
+    (p1-step-plan Decisions). Requires Qdrant + Ollama, like ``reindex``.
+    """
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    log = get_logger("vaultrag.cli")
+
+    project_id = project or settings.project_id
+    vault_path = vault or settings.vault_path
+    if not vault_path.is_dir():
+        typer.echo(f"watch failed: vault path is not a directory: {vault_path}", err=True)
+        raise typer.Exit(code=1)
+
+    store: SQLiteMetaStore | None = None
+    vector_store: QdrantVectorStore | None = None
+    embedder: OllamaEmbedder | None = None
+    try:
+        store = SQLiteMetaStore.from_settings(settings)
+        vector_store = QdrantVectorStore.from_settings(settings)
+        embedder = OllamaEmbedder.from_settings(settings)
+        # Boot reconcile first — a watcher that starts on a stale index would miss every
+        # edit made while it was down. reindex is idempotent, so this is cheap when clean.
+        stats = reindex_vault(
+            project_id=project_id,
+            vault_path=vault_path,
+            store=store,
+            vector_store=vector_store,
+            embedder=embedder,
+        )
+        typer.echo(
+            f"reconciled: +{stats.created} ~{stats.updated} -{stats.deleted} "
+            f"→{stats.renamed} ={stats.unchanged} !{stats.failed}"
+        )
+        ctx = IngestContext(
+            project_id=project_id,
+            vault_path=vault_path.resolve(),
+            store=store,
+            vector_store=vector_store,
+            embedder=embedder,
+        )
+        watcher = VaultWatcher(
+            ctx,
+            debounce_seconds=settings.watch_debounce_seconds,
+            workers=settings.watch_workers,
+        )
+        watcher.start()
+        typer.echo(f"watching {vault_path} (Ctrl-C to stop)…")
+        try:
+            threading.Event().wait()  # block main thread; interruptible by Ctrl-C
+        except KeyboardInterrupt:
+            typer.echo("stopping…")
+        finally:
+            watcher.stop()
+    except (VectorStoreError, EmbeddingError, OSError, sqlite3.Error) as exc:
+        log.error("watch.failed", project=project_id, vault=str(vault_path), error=str(exc))
+        typer.echo(f"watch failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        for closer in (embedder, vector_store, store):
+            if closer is not None:
+                closer.close()
+
+
+@app.command()
 def mcp(
     project: Annotated[
         str | None, typer.Option("--project", help="Project/tenant scope to serve.")
@@ -121,6 +198,14 @@ def mcp(
     vault: Annotated[
         Path | None, typer.Option("--vault", help="Path to the vault `open` reads from.")
     ] = None,
+    watch: Annotated[
+        bool,
+        typer.Option(
+            "--watch",
+            help="Also live-watch the vault in a background daemon thread (opt-in; "
+            "solo dogfooding). Off by default — serve/indexer own the watcher.",
+        ),
+    ] = False,
 ) -> None:
     """Serve the MCP tools (search/open) over stdio.
 
@@ -138,11 +223,15 @@ def mcp(
         typer.echo(f"mcp failed: vault path is not a directory: {vault_path}", err=True)
         raise typer.Exit(code=1)
 
-    # No MetaStore here: search reads only Qdrant, open reads only the vault. Neither
-    # client connects at construction time, so the server comes up instantly and a
-    # down Qdrant/Ollama surfaces as an actionable per-call tool error instead.
+    # No MetaStore here by default: search reads only Qdrant, open reads only the vault.
+    # Neither client connects at construction time, so the server comes up instantly and a
+    # down Qdrant/Ollama surfaces as an actionable per-call tool error instead. --watch is
+    # the one exception: live-watch needs the SQLite manifest/jobs + an embedder, so it
+    # opens a store and runs one VaultWatcher in a background daemon thread (opt-in, solo).
     vector_store: QdrantVectorStore | None = None
     embedder: OllamaEmbedder | None = None
+    store: SQLiteMetaStore | None = None
+    watcher: VaultWatcher | None = None
     try:
         try:
             vector_store = QdrantVectorStore.from_settings(settings)
@@ -176,20 +265,46 @@ def mcp(
                 # resolve() so a relative/'.'-style --vault still yields a real folder name.
                 vault_name=settings.vault_name or vault_path.resolve().name,
             )
+            if watch:
+                # Reuse the raw OllamaEmbedder (not the QueryEmbedder wrapper) for document
+                # ingest. The observer + dispatcher are daemon threads that die with this
+                # stdio process; stop() in the finally drains them on a clean detach.
+                store = SQLiteMetaStore.from_settings(settings)
+                watcher = VaultWatcher(
+                    IngestContext(
+                        project_id=project_id,
+                        vault_path=vault_path.resolve(),
+                        store=store,
+                        vector_store=vector_store,
+                        embedder=embedder,
+                    ),
+                    debounce_seconds=settings.watch_debounce_seconds,
+                    workers=settings.watch_workers,
+                )
+                watcher.start()
         # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
-        # client that resolves/binds something at construction. Either way the fix is
-        # the operator's, so fail with a readable line rather than a stdio traceback.
-        except (ValueError, OSError) as exc:
+        # client that resolves/binds something at construction; sqlite3.Error = an
+        # unopenable --watch store. Either way the fix is the operator's, so fail with a
+        # readable line rather than a stdio traceback.
+        except (ValueError, OSError, sqlite3.Error) as exc:
             log.error("mcp.failed", project=project_id, error=str(exc))
             typer.echo(f"mcp failed: {exc}", err=True)
             raise typer.Exit(code=1) from exc
-        log.info("mcp.serve", project=project_id, vault=str(vault_path), transport="stdio")
+        log.info(
+            "mcp.serve",
+            project=project_id,
+            vault=str(vault_path),
+            transport="stdio",
+            watching=watch,
+        )
         try:
             server.run(transport="stdio", show_banner=False)  # blocks until client detaches
         except KeyboardInterrupt:
             log.info("mcp.stopped", project=project_id)
     finally:
-        for closer in (embedder, vector_store):
+        if watcher is not None:
+            watcher.stop()
+        for closer in (embedder, vector_store, store):
             if closer is not None:
                 closer.close()
 
