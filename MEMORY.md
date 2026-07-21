@@ -8,8 +8,36 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 DONE. Next: Stage 3 (`related` tool +
-  graph-expand), now unblocked.**
+- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 DONE, rerank cost settled. Next: Stage 3
+  (`related` tool + graph-expand), unblocked.**
+- **`rerank_top_n` 50 → 20, and deeper is WORSE (2026-07-21).** Corpus set, 72 cases:
+  fusion **0.892** MRR@5 · `always`@50 **0.928** · `always`@5 **0.939** · **`auto`@5 0.946**.
+  So the cheapest config is also the best: candidates past the useful depth hold no winnable
+  cases but plenty of distractors, and a distractor scored high enough displaces a correct
+  chunk. **`auto` is now measured** (it was the open unknown) and wins on both axes.
+  The default is measured, not guessed — new **`vaultrag eval --ceiling`** reports how deep
+  the *correct* note already sits in fusion order, with **no model, in seconds**: saturates at
+  rank **5** on the corpus fixture, rank **14** on the live design vault. 20 clears the deeper
+  with headroom (15 would be fitted to a 58-case sample's exact max). The fixture saturates
+  early only because it is 51 chunks — **re-run `--ceiling` per vault; don't trust 20 blindly.**
+  Latent bug found and fixed on the way (committed by Anik as `ed0ef31`): `search` set
+  `fetch_limit = top_n`, so any `top_n < k` silently returned **fewer results than
+  rerank-off** — a shallow rerank would have read as a recall regression that was really
+  truncation. Now `max(top_n, k)`, with the unreviewed remainder kept in fusion order below
+  the reranked survivors (and exempt from `threshold` — an unscored chunk has no score to
+  fail a floor with). **Gate unmoved: 1.000/0.892/0.919** (it pins `rerank_mode=never`).
+  **429 tests** green, ruff, mypy (50).
+- **⚠️ `reindex` CANNOT repair a drifted vector store — the CLAUDE.md §6 "DR = reindex"
+  guardrail is currently false.** Found live: `vaultrag-design` had **57 notes / 173 chunks in
+  SQLite but only 50 in Qdrant** (71% missing), and `reindex` reported `=53 unchanged` because
+  it is idempotent against the **manifest** and never consults the vector store. Retrieval kept
+  returning plausible results from a third of the vault, with **no signal anywhere** — which
+  silently invalidates any quality number measured in that state. Repaired by hand (clear the
+  project's derived rows + Qdrant points, reindex → 173 = 173). **Filed, not fixed:**
+  `../Rag/agent-inbox/reindex-cannot-repair-a-drifted-vector-store.md` — recommends a
+  `reindex --force` plus a `live_stack` consistency assert. **Gotcha:** the `sqlite3` CLI
+  defaults `foreign_keys` **off**, so deleting `documents` without the pragma orphans `tags`
+  rows and the next ingest fails 29/57 notes on FK constraints.
 - **Rerank is a user-chosen mode (2026-07-21, Anik's ruling).** `rerank_enabled: bool` →
   **`rerank_mode: never | auto | always`** (`VAULTRAG_RERANK_MODE`), default **`never`**.
   `auto` decides **per query** from the top-1/top-2 RRF margin — **not** an LLM call, so it stays
@@ -169,6 +197,48 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 — rerank made affordable: `top_n` 50→20 via a new `--ceiling`, + a silent index-drift bug
+- **Did:** answered ask (a) from the previous handoff — make the rerank stage *affordable* before
+  tuning its quality — and hit two bugs on the way, one of them serious.
+- **The method matters more than the number.** Instead of sweeping `top_n` by running the model
+  per config (~1 h for 3 points), note that **a cross-encoder can only promote a chunk it is
+  shown**. So the useful depth is bounded by how deep the correct note already sits in *fusion*
+  order — computable with **no model, in seconds**. Shipped as **`vaultrag eval --ceiling`**
+  (`eval/ceiling.py`). Coverage saturates at fusion rank **5** (corpus fixture) and **14** (live
+  design vault). Everything above that is pure cost. This killed the sweep I had running.
+- **Deeper reranking is actively worse, not just slower.** `always`@50 MRR@5 **0.928** vs
+  `always`@5 **0.939** vs **`auto`@5 0.946** (fusion 0.892). Past the useful depth there are no
+  winnable cases left but plenty of distractors, and a distractor scored high enough displaces a
+  correct chunk. **`auto` is now measured** — it was the open unknown, and it wins on both axes
+  because it skips the known-item queries a cross-encoder can only damage. Default → **20**
+  (clears the deeper vault with headroom; 15 would be fitted to a 58-case sample's exact max).
+- **Bug 1 (fixed, committed by Anik as `ed0ef31`): `top_n` was not a pure cost knob.** `search`
+  set `fetch_limit = top_n`, so `top_n < k` returned **fewer results than rerank-off**. The whole
+  sweep would have measured truncation and blamed the cross-encoder. Now `max(top_n, k)` + an
+  unreviewed tail in fusion order below the survivors, exempt from `threshold`.
+- **Bug 2 (filed, NOT fixed) — the serious one: `reindex` cannot repair a drifted vector store.**
+  `vaultrag-design` held **173 chunks in SQLite, 50 in Qdrant**; `reindex` said `=53 unchanged`
+  because it checks the manifest, never the vector store. Retrieval kept working from a third of
+  the vault with no warning — so **any quality number measured then was meaningless and nothing
+  said so**. Directly contradicts CLAUDE.md §6 ("DR = reindex"). Repaired by hand → 173 = 173.
+  See `../Rag/agent-inbox/reindex-cannot-repair-a-drifted-vector-store.md`.
+- **Self-inflicted, worth remembering:** the `sqlite3` CLI defaults `foreign_keys` **off**. My
+  first repair deleted `documents` without the pragma, orphaning 78 `tags` rows, and the next
+  reindex failed **29 of 57 notes** on FK constraints. Redone cleanly.
+- **Files:** new `eval/ceiling.py` + `tests/test_ceiling.py`; `eval/__init__.py`, `cli.py`
+  (`--ceiling`), `config.py` + `retrieval/rerank.py` (`rerank_top_n` 50→20, with the measurement
+  in the comment). Vault: new agent-inbox note + ask-1 resolution appended to
+  `rerank-threshold-should-be-per-vault-not-global.md`.
+- **Green:** 429 tests, ruff, ruff format, mypy (50 src). **Gate unmoved: 1.000/0.892/0.919.**
+- **Next / handoff:** **Stage 3 (`related` + graph-expand)** is the next build step and is
+  unblocked. Two carried-forward caveats: (1) the drift bug is *filed, not fixed* — Stage 3 reads
+  the graph store, so if `related` ever looks inexplicably sparse, **check manifest vs Qdrant
+  counts before debugging the query**; (2) **latency numbers from this session are contaminated**
+  (the runs overlapped a reindex, the ceiling script and a pytest pass) — `always`@5 427 s /
+  `auto`@5 245 s over 72 cases are *relative* signals only; re-measure on an idle box before
+  quoting a speedup. Asks 2-4 (fp32-vs-int8 on ARM, smaller cross-encoder, batch/thread tuning)
+  stay open but are less urgent now.
 
 ### 2026-07-21 — Anik's 3 rulings: `doc_keys` kept, no tag edges, rerank becomes a mode
 - **Did:** Anik ruled on the two Stage-2 open questions **and** the long-open rerank default.
