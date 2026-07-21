@@ -37,6 +37,7 @@ from vaultrag.eval import (
     VectorFixture,
     apply_overlay,
     format_cases,
+    format_ceiling,
     format_comparison,
     format_misses,
     format_summary,
@@ -46,6 +47,7 @@ from vaultrag.eval import (
     load_golden,
     load_overlay,
     overlay_label,
+    rank_ceiling,
     replay_stack,
     run_eval,
 )
@@ -430,6 +432,14 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
             "changing the corpus, the golden queries, or the embedding model.",
         ),
     ] = False,
+    ceiling: Annotated[
+        bool,
+        typer.Option(
+            "--ceiling",
+            help="Report how deep the reranker would have to look (the rerank_top_n ceiling) "
+            "instead of scoring configs. Runs no cross-encoder, so it takes seconds.",
+        ),
+    ] = False,
 ) -> None:
     """Score retrieval quality against a golden set (P2 Stage 1).
 
@@ -484,6 +494,24 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
 
     if record:
         _record_fixture(golden_set, overlays[0][1])
+
+    if ceiling:
+        # Answers "how deep must rerank look?" without running one. Deliberately ignores
+        # --config/--rerank: the ceiling is a property of *fusion* order, so no rerank
+        # setting can move it, and honouring those flags would imply otherwise.
+        _, ceiling_settings = overlays[0]
+        stack_cm = (
+            live_stack(golden_set, ceiling_settings)
+            if use_live
+            else replay_stack(golden_set, ceiling_settings, fixture_path=VECTOR_FIXTURE_PATH)
+        )
+        try:
+            with stack_cm as stack:
+                typer.echo(format_ceiling(rank_ceiling(golden_set, stack)))
+        except (VectorStoreError, EmbeddingError, ValueError) as exc:
+            typer.echo(f"\nceiling could not run: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+        return
 
     reports: list[EvalReport] = []
     try:

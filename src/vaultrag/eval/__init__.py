@@ -10,6 +10,12 @@ it, and the CLI cannot import from the test tree. The *data* (fixture corpus, go
 frozen vectors) stays under ``tests/eval/``, where it belongs.
 """
 
+from vaultrag.eval.ceiling import (
+    CEILING_DEPTH,
+    CeilingReport,
+    format_ceiling,
+    rank_ceiling,
+)
 from vaultrag.eval.golden import (
     CORPUS_GOLDEN_PATH,
     CORPUS_VAULT_PATH,
@@ -58,6 +64,7 @@ from vaultrag.eval.report import (
 )
 
 __all__ = [
+    "CEILING_DEPTH",
     "CORPUS_GOLDEN_PATH",
     "CORPUS_VAULT_PATH",
     "DESIGN_GOLDEN_PATH",
@@ -68,6 +75,7 @@ __all__ = [
     "VECTOR_FIXTURE_PATH",
     "Case",
     "CaseResult",
+    "CeilingReport",
     "EvalReport",
     "GoldenSet",
     "GoldenSetError",
@@ -81,6 +89,7 @@ __all__ = [
     "apply_overlay",
     "first_relevant_rank",
     "format_cases",
+    "format_ceiling",
     "format_comparison",
     "format_misses",
     "format_summary",
@@ -91,6 +100,7 @@ __all__ = [
     "load_overlay",
     "ndcg_at_k",
     "overlay_label",
+    "rank_ceiling",
     "recall_at_k",
     "reciprocal_rank_at_k",
     "replay_stack",
