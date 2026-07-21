@@ -36,8 +36,13 @@ from vaultrag.indexer.secret_guard import is_secret_filename, scan_for_secrets
 log = structlog.get_logger(__name__)
 
 # Non-indexable extensions are skipped quietly — they are not "excluded", just not yet
-# supported — so scan stats stay meaningful. (Excalidraw + images arrive in P2 Stages 5-6.)
-_TEXT_SUFFIXES = frozenset({".md", ".markdown"})
+# supported — so scan stats stay meaningful. (Images arrive in P2 Stage 6.)
+#
+# `.excalidraw` is a *text* suffix: the scene is JSON, so the walk can content-scan it
+# for secrets exactly as it does markdown, and no new guard placement is needed. The
+# plugin's `.excalidraw.md` wrapper already matches `.md`; the pipeline routes both to
+# the Excalidraw parser (P2 Stage 5).
+_TEXT_SUFFIXES = frozenset({".md", ".markdown", ".excalidraw"})
 # Formats whose *bytes* are not the indexable text: they need a converter before any
 # text exists, so the walk cannot content-scan them and the pipeline must route them to
 # a format parser. PDFs land here in P2 Stage 4.

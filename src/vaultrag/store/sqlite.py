@@ -135,6 +135,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(project_id, state);
 
+-- Which generation of the parser built this project's index (P2 Stage 5). A missing
+-- row means "older than the marker itself". Its own table rather than a column on
+-- `projects` so it needs no ALTER-TABLE migration path, and because it is *index
+-- state*, not project configuration (which is what `projects.settings` holds).
+CREATE TABLE IF NOT EXISTS index_state (
+    project_id     TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    parser_version INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS embed_cache (
     model      TEXT NOT NULL,
     dims       INTEGER NOT NULL,
@@ -454,6 +463,21 @@ class SQLiteMetaStore:
             "SELECT COUNT(*) AS n FROM doc_keys WHERE doc_id = ?", (doc_id,)
         ).fetchone()
         return int(row["n"])
+
+    # --- index state ----------------------------------------------------------
+    def get_parser_version(self, project_id: str) -> int | None:
+        row = self._conn.execute(
+            "SELECT parser_version FROM index_state WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        return int(row["parser_version"]) if row is not None else None
+
+    def set_parser_version(self, project_id: str, version: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO index_state (project_id, parser_version) VALUES (?, ?) "
+                "ON CONFLICT(project_id) DO UPDATE SET parser_version=excluded.parser_version",
+                (project_id, version),
+            )
 
     # --- links / graph --------------------------------------------------------
     def _resolve_keys(self, project_id: str, keys: Iterable[str]) -> dict[str, str | None]:

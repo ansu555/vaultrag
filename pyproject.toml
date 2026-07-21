@@ -12,6 +12,11 @@ dependencies = [
     "fastmcp>=3.4.4",
     "httpx>=0.27",
     "huggingface-hub>=0.26",
+    # Obsidian's Excalidraw plugin stores scenes as LZ-string-compressed base64
+    # (`compressed-json` fences). Pure Python, MIT, no transitive deps — a port of
+    # pieroxy's lz-string, verified byte-compatible with the JS implementation in
+    # both directions (tests/test_excalidraw.py pins a JS-produced blob).
+    "lzstring>=1.0.4",
     "markdown-it-py>=4.2.0",
     "numpy>=2.0",
     "onnxruntime>=1.20",
@@ -69,8 +74,16 @@ files = ["src"]
 plugins = ["pydantic.mypy"]
 
 # Reranker ML stack ships no type information (loaded lazily in retrieval/rerank.py).
+# `lzstring` (Excalidraw `compressed-json`, P2 Stage 5) ships none either.
 [[tool.mypy.overrides]]
-module = ["onnxruntime", "onnxruntime.*", "tokenizers", "tokenizers.*", "huggingface_hub"]
+module = [
+    "onnxruntime",
+    "onnxruntime.*",
+    "tokenizers",
+    "tokenizers.*",
+    "huggingface_hub",
+    "lzstring",
+]
 ignore_missing_imports = true
 
 # --- tests -------------------------------------------------------------------

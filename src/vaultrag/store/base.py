@@ -270,6 +270,18 @@ class MetaStore(Protocol):
     def doc_key_count(self, doc_id: str) -> int:
         """How many ``doc_keys`` rows a document has. Zero ⇒ its graph was never built."""
 
+    # --- index state (P2 Stage 5) ---------------------------------------------
+    def get_parser_version(self, project_id: str) -> int | None:
+        """Which :data:`~vaultrag.parsing.PARSER_VERSION` last built this index.
+
+        ``None`` means the index predates the marker. Older than the shipped version
+        ⇒ unchanged files would now parse into *more* than they did, and the ordinary
+        hash-based reconcile will never notice (see ``vaultrag.parsing``).
+        """
+
+    def set_parser_version(self, project_id: str, version: int) -> None:
+        """Record the parser generation that built this project's index."""
+
     # --- jobs -----------------------------------------------------------------
     def enqueue_job(
         self,

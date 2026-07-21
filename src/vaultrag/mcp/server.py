@@ -33,9 +33,11 @@ Security posture:
 * **``open`` enforces the same gates as indexing** — vault containment (a resolved
   path, including through symlinks, must stay under the vault root), the built-in
   secret guard (filename + content), and ``.ragignore``. PDFs are indexable but not
-  text, so ``open`` refuses them and points at ``search``'s page-cited chunks instead.
-  Without these, ``open`` would hand an agent exactly the files the scan boundary
-  exists to withhold.
+  text, so ``open`` refuses them and points at ``search``'s page-cited chunks instead;
+  bare ``.excalidraw`` scenes are refused for the same reason, and an Excalidraw
+  *wrapper* is served with its compressed payload trimmed off (P2 Stage 5). Without
+  these, ``open`` would hand an agent exactly the files the scan boundary exists to
+  withhold — or tens of kilobytes of base64 it can do nothing with.
 * Retrieved vault text is returned as data, never executed or interpreted (§6).
 
 Tools are deliberately **sync** functions: FastMCP runs them in a worker thread, which
@@ -68,6 +70,12 @@ from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
 from vaultrag.models import BlockType, OpenResult, RelatedResult, SearchResult, WriteResult
 from vaultrag.parsing import heading_section, parse_document
+from vaultrag.parsing.excalidraw import (
+    is_excalidraw_source,
+    is_scene_file,
+    readable_text,
+    scene_title,
+)
 from vaultrag.retrieval import (
     DEFAULT_BUDGET_TOKENS,
     DEFAULT_K,
@@ -119,7 +127,7 @@ _EXCLUSION_MESSAGES: dict[ExclusionReason, str] = {
     "pruned-dir": "is under a directory the indexer never scans (.git/.obsidian/.trash/…)",
     "secret-filename": "is blocked by the built-in secret guard",
     "ragignore": "is excluded by .ragignore and cannot be opened",
-    "unsupported": "is not an indexable file (markdown or PDF)",
+    "unsupported": "is not an indexable file (markdown, Excalidraw, or PDF)",
 }
 
 
@@ -388,6 +396,11 @@ def build_mcp_server(
         # Parse once, for every mode: `heading` needs the block tree, and `title` is
         # frontmatter the caller wants regardless of which slice they asked for.
         document = parse_document(path=rel, raw_text=text)
+        # A drawing's name comes from its filename/frontmatter, not from the plugin's
+        # `# Excalidraw Data` scaffolding heading — keep `open` agreeing with `search`.
+        title = (
+            scene_title(rel, text) if is_excalidraw_source(rel, text) else (document.metadata.title)
+        )
 
         resolved_heading: str | None = None
         if lines is not None:
@@ -413,7 +426,7 @@ def build_mcp_server(
         line_end = start + len(kept) - 1 if kept else start - 1
         result = OpenResult(
             path=rel,
-            title=document.metadata.title,
+            title=title,
             heading=resolved_heading,
             line_start=start,
             line_end=line_end,
@@ -773,6 +786,14 @@ def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
             f"searchable via `search`, and each hit cites the page it came from."
         )
 
+    # A bare `.excalidraw` is a JSON scene end to end — same situation as the PDF above,
+    # arrived at differently: the bytes *are* text, they just aren't prose.
+    if is_scene_file(rel):
+        raise ToolError(
+            f"{rel!r} is an Excalidraw scene — `open` serves prose, and this file is "
+            f"scene JSON. Its labels and frame names are searchable via `search`."
+        )
+
     try:
         text = candidate.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -783,6 +804,12 @@ def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
         # Same posture as the scan boundary: withhold the whole file, name only the rule.
         log.warning("mcp.open_blocked", path=rel, rule=rule)
         raise ToolError(f"{rel!r} contains secret-like content ({rule}) and is withheld")
+
+    # An Excalidraw *wrapper* does have prose worth serving (`## Text Elements`,
+    # `## Element Links`) — just not the compressed scene below it. Cutting the payload
+    # is a suffix trim, so every line `open` returns still has its on-disk number.
+    if is_excalidraw_source(rel, text):
+        text = readable_text(text)
     return rel, text
 
 

@@ -75,6 +75,8 @@ from vaultrag.indexer.scan import (
 )
 from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.models import Document, document_id
+from vaultrag.parsing import PARSER_VERSION
+from vaultrag.parsing.excalidraw import is_excalidraw_source, parse_excalidraw
 from vaultrag.parsing.markdown import parse_document
 from vaultrag.parsing.pdf import PdfError, PdfParser
 from vaultrag.store.base import JobKind, JobState, MetaStore
@@ -156,6 +158,10 @@ class ReindexStats:
     chunks_written: int = 0
     graph_backfilled: int = 0  # unchanged docs whose link edges were built after the fact
     elapsed_ms: float = 0.0
+    # True when this index was built by an older parser and unchanged files were left
+    # alone that today's parser would read more out of. Reported, not acted on — see
+    # `vaultrag.parsing.PARSER_VERSION`; the repair is `reindex --force`.
+    stale_parser: bool = False
 
 
 def reindex_vault(
@@ -196,6 +202,10 @@ def reindex_vault(
         embedder=embedder,
         pdf_parser=pdf_parser,
     )
+
+    # Sampled before any work: both answers are about the index as it was *found*.
+    stored_parser = store.get_parser_version(project_id)
+    was_empty = store.chunk_count(project_id) == 0
 
     diff, _scan_stats = scan_vault(vault_path, store.document_manifest(project_id), force=force)
     diff, skipped = _drop_unparseable(ctx, diff)
@@ -241,6 +251,15 @@ def reindex_vault(
 
     graph_backfilled = _backfill_graph(ctx, diff.unchanged)
 
+    # Only a run that actually re-read every file may claim this index is current: a
+    # plain reindex leaves hash-equal files untouched, so it cannot have applied a
+    # newer parser to them. Recording the version after a partial run would mark the
+    # index clean while the stale documents are still stale — the precise silent-green
+    # shape this marker exists to end (`vaultrag.parsing.PARSER_VERSION`).
+    stale_parser = _reconcile_parser_version(
+        ctx, stored=stored_parser, was_empty=was_empty, force=force, failed=failed
+    )
+
     stats = ReindexStats(
         created=created,
         updated=updated,
@@ -252,6 +271,7 @@ def reindex_vault(
         chunks_written=chunks_written,
         graph_backfilled=graph_backfilled,
         elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+        stale_parser=stale_parser,
     )
     log.info("reindex.complete", project=project_id, vault=str(vault_path), **asdict(stats))
     return stats
@@ -369,16 +389,22 @@ def _parse_source(
     """Bytes → :class:`Document`, routed by format. The one place formats branch.
 
     Everything downstream (chunk → embed → upsert) is format-agnostic by design
-    (arch §5), so a new source type is a new branch here and nothing else.
+    (arch §5), so a new source type is a new branch here and nothing else. Today:
+    markdown, Excalidraw scenes (P2 Stage 5), PDFs via Docling (P2 Stage 4).
 
     Raises :class:`~vaultrag.parsing.pdf.PdfError` if conversion fails and
     :class:`SecretBlocked` if the converted text carries key material — the content
     gate the walk could not apply to bytes.
     """
     if not is_binary_source(path):
+        text = data.decode("utf-8", errors="replace")
+        if is_excalidraw_source(path, text):
+            return parse_excalidraw(
+                path=path, raw_text=text, content_hash=content_hash, mtime=mtime
+            )
         return parse_document(
             path=path,
-            raw_text=data.decode("utf-8", errors="replace"),
+            raw_text=text,
             content_hash=content_hash,
             mtime=mtime,
         )
@@ -479,10 +505,13 @@ def _backfill_graph(ctx: IngestContext, unchanged: Sequence[str]) -> int:
             continue
         try:
             abs_path = ctx.vault_path / path
-            raw_text = abs_path.read_text(encoding="utf-8", errors="replace")
-            document = parse_document(
+            # Through `_parse_source`, not `parse_document`: an Excalidraw scene or a
+            # PDF read as plain markdown yields the *wrong* edges (or none), and the
+            # backfill is the one path that would quietly write them.
+            document = _parse_source(
+                ctx,
                 path=path,
-                raw_text=raw_text,
+                data=abs_path.read_bytes(),
                 content_hash=None,
                 mtime=int(abs_path.stat().st_mtime),
             )
@@ -501,6 +530,36 @@ def _backfill_graph(ctx: IngestContext, unchanged: Sequence[str]) -> int:
     if backfilled:
         log.info("reindex.graph_backfilled", project=ctx.project_id, documents=backfilled)
     return backfilled
+
+
+def _reconcile_parser_version(
+    ctx: IngestContext, *, stored: int | None, was_empty: bool, force: bool, failed: int
+) -> bool:
+    """Update/read the stored parser generation. Returns whether the index is stale.
+
+    A brand-new project is never "stale" — there are no pre-existing documents to have
+    been parsed by anything older — so the marker is simply recorded. An existing
+    project at an older version is reported until a clean ``--force`` run re-reads
+    every file, which is the only run that can honestly claim otherwise.
+
+    ``was_empty`` is sampled *before* the run: by the time this is called the project
+    has just been populated, so asking "is it empty?" here would answer "no" for every
+    first-ever reindex and report it stale.
+    """
+    if (stored is None and was_empty) or (force and failed == 0):
+        ctx.store.set_parser_version(ctx.project_id, PARSER_VERSION)
+        return False
+
+    if stored is not None and stored >= PARSER_VERSION:
+        return False
+
+    log.warning(
+        "reindex.stale_parser",
+        project=ctx.project_id,
+        indexed_with=stored,
+        current=PARSER_VERSION,
+    )
+    return True
 
 
 def _read_and_ingest(ctx: IngestContext, path: str, content_hash: str) -> int:
