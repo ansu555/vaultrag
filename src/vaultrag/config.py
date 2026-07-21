@@ -146,12 +146,11 @@ class Settings(BaseSettings):
     #
     # DEFAULT `never`, and the reason is LATENCY, not quality. Measured 2026-07-21 on this
     # box (Apple Silicon, onnxruntime CPU): bge-v2-m3 costs ~500 ms **per passage** —
-    # model_int8 502, model_quantized 509 — so a default top_n=50 query spends ~25 s in
-    # stage 4. `search` is an interactive MCP tool an agent blocks on; 25 s is not a
-    # quality/latency trade-off, it is unusable. The +0.036 MRR@5 is real and worth having
-    # on a box that can afford it (or with a smaller rerank_top_n), which is exactly why
-    # this is a user-set mode rather than a shipped default. See
-    # ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md.
+    # model_int8 502, model_quantized 509 — so stage 4 costs ~0.5 s x rerank_top_n per
+    # query. `search` is an interactive MCP tool an agent blocks on, so the passage count is
+    # the whole ballgame; see `rerank_top_n` for why it dropped 50 -> 20. This stays a
+    # user-set mode rather than a shipped default because the affordable point is
+    # box-dependent. See ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md.
     # `auto`/`always` degrade to a no-op reranker (fusion order) when the model can't be
     # fetched, so an offline or light install loses the lift, never the search.
     rerank_mode: RerankMode = Field(
@@ -168,8 +167,10 @@ class Settings(BaseSettings):
         description="Model file within the rerank repo (int8 export for CPU).",
     )
     rerank_top_n: int = Field(
-        default=50,
-        description="Number of top fused candidates fed to the cross-encoder (top-50 → top-k).",
+        default=20,
+        description="Number of top fused candidates fed to the cross-encoder. Cost is linear "
+        "in this; 20 sits just above the deepest fusion rank at which either golden set "
+        "still has a winnable case (see `vaultrag eval --ceiling`). Lower it to buy latency.",
     )
     rerank_threshold: float = Field(
         default=0.0,
