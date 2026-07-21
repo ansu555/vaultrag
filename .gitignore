@@ -1,5 +1,8 @@
 # VaultRAG — derived / local state (the vault is the source of truth; this is a cache)
-state/            # sqlite db + embed cache — rebuildable via `vaultrag reindex`
+# (comment on its own line: .gitignore has no trailing-inline-comment syntax, so
+#  "state/  # ..." is one literal pattern that matches nothing)
+# sqlite db + embed cache — rebuildable via `vaultrag reindex`
+state/
 
 # Python / uv
 .venv/

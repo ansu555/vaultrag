@@ -1,0 +1,51 @@
+# Retrieval quality gate — P2 Stage 1 (../Rag/projects/vaultrag/p2-step-plan.md).
+name: eval
+
+# Runs on every PR rather than only on paths that "look like" retrieval. Two reasons:
+# the job is hermetic and takes about a minute, and a path-filtered required check that
+# never runs blocks merges instead of guarding them. Cheap and always-on beats clever.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: retrieval quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # FastEmbed fetches a small BM25 stopword/stemmer artifact from HuggingFace on first
+      # encode (index/sparse.py). That is the only network the gate needs — no Ollama, no
+      # Docker, no Qdrant server: dense vectors are replayed from the committed fixture and
+      # Qdrant runs in-process (:memory:). Cached so reruns do not re-fetch it.
+      - name: Cache FastEmbed BM25 artifact
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-${{ runner.os }}
+
+      # The gate proper. Exits non-zero when recall@10 < 0.9 or MRR@5 < 0.75 on the frozen
+      # corpus, which is what makes this check merge-blocking (repo CLAUDE.md §6).
+      - name: Score the golden set
+        run: uv run vaultrag eval --show-cases
+
+      # Guards the gate itself: metric arithmetic, golden-set validation, the frozen-vector
+      # fixture, and the "a bad config must fail" case. A green gate whose machinery is
+      # broken is worse than no gate.
+      - name: Test the harness
+        run: uv run pytest tests/test_eval.py -q

@@ -1,30 +1,54 @@
 """``vaultrag`` command-line entrypoint.
 
-P0 exposes two subcommands:
+Subcommands:
 
-* ``reindex`` — build the index from a vault (wired at Step 8:
+* ``reindex`` — build the index from a vault (P0 Step 8:
   :func:`~vaultrag.indexer.pipeline.reindex_vault`).
-* ``mcp``     — serve the MCP tools (search/open) over stdio (wired at Step 10:
+* ``watch``   — live-watch a vault and reindex each edit (P1 Stage 4).
+* ``mcp``     — serve the MCP tools over stdio (P0 Step 10:
   :func:`~vaultrag.mcp.build_mcp_server`).
+* ``eval``    — score retrieval against a golden set; the CI gate (P2 Stage 1).
 
-Later phases add ``serve`` (HTTP) and ``eval``. See
-``../Rag/projects/vaultrag/p0-step-plan.md``.
+Later phases add ``serve`` (HTTP). See ``../Rag/projects/vaultrag/p0-step-plan.md``.
 """
 
 from __future__ import annotations
 
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from vaultrag import __version__
-from vaultrag.config import load_settings
+from vaultrag.config import Settings, load_settings
 from vaultrag.embedding.base import EmbeddingError
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.embedding.ollama import OllamaEmbedder
+from vaultrag.eval import (
+    VECTOR_FIXTURE_PATH,
+    EvalReport,
+    GoldenSet,
+    GoldenSetError,
+    OverlayError,
+    RecordingEmbedder,
+    VectorFixture,
+    apply_overlay,
+    format_cases,
+    format_comparison,
+    format_misses,
+    format_summary,
+    live_stack,
+    load_corpus_golden,
+    load_design_golden,
+    load_golden,
+    load_overlay,
+    overlay_label,
+    replay_stack,
+    run_eval,
+)
 from vaultrag.index.base import VectorStoreError
 from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.index.sparse import Bm25Embedder
@@ -345,6 +369,177 @@ def mcp(
         for closer in (embedder, vector_store, store):
             if closer is not None:
                 closer.close()
+
+
+@app.command()
+def eval(  # shadows the builtin: `eval` is the documented subcommand name
+    golden: Annotated[
+        str,
+        typer.Option(
+            "--golden",
+            help="Golden set: 'corpus' (hermetic gate), 'design' (live dogfooding vault), "
+            "or a path to a golden JSON file.",
+        ),
+    ] = "corpus",
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live",
+            help="Score the running index (Qdrant + Ollama from settings) instead of "
+            "building the fixture corpus in memory. Implied by --golden design.",
+        ),
+    ] = False,
+    config: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--config",
+            help="Settings-override file (YAML or JSON) applied on top of the environment. "
+            "Repeat to A/B two or more configs over the same golden set; the first is the "
+            "baseline the deltas are measured against.",
+        ),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help="Override the project scope named in the golden set."),
+    ] = None,
+    gate: Annotated[
+        bool,
+        typer.Option(
+            "--gate/--no-gate",
+            help="Exit non-zero when a config misses recall@10 >= 0.9 or MRR@5 >= 0.75. "
+            "On by default — this is what makes the CI job merge-blocking.",
+        ),
+    ] = True,
+    show_cases: Annotated[
+        bool,
+        typer.Option("--show-cases", help="Print the per-case rank table, not just the summary."),
+    ] = False,
+    record: Annotated[
+        bool,
+        typer.Option(
+            "--record",
+            help="Re-record the frozen vector fixture from live Ollama, then run. Use after "
+            "changing the corpus, the golden queries, or the embedding model.",
+        ),
+    ] = False,
+) -> None:
+    """Score retrieval quality against a golden set (P2 Stage 1).
+
+    By default this is fully hermetic: it reindexes the committed fixture vault into an
+    in-memory Qdrant using frozen Qwen3 vectors, so it needs no Docker, no Ollama and no
+    network, and returns the same numbers on every machine. That is what CI runs::
+
+        uv run vaultrag eval                      # the gate
+        uv run vaultrag eval --golden design      # dogfood the live index
+        uv run vaultrag eval --config base.yaml --config rerank-on.yaml   # A/B
+    """
+    settings = load_settings()
+    configure_logging(settings.log_level)
+
+    try:
+        golden_set = _resolve_golden(golden)
+    except GoldenSetError as exc:
+        typer.echo(f"eval failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    use_live = live or golden_set.vault_path is None
+    if record and use_live:
+        typer.echo("eval failed: --record only applies to the hermetic corpus run", err=True)
+        raise typer.Exit(code=2)
+
+    overlays: list[tuple[str, Settings]] = []
+    try:
+        for path in config or []:
+            overrides = load_overlay(path)
+            overlays.append((overlay_label(path, overrides), apply_overlay(settings, overrides)))
+    except OverlayError as exc:
+        typer.echo(f"eval failed: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if not overlays:
+        overlays = [("current settings", settings)]
+
+    if project:
+        golden_set = replace(golden_set, project_id=project)
+
+    if record:
+        _record_fixture(golden_set, overlays[0][1])
+
+    reports: list[EvalReport] = []
+    try:
+        for label, run_settings in overlays:
+            stack_cm = (
+                live_stack(golden_set, run_settings)
+                if use_live
+                else replay_stack(golden_set, run_settings, fixture_path=VECTOR_FIXTURE_PATH)
+            )
+            with stack_cm as stack:
+                reports.append(run_eval(golden_set, stack, label=label))
+    except (VectorStoreError, EmbeddingError, ValueError) as exc:
+        typer.echo(f"\neval could not run: {exc}", err=True)
+        if use_live:
+            typer.echo(
+                "live mode needs Qdrant up (`docker compose up -d qdrant`), Ollama serving, "
+                "and the project indexed (`uv run vaultrag reindex --project … --vault …`).",
+                err=True,
+            )
+        raise typer.Exit(code=2) from exc
+
+    for report in reports:
+        if show_cases:
+            typer.echo(format_cases(report))
+        typer.echo(format_summary(report))
+    if len(reports) > 1:
+        typer.echo(format_comparison(reports))
+
+    failed = [r for r in reports if not r.metrics.meets_targets()]
+    if failed:
+        typer.echo("")
+        for report in failed:
+            typer.echo(f"{report.label}: {'; '.join(report.metrics.failures())}", err=True)
+            typer.echo(format_misses(report), err=True)
+        if gate:
+            typer.echo("\nquality gate FAILED — see the misses above.", err=True)
+            raise typer.Exit(code=1)
+
+
+def _resolve_golden(name: str) -> GoldenSet:
+    """Map the ``--golden`` value to a set: the two shorthands, or a path."""
+    if name == "corpus":
+        return load_corpus_golden()
+    if name == "design":
+        return load_design_golden()
+    return load_golden(Path(name))
+
+
+def _record_fixture(golden_set: GoldenSet, settings: Settings) -> None:
+    """Refresh ``tests/eval/vectors.db`` from live Ollama by running the eval through it.
+
+    Recording *by running* is deliberate: it guarantees the fixture covers exactly the
+    texts the gate will ask for — every chunk the current chunker produces from the corpus,
+    plus every golden query — rather than a hand-maintained list that silently drifts out
+    of sync with the pipeline.
+    """
+    typer.echo(f"recording vectors from {settings.ollama_url} ({settings.embed_model})…")
+    fixture = VectorFixture(VECTOR_FIXTURE_PATH, create=True)
+    inner = OllamaEmbedder.from_settings(settings)
+    recorder = RecordingEmbedder(inner, fixture)
+    try:
+        with replay_stack(
+            golden_set, settings, fixture_path=VECTOR_FIXTURE_PATH, embedder=recorder
+        ) as stack:
+            run_eval(golden_set, stack, label="record")
+        fixture.vacuum()
+        typer.echo(
+            f"recorded {recorder.recorded} new vectors ({recorder.reused} already cached); "
+            f"fixture now holds {fixture.count()} → {VECTOR_FIXTURE_PATH}"
+        )
+    except (EmbeddingError, VectorStoreError) as exc:
+        typer.echo(f"recording failed: {exc}", err=True)
+        typer.echo("is Ollama serving the embedding model?", err=True)
+        raise typer.Exit(code=2) from exc
+    finally:
+        recorder.close()
+        fixture.close()
 
 
 def main() -> None:

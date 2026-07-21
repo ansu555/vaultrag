@@ -1,0 +1,105 @@
+{
+  "name": "meridian-corpus",
+  "project": "vaultrag-eval-corpus",
+  "vault_path": "corpus",
+  "description": "The merge-blocking gate set (P2 Stage 1, Decision 2 of ../Rag/projects/vaultrag/p2-step-plan.md). 72 (query -> expected note) pairs over the frozen fixture vault in tests/eval/corpus/, which is a synthetic engineering knowledge base and never drifts. Written to be HARDER than a title-matchy set: most queries are paraphrases sharing no distinctive token with the expected note's title, several notes cover neighbouring topics so ranking must discriminate, and a handful are identifier/error-code lookups that exercise the BM25 half of hybrid search. Targets (evaluation-framework.md): recall@10 >= 0.9, MRR@5 >= 0.75. Run: uv run vaultrag eval",
+  "cases": [
+    {"query": "what absorbs the gap between burst ingest and slower downstream processing", "expected_path": "decisions/queue-kafka-not-sqs.md", "note": "paraphrase; no title token"},
+    {"query": "why can we rewind a consumer group to an earlier offset and reprocess", "expected_path": "decisions/queue-kafka-not-sqs.md"},
+    {"query": "which managed queue did we turn down for the event buffer and why", "expected_path": "decisions/queue-kafka-not-sqs.md"},
+
+    {"query": "why did dashboard aggregations move off the row-oriented database", "expected_path": "decisions/storage-clickhouse-not-postgres.md"},
+    {"query": "how much did compression shrink the ninety day working set", "expected_path": "decisions/storage-clickhouse-not-postgres.md", "note": "numeric fact: 4.1 TB -> 380 GB"},
+    {"query": "which store still holds billing and tenant configuration", "expected_path": "decisions/storage-clickhouse-not-postgres.md"},
+
+    {"query": "why does the client choose the deduplication key instead of the server", "expected_path": "decisions/dedupe-by-idempotency-key.md"},
+    {"query": "how long do we remember keys we have already accepted", "expected_path": "decisions/dedupe-by-idempotency-key.md"},
+    {"query": "what happens to duplicate events when the dedupe cache is unreachable", "expected_path": "decisions/dedupe-by-idempotency-key.md"},
+
+    {"query": "why do we refuse to promise each event is processed precisely once", "expected_path": "decisions/no-exactly-once-delivery.md"},
+    {"query": "what do we actually tell customers about processing guarantees", "expected_path": "decisions/no-exactly-once-delivery.md"},
+    {"query": "what throughput penalty did transactional producers cost in staging", "expected_path": "decisions/no-exactly-once-delivery.md"},
+
+    {"query": "how do we stop a producer silently changing a field type under consumers", "expected_path": "decisions/schema-registry-avro-not-json.md"},
+    {"query": "what does backward compatibility mode require of a newly added field", "expected_path": "decisions/schema-registry-avro-not-json.md"},
+    {"query": "how much smaller is the binary encoding per event", "expected_path": "decisions/schema-registry-avro-not-json.md"},
+
+    {"query": "why is smoothing traffic to a constant rate wrong for our customers", "expected_path": "decisions/rate-limit-token-bucket-not-leaky.md"},
+    {"query": "admission control so one account cannot monopolise gateway capacity", "expected_path": "decisions/rate-limit-token-bucket-not-leaky.md"},
+    {"query": "default steady rate and burst allowance for a new account", "expected_path": "decisions/rate-limit-token-bucket-not-leaky.md"},
+
+    {"query": "why can a kafka consumer not be released with a percentage rollout", "expected_path": "decisions/deploy-blue-green-not-canary.md"},
+    {"query": "how is a new consumer version validated before it takes over", "expected_path": "decisions/deploy-blue-green-not-canary.md", "note": "shadow mode + 30 min output diff"},
+    {"query": "how do I roll back a stateful consumer release instantly", "expected_path": "decisions/deploy-blue-green-not-canary.md"},
+
+    {"query": "why were bearer tokens rejected for high volume device traffic", "expected_path": "decisions/auth-hmac-not-oauth-for-ingest.md"},
+    {"query": "why did we not require client certificates from customer fleets", "expected_path": "decisions/auth-hmac-not-oauth-for-ingest.md", "note": "mTLS rejected alternative"},
+    {"query": "why signing the request body beats a credential that can be replayed", "expected_path": "decisions/auth-hmac-not-oauth-for-ingest.md"},
+
+    {"query": "lag is climbing on every partition at once, what do I check", "expected_path": "runbooks/consumer-lag-spike.md"},
+    {"query": "does adding more consumer instances always reduce the backlog", "expected_path": "runbooks/consumer-lag-spike.md", "note": "capped by partition count"},
+    {"query": "at what point does a backlog start losing data to retention", "expected_path": "runbooks/consumer-lag-spike.md"},
+
+    {"query": "an analytics node is nearly out of space, what do I look at first", "expected_path": "runbooks/clickhouse-disk-pressure.md"},
+    {"query": "a long running mutation is holding parts that cannot be merged", "expected_path": "runbooks/clickhouse-disk-pressure.md"},
+    {"query": "how do I reclaim space from parts left behind by failed merges", "expected_path": "runbooks/clickhouse-disk-pressure.md"},
+
+    {"query": "one record keeps crashing the consumer every time it is retried", "expected_path": "runbooks/poison-pill-message.md"},
+    {"query": "how do I read a single record off a topic without consuming it", "expected_path": "runbooks/poison-pill-message.md"},
+    {"query": "when is it acceptable to force skip past an offset", "expected_path": "runbooks/poison-pill-message.md"},
+
+    {"query": "a customer says their ingest key leaked, what is the procedure", "expected_path": "runbooks/credential-rotation.md"},
+    {"query": "why are two secrets valid at the same time during a changeover", "expected_path": "runbooks/credential-rotation.md"},
+    {"query": "the customer has not migrated by day six of the overlap window", "expected_path": "runbooks/credential-rotation.md"},
+
+    {"query": "when is it worth moving traffic out of a struggling region", "expected_path": "runbooks/region-failover.md"},
+    {"query": "what order do I shift ingest and query serving in", "expected_path": "runbooks/region-failover.md"},
+    {"query": "how do I bring traffic back once the region has recovered", "expected_path": "runbooks/region-failover.md"},
+
+    {"query": "what does MER-1422 mean", "expected_path": "reference/error-codes.md", "note": "identifier lookup; BM25 half of hybrid"},
+    {"query": "which internal failure is the only one a client ever sees as a 503", "expected_path": "reference/error-codes.md"},
+    {"query": "codes raised when enrichment fails", "expected_path": "reference/error-codes.md"},
+
+    {"query": "maximum number of events allowed in one batch", "expected_path": "reference/ingest-api.md"},
+    {"query": "what does a 202 response actually promise the caller", "expected_path": "reference/ingest-api.md"},
+    {"query": "how should a client retry only the elements that failed", "expected_path": "reference/ingest-api.md"},
+
+    {"query": "which environment variable controls how many records a consumer polls at once", "expected_path": "reference/config-envvars.md"},
+    {"query": "where do services read their settings from, is there a config file", "expected_path": "reference/config-envvars.md"},
+    {"query": "MERIDIAN_DEDUPE_TTL_SECONDS", "expected_path": "reference/config-envvars.md", "note": "bare identifier"},
+
+    {"query": "which field does the server inject and never trust from the client", "expected_path": "reference/event-schema.md", "note": "tenant_id"},
+    {"query": "why are nested objects flattened into dotted keys", "expected_path": "reference/event-schema.md"},
+    {"query": "why must every optional field carry a default value", "expected_path": "reference/event-schema.md"},
+
+    {"query": "are throttled requests counted against our availability number", "expected_path": "reference/slo-definitions.md"},
+    {"query": "how quickly must an accepted event become queryable", "expected_path": "reference/slo-definitions.md"},
+    {"query": "why is correctness not given an error budget", "expected_path": "reference/slo-definitions.md"},
+
+    {"query": "why does the edge wait for durable acknowledgement before replying", "expected_path": "services/gateway-service.md"},
+    {"query": "how many events per second can one core handle at the edge", "expected_path": "services/gateway-service.md"},
+    {"query": "a newly declared event name is rejected for about half a minute", "expected_path": "services/gateway-service.md", "note": "30s tenant event-set cache"},
+
+    {"query": "what does a tenant's broken callback do to our pipeline", "expected_path": "services/enricher-service.md"},
+    {"query": "why do these instances take forty seconds to become ready", "expected_path": "services/enricher-service.md"},
+    {"query": "how is a session identifier derived from user activity", "expected_path": "services/enricher-service.md"},
+
+    {"query": "why are writes batched into very large chunks before insert", "expected_path": "services/rollup-worker.md"},
+    {"query": "how late can an event arrive and still change an aggregate", "expected_path": "services/rollup-worker.md"},
+
+    {"query": "how is query injection made structurally impossible rather than filtered", "expected_path": "services/query-api.md"},
+    {"query": "why are results cached for only half a minute", "expected_path": "services/query-api.md"},
+
+    {"query": "how are repeatedly failing records classified before being replayed", "expected_path": "services/dead-letter-reaper.md"},
+    {"query": "how long are unrecoverable records kept before deletion", "expected_path": "services/dead-letter-reaper.md"},
+
+    {"query": "a report shows different numbers on every refresh", "expected_path": "til/clickhouse-final-modifier.md"},
+    {"query": "cheaper way to get a deduplicated read than the expensive modifier", "expected_path": "til/clickhouse-final-modifier.md", "note": "argMax + GROUP BY"},
+
+    {"query": "why did restarting the consumer group make the outage last longer", "expected_path": "til/kafka-rebalance-storms.md"},
+    {"query": "which timeouts did we raise to stop members being evicted", "expected_path": "til/kafka-rebalance-storms.md"},
+
+    {"query": "background work vanishes with no error and no log line", "expected_path": "til/python-asyncio-task-gc.md"},
+    {"query": "why must you hold a strong reference to a created task", "expected_path": "til/python-asyncio-task-gc.md"}
+  ]
+}
