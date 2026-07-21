@@ -207,6 +207,15 @@ class MetaStore(Protocol):
 
     def delete_chunks_for_doc(self, doc_id: str) -> None: ...
 
+    def chunk_count(self, project_id: str) -> int:
+        """How many chunks the manifest believes this project has indexed.
+
+        The SQLite half of the drift check: compared against the vector store's own
+        point count, a disagreement means the two derived caches were lost
+        independently and the index is serving a fraction of the vault (see
+        ``../Rag/agent-inbox/reindex-cannot-repair-a-drifted-vector-store.md``).
+        """
+
     # --- tags -----------------------------------------------------------------
     def set_tags(self, project_id: str, doc_id: str, tags: Iterable[str]) -> None:
         """Replace the tag set for a document (idempotent)."""

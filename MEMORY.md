@@ -8,8 +8,8 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 DONE. Next: Stage 4 (PDF via Docling),
-  unblocked.**
+- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 DONE, and the index-drift bug is now FIXED.
+  Next: Stage 4 (PDF via Docling), unblocked.**
 - **Stage 3 (`related` + graph-expand) DONE 2026-07-21, and it ships ON.** The plan's
   condition ("on only if a measured non-regression on the Stage 1 gate") was met: gate
   **recall@10 1.000 · MRR@5 0.892 unchanged · nDCG@10 0.919 → 0.920, PASS**, plus a real gain
@@ -52,17 +52,29 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   the reranked survivors (and exempt from `threshold` — an unscored chunk has no score to
   fail a floor with). **Gate unmoved: 1.000/0.892/0.919** (it pins `rerank_mode=never`).
   **429 tests** green, ruff, mypy (50).
-- **⚠️ `reindex` CANNOT repair a drifted vector store — the CLAUDE.md §6 "DR = reindex"
-  guardrail is currently false.** Found live: `vaultrag-design` had **57 notes / 173 chunks in
-  SQLite but only 50 in Qdrant** (71% missing), and `reindex` reported `=53 unchanged` because
-  it is idempotent against the **manifest** and never consults the vector store. Retrieval kept
-  returning plausible results from a third of the vault, with **no signal anywhere** — which
-  silently invalidates any quality number measured in that state. Repaired by hand (clear the
-  project's derived rows + Qdrant points, reindex → 173 = 173). **Filed, not fixed:**
-  `../Rag/agent-inbox/reindex-cannot-repair-a-drifted-vector-store.md` — recommends a
-  `reindex --force` plus a `live_stack` consistency assert. **Gotcha:** the `sqlite3` CLI
-  defaults `foreign_keys` **off**, so deleting `documents` without the pragma orphans `tags`
-  rows and the next ingest fails 29/57 notes on FK constraints.
+- **✅ Index-drift bug FIXED 2026-07-21 (was: "`reindex` cannot repair a drifted vector
+  store").** The CLAUDE.md §6 "DR = reindex" guardrail is true again. Three parts, all measured:
+  **(1) `vaultrag reindex --force`** — implemented in the *classifier*
+  (`diff_manifest(force=True)` routes hash-equal files to `updates` instead of `unchanged`), so
+  deletes and renames are still derived normally; a force that bypassed the diff would re-upsert
+  everything **and strand documents deleted from disk**. **(2) `live_stack` refuses to score a
+  drifted index** — raises `DriftError` (a `ValueError`, so the eval CLI's existing "can't run"
+  handling maps it to **exit 2**), mirroring the `stats.failed` guard `replay_stack` already had.
+  **(3) A post-reindex drift warning** — the cheap slice of the `doctor` option: every `reindex`
+  ends with the one-query check and says `warning: index drift … — re-run with --force`. That is
+  what makes `--force` discoverable *at the moment it's needed*, which was option 1's stated
+  weakness. New `consistency.py` (`Drift`/`DriftError`/`check_drift`) + `MetaStore.chunk_count`.
+  **Verified live, and the bug reproduced on the way:** with 2 points deleted from Qdrant, a
+  plain `reindex` did **real work** (`+1 ~2 =55`, 35 chunks) **and was still drifted 179 vs 177**
+  — it will never converge. `eval --live` exit **2**; `--force` → `~58`, 179 chunks, **1.7 s**,
+  manifest = Qdrant = 179. **The repair is affordable because force re-upserts but does not
+  re-embed** — the `(model,dims,chunk_hash)` cache absorbs it (1.7 s forced vs 8.7 s for the
+  partial run before it). **Still exposed:** the **MCP server does not check drift at startup**,
+  so a long-running `vaultrag mcp` can still serve a drifted index silently. Resolution appended
+  to `../Rag/agent-inbox/reindex-cannot-repair-a-drifted-vector-store.md` (status → resolved).
+  **Gotcha retained from the manual repair:** the `sqlite3` CLI defaults `foreign_keys` **off**,
+  so deleting `documents` without the pragma orphans `tags` rows and the next ingest fails on FK
+  constraints. **494 tests** (+14), ruff, mypy (52). Gate unmoved: 1.000/0.892/0.920.
 - **Rerank is a user-chosen mode (2026-07-21, Anik's ruling).** `rerank_enabled: bool` →
   **`rerank_mode: never | auto | always`** (`VAULTRAG_RERANK_MODE`), default **`never`**.
   `auto` decides **per query** from the top-1/top-2 RRF margin — **not** an LLM call, so it stays
@@ -222,6 +234,58 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 — index-drift bug fixed: `reindex --force` + a live-eval refusal + a warning
+- **Did:** Anik asked whether Stage 4 was safe to start or whether anything needed resolving
+  first. Verdict: Stage 4 was unblocked, but the *filed-not-fixed* drift bug was worth an hour
+  **before** it, because every Stage 4 acceptance criterion is live-index dogfooding ("a real
+  multi-page PDF indexes end-to-end; chunks carry the correct `page`") and Stage 4 is the first
+  stage to add a **new file type** — on a drifted index, "this PDF never reached Qdrant" and
+  "the Docling adapter skipped it" are indistinguishable, so you'd debug the wrong layer.
+  Anik: *"do it"*. Built options **1 + 3** from the agent-inbox note, plus the cheapest useful
+  slice of option 2.
+- **`--force` lives in the classifier, not in a second code path.** `diff_manifest(force=True)`
+  sends hash-equal files to `updates` instead of `unchanged`; everything downstream is the
+  ordinary reconcile. This is the part worth remembering: a force implemented as "skip the diff
+  and re-upsert everything" would **strand documents deleted from disk**, turning a repair into
+  a different kind of corruption. Deletes and renames still derive normally (pinned by a test).
+- **The eval harness now refuses live drift.** `live_stack` raises `DriftError` naming both
+  counts + the repair command. It subclasses `ValueError` on purpose, so the eval CLI's existing
+  "can't run" handler maps it to **exit 2** with no CLI change — a refusal to measure, never a
+  quality number. Exactly the treatment `replay_stack` already gave the hermetic version of this
+  failure (`stats.failed`); live had the same hole and no guard.
+- **Added the detection half too (option 2, cheap form).** Not a `doctor` command — that still
+  wants a `serve` role — but every `reindex` ends with the one-query check and prints
+  `warning: index drift … — re-run with --force`. Option 1's stated weakness was that it only
+  helps someone who *already suspects* a problem; this closes that.
+- **Verified live, and reproduced the bug on the way — better than planned.** Deleted one note's
+  points from the running Qdrant, then: `eval --live` **exit 2** (refused, named 173 vs 171);
+  plain `reindex` did **real work** (`+1 ~2 =55`, 35 chunks — the vault had genuinely changed)
+  **and remained drifted at 179 vs 177**, i.e. it will never converge no matter how often you
+  run it; the new warning fired; `--force` → `~58`, 179 chunks, **1.7 s**, manifest = Qdrant =
+  179, warning gone. **Force is cheap because it re-upserts without re-embedding** — the
+  `(model,dims,chunk_hash)` cache absorbs every unchanged chunk, so the *full* forced rebuild
+  (1.7 s) beat the *partial* plain run that preceded it (8.7 s). There is a test for that too,
+  because it is the property that makes the DR path usable on a big vault.
+- **Files:** `src/vaultrag/consistency.py` (new — `Drift`/`DriftError`/`check_drift`),
+  `store/base.py` + `store/sqlite.py` (`chunk_count`), `indexer/scan.py` (`force` on
+  `diff_manifest`/`scan_vault`), `indexer/pipeline.py` (`force` on `reindex_vault`), `cli.py`
+  (`--force` + the warning), `eval/harness.py` (`live_stack` guard). Tests:
+  `tests/test_consistency.py` (new, 13) + 1 in `test_cli.py`. **Vault:** resolution appended to
+  `agent-inbox/reindex-cannot-repair-a-drifted-vector-store.md`, status draft → resolved.
+  **494 tests** (+14), ruff, ruff format, mypy (52). **Hermetic gate unmoved: 1.000 / 0.892 /
+  0.920** (this touches no retrieval stage).
+- **Next / handoff:** **Stage 4 — PDF via Docling** (decision 3, the `vaultrag[pdf]` optional
+  extra, still open). Things to know: (a) **the MCP server still does not check drift at
+  startup** — a long-running `vaultrag mcp` can serve a drifted index silently; that is the
+  remaining exposure and the argument for option 2's full form once `serve` exists; (b) the
+  **design-vault dogfood number moved 0.749 → 0.739 for a non-code reason** — `../Rag` gained a
+  note and changed two during this session (173 → 179 chunks), so the 58-case set is scoring a
+  different corpus. This is precisely the drift Stage 1 predicted when it chose a frozen fixture
+  for the gate; **don't read it as a regression, and don't compare design-vault numbers across
+  sessions**; (c) `state/vaultrag.db` **is still tracked in git** and still needs
+  `git rm --cached state/vaultrag.db` from Anik — `.gitignore` is fixed but does not apply to
+  already-tracked files, and it keeps growing every session.
 
 ### 2026-07-21 — P2 Stage 3: `related` tool + graph-expand (retrieval stage 6)
 - **Did:** Anik: *"impliment the stage 3 and test it properly … push it"* → Stage 3 of

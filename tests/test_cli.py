@@ -34,6 +34,14 @@ def test_version() -> None:
     assert __version__ in result.output
 
 
+def test_reindex_offers_force() -> None:
+    """The documented DR path (CLAUDE.md §6) must be reachable from the CLI, not just the
+    library — a plain reindex cannot repair a drifted vector store."""
+    result = runner.invoke(app, ["reindex", "--help"])
+    assert result.exit_code == 0
+    assert "--force" in result.output
+
+
 def test_reindex_fails_gracefully_when_services_are_down(tmp_path: Path) -> None:
     """No live Qdrant/Ollama in this test run — assert a clean error, not a traceback."""
     vault_dir = tmp_path / "vault"

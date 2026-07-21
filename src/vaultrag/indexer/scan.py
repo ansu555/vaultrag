@@ -258,6 +258,8 @@ def walk_vault(
 def diff_manifest(
     scanned: Sequence[ScannedFile],
     manifest: Mapping[str, str | None],
+    *,
+    force: bool = False,
 ) -> ScanDiff:
     """Diff on-disk files against the stored ``path -> hash`` manifest.
 
@@ -270,6 +272,12 @@ def diff_manifest(
     into :attr:`ScanDiff.renames` (old_path → new_path), and both are removed from the
     create/delete lists so Step 8 moves the document instead of re-embedding it. Pure
     function — feed it a hand-built manifest to test the classifier without a vault.
+
+    ``force`` classifies hash-equal files as **updates** instead of ``unchanged``, which
+    is what makes ``reindex --force`` rebuild a vector store the manifest wrongly
+    believes is populated. It changes only that one branch: deletes and renames are
+    still derived normally, so a forced run stays a reconcile rather than becoming a
+    blind re-upsert that leaves removed documents behind.
     """
     by_path = {f.path: f for f in scanned}
     creates: list[ScannedFile] = []
@@ -280,7 +288,7 @@ def diff_manifest(
         prior = manifest.get(f.path, _MISSING)
         if prior is _MISSING:
             creates.append(f)
-        elif prior == f.hash:
+        elif prior == f.hash and not force:
             unchanged.append(f.path)
         else:
             updates.append(f)
@@ -342,17 +350,24 @@ def _extract_renames(
 # ---------------------------------------------------------------------------
 # Top-level entry
 # ---------------------------------------------------------------------------
-def scan_vault(vault_path: Path, manifest: Mapping[str, str | None]) -> tuple[ScanDiff, ScanStats]:
+def scan_vault(
+    vault_path: Path,
+    manifest: Mapping[str, str | None],
+    *,
+    force: bool = False,
+) -> tuple[ScanDiff, ScanStats]:
     """Walk ``vault_path`` and diff it against ``manifest`` in one call.
 
     The convenience wrapper Step 8 will call: pass ``store.document_manifest(project)``
     as ``manifest``. Returns the reconcile plan plus walk stats for logging/metrics.
+    ``force`` is passed through to :func:`diff_manifest` (re-ingest everything).
     """
     files, stats = walk_vault(vault_path)
-    diff = diff_manifest(files, manifest)
+    diff = diff_manifest(files, manifest, force=force)
     log.info(
         "scan.complete",
         vault=str(vault_path),
+        force=force,
         indexable=stats.indexable,
         ignored=stats.ignored,
         secrets_blocked=stats.secrets_blocked,
