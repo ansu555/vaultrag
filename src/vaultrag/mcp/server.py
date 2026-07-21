@@ -16,6 +16,10 @@ Tool surface (``../Rag/reference/reference-mcp-tools.md``, arch §16):
 * ``open(path, heading?, lines?)`` — reads an exact slice of one note **straight from
   the vault** (the source of truth — always at least as fresh as the index the citation
   came from), not from Qdrant.
+* ``related(path, hops?, limit?)`` — the note's graph neighbourhood (links, backlinks,
+  tag-siblings) as paths + titles, from P2 Stage 2's ``links`` table. Registered only when
+  a graph store is supplied. Text-free by design: it is how an agent explores outward from
+  a hit without spending context (``retrieval/graph.py``).
 
 Tool descriptions are written *for models* — when to call, arg semantics, budget
 guidance — treated as seriously as retrieval quality
@@ -56,15 +60,18 @@ from vaultrag.index.base import SearchFilters, SparseEmbedder, VectorStore, Vect
 from vaultrag.indexer.scan import ExclusionReason, exclusion_reason, load_ignore_spec
 from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
-from vaultrag.models import BlockType, OpenResult, SearchResult, WriteResult
+from vaultrag.models import BlockType, OpenResult, RelatedResult, SearchResult, WriteResult
 from vaultrag.parsing import heading_section, parse_document
 from vaultrag.retrieval import (
     DEFAULT_BUDGET_TOKENS,
     DEFAULT_K,
     DEFAULT_PARENT_MAX_TOKENS,
+    GraphExpandParams,
+    GraphStore,
     Reranker,
     RerankParams,
     VaultParentResolver,
+    related_notes,
 )
 from vaultrag.retrieval import search as retrieval_search
 from vaultrag.retrieval.pipeline import pack_budget
@@ -167,6 +174,8 @@ def build_mcp_server(
     rerank_params: RerankParams | None = None,
     parent_swap_enabled: bool = False,
     parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
+    graph_store: GraphStore | None = None,
+    graph_params: GraphExpandParams | None = None,
     vault_name: str | None = None,
     writer: NoteWriter | None = None,
 ) -> FastMCP:
@@ -184,6 +193,11 @@ def build_mcp_server(
     enclosing section, reconstructed live from the vault through ``open``'s *own* gated
     reader — so parent-swap can never surface a file ``open`` would refuse (CLAUDE.md §6).
     It runs in ``snippets`` mode only; ``compact`` (browse-by-preview) skips the vault reads.
+
+    ``graph_store`` turns on retrieval stage 6 **and** registers the ``related`` tool — both
+    read P2 Stage 2's ``links`` table (``retrieval/graph.py``). ``None`` (a deployment with no
+    metadata store, or one indexed before Stage 2) simply omits both: search still works, it
+    just carries no ``related`` pointers, and no tool advertises a graph that isn't there.
 
     ``vault_name`` is the Obsidian display name used to build ``obsidian://open`` citation
     URIs (retrieval stage 8); ``None`` omits them. The CLI resolves it from settings, falling
@@ -203,7 +217,8 @@ def build_mcp_server(
             "designing, debugging, or answering questions about this project, call "
             "`search` first with one focused query — prefer that over reading many "
             "files. Follow a citation with `open` (its `path`, plus its `anchor` as "
-            "`heading`) when the snippet alone is not enough context."
+            "`heading`) when the snippet alone is not enough context, or with `related` "
+            "(its `path`) to see what the vault links to it."
         ),
     )
 
@@ -295,6 +310,8 @@ def build_mcp_server(
                 rerank=rerank_params,
                 parent_resolver=parent_resolver,
                 parent_max_tokens=parent_max_tokens,
+                graph_store=graph_store,
+                graph=graph_params,
                 vault_name=vault_name,
                 # Compact mode budgets the *previews*, not the full texts: packing full
                 # texts first would silently drop hits the agent asked to browse (k),
@@ -313,6 +330,7 @@ def build_mcp_server(
             q_hash=blake3(query.encode("utf-8")).hexdigest()[:12],
             mode=mode,
             hits=len(result.snippets),
+            related=len(result.related),
             total_tokens=result.total_tokens,
             truncated=result.truncated,
             elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
@@ -408,10 +426,112 @@ def build_mcp_server(
         )
         return result
 
+    if graph_store is not None:
+        _register_related_tool(
+            mcp,
+            project_id=project_id,
+            vault_root=vault_root,
+            graph_store=graph_store,
+            params=graph_params if graph_params is not None else GraphExpandParams(),
+            vault_name=vault_name,
+        )
     if writer is not None:
         _register_write_tools(mcp, writer)
 
     return mcp
+
+
+# ---------------------------------------------------------------------------
+# related (P2 Stage 3) — registered only when a graph store is supplied.
+# ---------------------------------------------------------------------------
+def _register_related_tool(
+    mcp: FastMCP,
+    *,
+    project_id: str,
+    vault_root: Path,
+    graph_store: GraphStore,
+    params: GraphExpandParams,
+    vault_name: str | None,
+) -> None:
+    """Attach ``related`` — graph exploration over P2 Stage 2's ``links`` table.
+
+    Returns pointers (path + title + why), never text: following one is what ``open`` and
+    ``search`` are for, and keeping text out means an agent can survey a neighbourhood for
+    almost nothing. Everything it names came out of the index, which already applied every
+    scan gate (``.ragignore``, the secret guard, containment), so there is no path here by
+    which ``related`` can surface a note ``open`` would refuse.
+    """
+
+    @mcp.tool
+    def related(
+        path: Annotated[
+            str,
+            Field(
+                description="Vault-relative note path exactly as a search citation gave "
+                "it, e.g. 'projects/vaultrag/chunking-strategy.md'."
+            ),
+        ],
+        hops: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=2,
+                description="Link distance to explore. 1 (default) = direct links and "
+                "backlinks. 2 also returns notes one further hop out — broader, noisier, "
+                "and usually only worth it when 1 hop came back thin.",
+            ),
+        ] = 1,
+        limit: Annotated[
+            int,
+            Field(ge=1, le=200, description="Max related notes to return."),
+        ] = 50,
+    ) -> RelatedResult:
+        """Explore the note graph around one note: links, backlinks, and tag-siblings.
+
+        Call this after a search hit to find what the vault itself connects to that note —
+        cheaper and more precise than another search, because it follows the author's own
+        wikilinks rather than guessing at similarity. Returns paths + titles only (no text,
+        no token budget); follow anything interesting with open() or search(). Each entry's
+        `relation` says why it is there: `links_to` (the note points at it), `backlink` (it
+        points at the note), `neighbor` (2 hops away), `tag_sibling` (no link, shared tags —
+        the weakest signal, so only the few strongest are returned). `unresolved` lists
+        wikilinks in the note that point at nothing indexed — a broken link, or a note not
+        written yet.
+        """
+        rel = _vault_relative(vault_root, path)
+        document = graph_store.get_document(project_id, rel)
+        if document is None:
+            raise ToolError(
+                f"{rel!r} is not indexed in project {project_id!r} — pass a path exactly as "
+                "a search citation gave it (the graph only knows indexed notes)"
+            )
+        notes, unresolved, truncated = related_notes(
+            project_id=project_id,
+            doc_id=document.id,
+            store=graph_store,
+            hops=hops,
+            limit=limit,
+            max_tag_siblings=params.max_tag_siblings,
+            vault_name=vault_name,
+        )
+        log.info(
+            "mcp.related",
+            project=project_id,
+            path=rel,
+            hops=hops,
+            notes=len(notes),
+            unresolved=len(unresolved),
+            truncated=truncated,
+        )
+        return RelatedResult(
+            path=rel,
+            title=document.title,
+            doc_id=document.id,
+            hops=hops,
+            notes=notes,
+            unresolved=unresolved,
+            truncated=truncated,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +715,23 @@ def _one_line(text: str, limit: int = _COMPACT_LINE_CHARS) -> str:
 # ---------------------------------------------------------------------------
 # open helpers
 # ---------------------------------------------------------------------------
+def _vault_relative(vault_root: Path, path: str) -> str:
+    """Normalize a client-supplied path to a vault-relative one, refusing escapes.
+
+    The lookup-only twin of :func:`_read_note`'s first half — used by ``related``, which
+    never opens the file and so must not require it to exist on disk (the index is what it
+    queries). Containment is still enforced: ``'../../etc/passwd'`` is a mistake worth
+    naming, not a silent "not indexed", and refusing it here means no path outside the
+    vault ever reaches a store query.
+    """
+    if not path.strip():
+        raise ToolError("`path` must be a non-empty vault-relative path")
+    candidate = (vault_root / path).resolve()
+    if not candidate.is_relative_to(vault_root):
+        raise ToolError(f"path {path!r} escapes the vault — pass a vault-relative note path")
+    return candidate.relative_to(vault_root).as_posix()
+
+
 def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
     """Resolve ``path`` inside the vault and read it, enforcing every indexing gate.
 
@@ -609,13 +746,8 @@ def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
     take effect immediately, and a cached spec would keep serving a file the user just
     withdrew.
     """
-    if not path.strip():
-        raise ToolError("`path` must be a non-empty vault-relative path")
-
-    candidate = (vault_root / path).resolve()
-    if not candidate.is_relative_to(vault_root):
-        raise ToolError(f"path {path!r} escapes the vault — pass a vault-relative note path")
-    rel = candidate.relative_to(vault_root).as_posix()
+    rel = _vault_relative(vault_root, path)
+    candidate = vault_root / rel
 
     reason = exclusion_reason(rel, ignore=load_ignore_spec(vault_root))
     if reason is not None:

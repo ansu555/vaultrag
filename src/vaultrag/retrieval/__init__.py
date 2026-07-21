@@ -10,6 +10,15 @@ from __future__ import annotations
 
 from vaultrag.index.base import SearchFilters
 from vaultrag.retrieval.cite import cite, obsidian_uri
+from vaultrag.retrieval.graph import (
+    GraphExpandParams,
+    GraphStore,
+    authority_boost,
+    graph_expand,
+    graph_params_for,
+    neighbor_notes,
+    related_notes,
+)
 from vaultrag.retrieval.parents import (
     DEFAULT_PARENT_MAX_TOKENS,
     ParentResolver,
@@ -41,6 +50,8 @@ __all__ = [
     "DEFAULT_PARENT_MAX_TOKENS",
     "DEFAULT_PREFETCH_LIMIT",
     "BgeReranker",
+    "GraphExpandParams",
+    "GraphStore",
     "NoOpReranker",
     "ParentResolver",
     "ParentSection",
@@ -49,10 +60,15 @@ __all__ = [
     "Reranker",
     "SearchFilters",
     "VaultParentResolver",
+    "authority_boost",
     "cite",
+    "graph_expand",
+    "graph_params_for",
     "load_reranker",
+    "neighbor_notes",
     "obsidian_uri",
     "parent_swap",
+    "related_notes",
     "rerank_candidates",
     "rerank_params_for",
     "search",

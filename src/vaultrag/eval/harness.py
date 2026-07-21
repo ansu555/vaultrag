@@ -16,7 +16,9 @@ which one it is scoring.
 **What the harness deliberately does not do.** It passes no ``parent_resolver`` and no
 ``vault_name``: parent-swap repackages a hit *within* the same note and citation stamps a
 URI, so neither can move a path-based ranking metric — including them would add live vault
-reads to every case and measure nothing new. It also runs with a large token budget by
+reads to every case and measure nothing new. Stage 6 **is** wired in, by the same test: it
+reorders documents, so it can and does move the metric, and a stage that moves the metric
+has to land through the gate rather than around it. It also runs with a large token budget by
 default (:data:`EVAL_BUDGET_TOKENS`), because the greedy budget packer can truncate a
 result list before rank 10 and we want recall@10 to measure *retrieval*, not packing. Pass
 a production-sized budget explicitly to see the end-to-end view instead.
@@ -44,8 +46,11 @@ from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.index.sparse import Bm25Embedder
 from vaultrag.indexer.pipeline import reindex_vault
 from vaultrag.retrieval import (
+    GraphExpandParams,
+    GraphStore,
     Reranker,
     RerankParams,
+    graph_params_for,
     load_reranker,
     rerank_params_for,
     search,
@@ -71,6 +76,12 @@ class SearchStack:
     sparse: SparseEmbedder
     reranker: Reranker | None = None
     rerank_params: RerankParams = field(default_factory=RerankParams)
+    # Retrieval stage 6. Non-None means the link-graph authority boost reorders the results
+    # this stack scores — which is exactly the claim the gate has to check before stage 6
+    # ships on, so it is wired in rather than skipped like parent-swap and cite (those
+    # cannot move a path-based metric; a reorder is nothing but a move).
+    graph_store: GraphStore | None = None
+    graph_params: GraphExpandParams = field(default_factory=GraphExpandParams)
     k: int = EVAL_K
     budget_tokens: int = EVAL_BUDGET_TOKENS
 
@@ -91,6 +102,8 @@ class SearchStack:
             budget_tokens=self.budget_tokens,
             reranker=reranker,
             rerank=self.rerank_params,
+            graph_store=self.graph_store,
+            graph=self.graph_params,
         )
         seen: set[str] = set()
         ordered: list[str] = []
@@ -125,9 +138,11 @@ class EvalReport:
     metrics: Metrics
     results: list[CaseResult]
     reranked: bool
-    # Reconstructed from what actually ran (reranker present? gate open?), not read back
-    # from Settings — a results table must describe the run, not the intent.
+    # Reconstructed from what actually ran (reranker present? gate open? graph store
+    # attached?), not read back from Settings — a results table must describe the run, not
+    # the intent.
     rerank_mode: str = str(RerankMode.never)
+    graph_expand: bool = False
 
     @property
     def misses(self) -> list[CaseResult]:
@@ -142,6 +157,10 @@ def run_eval(golden: GoldenSet, stack: SearchStack, *, label: str = "config") ->
     reranked. That is not waste: nDCG@10 is defined pre-rerank (it measures whether fusion
     *found* the material at all), while recall@10 and MRR@5 score the order the agent
     actually receives. With rerank off the two passes would be identical, so only one runs.
+
+    The pre-pass isolates **stage 4 and nothing else**: every other configured stage,
+    including stage 6's graph reorder, runs in both passes. So "pre-rerank" means exactly
+    that, and a stage-6 A/B is done by running two configs, not by reading the two columns.
     """
     reranked = stack.reranker is not None
     if not reranked:
@@ -175,6 +194,7 @@ def run_eval(golden: GoldenSet, stack: SearchStack, *, label: str = "config") ->
         results=results,
         reranked=reranked,
         rerank_mode=str(mode),
+        graph_expand=stack.graph_store is not None,
     )
 
 
@@ -259,6 +279,11 @@ def replay_stack(
                 sparse=Bm25Embedder(),
                 reranker=_maybe_reranker(settings),
                 rerank_params=_rerank_params(settings),
+                # The same throwaway store the corpus was just indexed into — so the graph
+                # the gate scores is the one today's ingest builds from today's corpus, not
+                # a committed snapshot that could drift out from under it.
+                graph_store=store if settings.graph_expand_enabled else None,
+                graph_params=graph_params_for(settings),
                 k=settings.default_top_k,
             )
         finally:
@@ -277,6 +302,9 @@ def live_stack(golden: GoldenSet, settings: Settings) -> Iterator[SearchStack]:
     """
     vector_store = QdrantVectorStore.from_settings(settings)
     embedder = OllamaEmbedder.from_settings(settings)
+    # The real state DB, read-only in practice — the live graph belongs to the live index,
+    # so dogfooding measures the same stage 6 the served MCP server runs.
+    store = SQLiteMetaStore.from_settings(settings) if settings.graph_expand_enabled else None
     try:
         yield SearchStack(
             project_id=golden.project_id,
@@ -285,11 +313,15 @@ def live_stack(golden: GoldenSet, settings: Settings) -> Iterator[SearchStack]:
             sparse=Bm25Embedder(),
             reranker=_maybe_reranker(settings),
             rerank_params=_rerank_params(settings),
+            graph_store=store,
+            graph_params=graph_params_for(settings),
             k=settings.default_top_k,
         )
     finally:
         embedder.close()
         vector_store.close()
+        if store is not None:
+            store.close()
 
 
 def _rerank_params(settings: Settings) -> RerankParams:

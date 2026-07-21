@@ -205,6 +205,51 @@ class Settings(BaseSettings):
         "section is too coarse, so its child is kept instead (the ~2k cap, arch §6).",
     )
 
+    # --- graph expand (retrieval stage 6; P2 Stage 3) -------------------------
+    # The first consumer of Stage 2's `links` table. Two halves, one flag:
+    #   (a) an authority boost — a chunk whose document is linked from *other* documents in
+    #       the same result set gets a small lift, because the vault's author said those
+    #       notes defer to it and no query-vs-chunk scorer can see that;
+    #   (b) a neighbor append — the 1-hop links/backlinks of the top few result documents,
+    #       returned as titles+paths in `SearchResult.related`, never as text, so they cost
+    #       zero budget_tokens and can never displace a snippet.
+    # ON by default, and unlike rerank that is a *measured* claim, not a hope: the stage is
+    # pure SQLite (~10 indexed lookups, sub-millisecond — no model, no network, so none of
+    # rerank's latency argument applies), and it was gated before shipping on Stage 1's
+    # golden set. See ../Rag/projects/vaultrag/knowledge-graph-integration.md and
+    # retrieval-pipeline.md stage 6.
+    graph_expand_enabled: bool = Field(
+        default=True,
+        description="Retrieval stage 6: reorder by link authority and append 1-hop "
+        "neighbours of the top hits as titles+paths. Needs the SQLite link graph (P2 "
+        "Stage 2); with no metadata store the stage is simply skipped.",
+    )
+    graph_boost: float = Field(
+        default=0.25,
+        description="Largest share of the result set's score spread that pure link "
+        "authority can add. Expressed as a fraction because the incoming scores are RRF, "
+        "cross-encoder sigmoid, or constant depending on which stages ran — an absolute "
+        "bonus would be a no-op on one scale and decisive on another. 0 disables the "
+        "reorder while leaving the neighbour append on.",
+    )
+    graph_top_docs: int = Field(
+        default=3,
+        description="How many top-ranked documents seed the neighbour append (stage 6).",
+    )
+    graph_max_related: int = Field(
+        default=10,
+        description="Cap on appended neighbour pointers per search, so a hub note linked "
+        "from half the vault can't flood the response.",
+    )
+    graph_max_tag_siblings: int = Field(
+        default=5,
+        description="Cap on shared-tag siblings returned by `related`. Small on purpose: "
+        "`tags` holds prefix-expanded tags, so every note under one project/ namespace is a "
+        "weak sibling of every other — measured on the design vault, one `related` call "
+        "returned 46 tag siblings beside 3 real links. Raise it on a vault with a flat, "
+        "meaningful tag vocabulary.",
+    )
+
     # --- live watch (indexer; P1 Stage 4) -------------------------------------
     # watchdog Observer → per-path debounce → worker pool → ingest_path. Owned by
     # serve/indexer and `vaultrag watch`; `vaultrag mcp` runs it only with --watch (a

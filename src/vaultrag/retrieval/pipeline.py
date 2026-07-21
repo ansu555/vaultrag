@@ -8,11 +8,12 @@ fusion, ``project_id`` + ``filters`` applied inside both branches — Step 7's
 ``QdrantVectorStore.query``), then greedily pack the already-ranked hits into
 ``budget_tokens``.
 
-Rerank / parent-swap / graph-expand / MMR-compression are stages 4-7 of
-``../Rag/projects/vaultrag/retrieval-pipeline.md`` and are explicitly **P1+, not P0**
-(``../Rag/projects/vaultrag/p0-step-plan.md`` Step 9) — this module is stage 0 (scope +
-filters), 2-3 (hybrid prefetch + fusion, done server-side by the vector store), a
-P0-simple version of 7 (budget truncation only), and 8 (cite + respond).
+This module is the stage sequencer. Stage 0 (scope + filters) and 2-3 (hybrid prefetch +
+fusion, done server-side by the vector store) live here; stages 4 (rerank), 5 (parent
+swap), 6 (graph expand) and 8 (cite) are each their own module and each opt in through a
+parameter being non-``None``, so a caller composes exactly the pipeline it wants. Stage 7
+is still the P0-simple version — greedy budget truncation, no MMR/near-dupe drop (arch
+§13). Stage 1 (query expansion) is default-off by design and unbuilt.
 
 Ref: ``../Rag/projects/vaultrag/hybrid-search.md``,
 ``../Rag/projects/vaultrag/retrieval-pipeline.md``, arch §9-§11.
@@ -24,6 +25,7 @@ from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, VectorStore
 from vaultrag.models import SearchResult, Snippet
 from vaultrag.retrieval.cite import cite
+from vaultrag.retrieval.graph import GraphExpandParams, GraphStore, graph_expand
 from vaultrag.retrieval.parents import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, parent_swap
 from vaultrag.retrieval.rerank import Reranker, RerankParams, rerank_candidates
 
@@ -47,6 +49,8 @@ def search(
     rerank: RerankParams | None = None,
     parent_resolver: ParentResolver | None = None,
     parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
+    graph_store: GraphStore | None = None,
+    graph: GraphExpandParams | None = None,
     vault_name: str | None = None,
 ) -> SearchResult:
     """Run the hybrid read path for one query, scoped to ``project_id``.
@@ -67,6 +71,13 @@ def search(
     parent snippet, capped at ``min(parent_max_tokens, budget_tokens)`` (a parent that
     won't fit falls back to the child — ``retrieval/parents.py``). Without a resolver the
     hits become child snippets unchanged.
+
+    When ``graph_store`` is given, stage 6 runs after parent-swap: the kept snippets are
+    reordered by how many *other* result documents link to each (a query-conditional
+    authority signal from the vault's own wikilinks), and the 1-hop neighbours of the top
+    documents come back in ``SearchResult.related`` as titles+paths — outside ``snippets``
+    and outside the token budget, so a pointer can never displace a result
+    (``retrieval/graph.py``). Without a store the stage is skipped entirely.
 
     When ``vault_name`` is given, stage 8 (cite) stamps each snippet with a working
     ``obsidian://open`` URI into that vault (``retrieval/cite.py``); without it, ``uri``
@@ -104,6 +115,19 @@ def search(
         snippets = parent_swap(hits, parent_resolver, _to_snippet, cap_tokens=cap)
     else:
         snippets = [_to_snippet(hit) for hit in hits]
+
+    # Stage 6: link-graph authority reorder + neighbour pointers. Runs on the post-swap
+    # snippets (so it ranks whole sections when stage 5 produced them) and *before* packing,
+    # because reordering decides which prefix the greedy packer keeps. `related` is returned
+    # alongside — never merged into `snippets` — so pointers cost no budget and can't be
+    # mistaken for retrieved results (that mistake would silently inflate any recall metric).
+    snippets, related = graph_expand(
+        snippets,
+        project_id=project_id,
+        store=graph_store,
+        params=graph if graph is not None else GraphExpandParams(),
+        vault_name=vault_name,
+    )
     # Stage 8: attach the obsidian:// citation URI (no-op when vault_name is unset). Done
     # before packing so the kept snippets carry it; the URI isn't text, so it costs no budget.
     snippets = cite(snippets, vault_name=vault_name)
@@ -112,6 +136,7 @@ def search(
         query=query,
         project_id=project_id,
         snippets=packed,
+        related=related,
         total_tokens=total_tokens,
         truncated=truncated,
     )

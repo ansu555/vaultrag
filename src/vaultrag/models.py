@@ -227,14 +227,67 @@ class Snippet(_Base):
     chunk_id: str | None = None
 
 
+class RelatedNote(_Base):
+    """One note reachable from another through the vault's own graph — **no text**.
+
+    The unit of retrieval stage 6 and of the ``related`` tool: a pointer an agent can
+    follow with ``open`` / ``search``, deliberately carrying titles + paths only. Text
+    would cost ``budget_tokens`` and duplicate what a real search would return better;
+    a pointer costs nothing and is what "explore outward from a hit" actually needs
+    (``../Rag/projects/vaultrag/knowledge-graph-integration.md``, arch §14).
+
+    ``relation`` says *why* this note is here, which is the part an agent reasons with:
+
+    * ``links_to``    — the source note links **out** to this one.
+    * ``backlink``    — this note links **in** to the source (who cites it).
+    * ``neighbor``    — reachable in ``hops`` link-hops, either direction (2-hop only;
+      1-hop always arrives as the more specific ``links_to``/``backlink``).
+    * ``tag_sibling`` — no link at all: it shares tags. ``hops`` is ``None`` because a
+      tag is not a hop, and ``shared_tags`` carries the (prefix-expanded) overlap count.
+    """
+
+    path: str
+    title: str | None = None
+    relation: Literal["links_to", "backlink", "neighbor", "tag_sibling"]
+    hops: int | None = None  # link distance; None for tag siblings (not a link relation)
+    shared_tags: int | None = None  # tag_sibling only — how many tags overlap
+    uri: str | None = None  # obsidian://open?vault=…&file=… — None until a vault_name is set
+
+
 class SearchResult(_Base):
-    """The ``search`` response: ranked, budget-bounded cited snippets."""
+    """The ``search`` response: ranked, budget-bounded cited snippets.
+
+    ``related`` is retrieval stage 6's neighbor append: notes adjacent in the link graph
+    to the top hits, as pointers only. It is deliberately **not** part of ``snippets`` —
+    those are ranked retrieval results with text, these are unranked exploration hints —
+    and it costs no ``budget_tokens``, so it never displaces a snippet.
+    """
 
     query: str
     project_id: str
     snippets: list[Snippet] = Field(default_factory=list)
+    related: list[RelatedNote] = Field(default_factory=list)
     total_tokens: int = 0
     truncated: bool = False  # True if budget_tokens forced dropping lower-ranked hits
+
+
+class RelatedResult(_Base):
+    """The ``related`` response: one note's graph neighborhood, as pointers.
+
+    ``notes`` is deduped by path (a mutually-linked note appears once, under the most
+    specific relation) and ordered ``links_to`` → ``backlink`` → ``neighbor`` →
+    ``tag_sibling``. ``unresolved`` lists the wikilink targets this note writes that name
+    no indexed document — dangling links, the vault-hygiene signal (arch §14) — so an
+    agent can tell "nothing links here" apart from "the links here are broken".
+    """
+
+    path: str
+    title: str | None = None
+    doc_id: str
+    hops: int
+    notes: list[RelatedNote] = Field(default_factory=list)
+    unresolved: list[str] = Field(default_factory=list)
+    truncated: bool = False  # True if `limit` cut the neighborhood short
 
 
 class OpenResult(_Base):
