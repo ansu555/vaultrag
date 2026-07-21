@@ -35,7 +35,18 @@ from vaultrag.logging import get_logger
 
 log = get_logger(__name__)
 
-DEFAULT_TOP_N = 50
+# Measured, not guessed (2026-07-21). A cross-encoder can only promote a chunk it is shown,
+# so the useful depth is bounded by how deep the *correct* note already sits in fusion order
+# — which `vaultrag eval --ceiling` reports per vault, with no model and in seconds. On the
+# design vault (58 cases, 173 chunks) coverage saturates at fusion rank 14; on the corpus
+# fixture at rank 5. 20 clears the deeper of the two with headroom, because 15 would be
+# fitted to the exact maximum of a 58-case sample.
+#
+# Reviewing *past* that depth is not merely wasted latency, it is actively harmful: a
+# distractor at rank 40 can outscore the correct chunk at rank 1 and displace it. Measured
+# on the corpus set — MRR@5 fusion 0.892, top_n=50 0.928, top_n=5 **0.939** — i.e. the
+# shallower reranker beat the deeper one at a tenth the cost.
+DEFAULT_TOP_N = 20
 # No absolute floor by default. The vault's 0.3 (reranking.md / reranker-bge-v2-m3.md) was
 # measured to systematically evict *relevant* chunks — bge-v2-m3's sigmoid scores land at
 # ~0.02-0.25 on real content, so a fixed floor is score-distribution-dependent and can't
