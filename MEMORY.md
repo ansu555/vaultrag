@@ -8,8 +8,33 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 DONE, rerank cost settled. Next: Stage 3
-  (`related` tool + graph-expand), unblocked.**
+- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 DONE. Next: Stage 4 (PDF via Docling),
+  unblocked.**
+- **Stage 3 (`related` + graph-expand) DONE 2026-07-21, and it ships ON.** The plan's
+  condition ("on only if a measured non-regression on the Stage 1 gate") was met: gate
+  **recall@10 1.000 · MRR@5 0.892 unchanged · nDCG@10 0.919 → 0.920, PASS**, plus a real gain
+  where the graph is dense — live design vault, 58 cases, **MRR@5 0.710 → 0.749 (+0.039)**,
+  nDCG 0.779 → 0.806. **The boost is a fraction of the result set's score spread, not an
+  absolute bonus** — incoming scores are RRF (~0.016), a cross-encoder sigmoid, or a constant
+  1.0 from `NoOpReranker`, so any fixed number is a no-op on one scale and decisive on another.
+  That scaling buys the safety property the stage rests on: **a chunk can only overtake another
+  if it was already within `boost x spread` of it** — authority settles a photo-finish, never a
+  decisive win. **Default `graph_boost=0.25` swept on both sets:** corpus 0.10/0.25 +0.000,
+  0.50 -0.000, **1.00 -0.151**; design vault 0.10 +0.014, **0.25 +0.033**, 0.50 +0.062, 1.00
+  +0.003. Same "two golden sets disagree for an understood reason" shape as rerank — the corpus
+  is 27 notes / 57 links with one correct answer per query, so in-result-set in-degree has
+  little to work with. 0.50 measured better on the design vault; **0.25 is the conservative
+  point non-negative on both**, and it's a per-vault knob. In-degree is counted **only within
+  the result set** (query-conditional, not a global PageRank — otherwise every MOC dominates
+  every search it grazes). **Neighbours are a separate `SearchResult.related` field, never
+  extra snippets**: merging them into `snippets` would make pointers indistinguishable from
+  results and **silently inflate every recall number the gate computes**. Latency **p50 0.39 ms
+  / p95 0.66 ms** over 58 live queries — 10x under the plan's 5 ms budget, pure SQLite, which is
+  why "on by default" is free (none of rerank's latency argument applies). **Found only by
+  dogfooding the live vault:** `related` returned **49 entries — 1 link, 2 backlinks, 46 tag
+  siblings**, because `tags` is prefix-expanded and one shared `project/…` namespace makes every
+  note a weak sibling; new `graph_max_tag_siblings` (default 5) → 3 links + 5 strongest siblings.
+  **480 tests** (+51), ruff, mypy (51).
 - **`rerank_top_n` 50 → 20, and deeper is WORSE (2026-07-21).** Corpus set, 72 cases:
   fusion **0.892** MRR@5 · `always`@50 **0.928** · `always`@5 **0.939** · **`auto`@5 0.946**.
   So the cheapest config is also the best: candidates past the useful depth hold no winnable
@@ -197,6 +222,60 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 — P2 Stage 3: `related` tool + graph-expand (retrieval stage 6)
+- **Did:** Anik: *"impliment the stage 3 and test it properly … push it"* → Stage 3 of
+  `../Rag/projects/vaultrag/p2-step-plan.md`. Stage 2 made the wikilink graph *data*; Stage 3 is
+  its first consumer. New `retrieval/graph.py` (narrow `GraphStore` protocol + `authority_boost`
+  + `neighbor_notes` + `related_notes`), retrieval **stage 6** wired between parent-swap and
+  cite, new **`related(path, hops?, limit?)`** MCP tool, `RelatedNote`/`RelatedResult` models,
+  `SearchResult.related`, 4 config knobs, CLI `--graph/--no-graph` for the A/B, and the eval
+  harness now carries a graph store so the stage lands *through* the gate rather than around it.
+- **The design decision that mattered: scale-free boosting.** Scores arriving at stage 6 are RRF
+  (~0.016 and down), a cross-encoder sigmoid in `[0,1]`, or a constant 1.0 — an absolute bonus
+  would be a no-op on one and a wrecking ball on another. Expressing the boost as a fraction of
+  the result set's own `max - min` gives one meaning **and** the property the stage is safe by:
+  a chunk can only overtake another it was already within `boost x spread` of.
+- **Shipped ON, measured not assumed.** Gate 1.000 / 0.892 / **0.920** PASS (nDCG +0.001); live
+  design vault **MRR@5 0.710 → 0.749**. Boost sweep on both sets is in the Phase bullet — the
+  headline is that **1.00 costs -0.151 MRR@5 on the corpus**, which is what the 0.25 default buys
+  distance from, and that the corpus is neutral while the real vault gains (same understood
+  disagreement as rerank: the corpus is 27 notes / 57 links, one correct answer per query).
+- **Two things I deliberately did NOT do.** (1) Pointers are **not** appended to `snippets` —
+  they'd be indistinguishable from retrieved results and would silently inflate recall@10, the
+  exact silent-green shape this repo has been bitten by twice. They live in `SearchResult.related`,
+  outside the budget packer. (2) The graph store is a **reader**: it attaches to an existing state
+  DB and never creates one, so a read-only server with no index still comes up clean and simply
+  doesn't advertise `related` (two CLI tests pin both directions).
+- **The bug only the live vault could show.** On fixtures `related` looked great. Against
+  `../Rag` it returned **49 entries: 1 link, 2 backlinks, 46 tag siblings** — `tags` is
+  prefix-expanded, so one shared `project/…` namespace makes every note a weak sibling of every
+  other (the caveat the Stage 2 handoff flagged, now with a number). The relation the tool is
+  *named for* was buried under the weakest one. Added `graph_max_tag_siblings` (default 5, store
+  already returns most-shared-first, counted on what is *added* so dedupe can't shrink the cap):
+  the same call now answers with 3 links + the 5 strongest siblings.
+- **Verified over real stdio, not just in-memory:** subprocess `vaultrag mcp --no-write` against
+  the live `vaultrag-design` index — `related` registered, returned the neighbourhood, and
+  **every returned path re-opened successfully through `open`** (a pointer that 404s is worse
+  than no pointer); `hops=2` correctly promotes 14 notes from `tag_sibling` to the more specific
+  `neighbor`; path traversal refused; a 5-hit search carried 9 pointers at `total_tokens` = the
+  snippets alone. Index consistency checked first per the standing caveat (SQLite 224 = Qdrant
+  224 — no drift, so the numbers mean something).
+- **Files:** `retrieval/graph.py` (new), `retrieval/{pipeline,__init__}.py`, `models.py`
+  (`RelatedNote`/`RelatedResult`/`SearchResult.related`), `config.py` (4 knobs), `mcp/server.py`
+  (`related` + `_vault_relative`, which `_read_note` now shares so the two can't drift),
+  `cli.py` (store opened for the graph, `--graph/--no-graph`), `eval/{harness,report}.py`.
+  Tests: `tests/test_graph.py` (new, 38), +14 in `test_mcp.py`, +2 in `test_cli.py`.
+  **Vault:** `p2-step-plan.md` Log. Green: **480 tests** (+51), ruff, ruff format, mypy (51).
+- **Next / handoff:** **Stage 4 — PDF via Docling** (decision 3, the `vaultrag[pdf]` optional
+  extra, still open). Things to know: (a) stage 6 reorders *within* the `k` earlier stages kept —
+  it cannot resurrect a chunk rerank dropped, which is the honest scope of a post-hoc signal;
+  (b) `graph_boost` **0.50 measured better on the design vault** (+0.062 vs +0.033) and is the
+  obvious thing to raise if a future harder golden set agrees — the sweep is in `graph.py`'s
+  docstring; (c) stage 6 touches no Qdrant filtering, so the in-memory-payload-index caveat from
+  Stage 1 does not apply to it; (d) the `reindex`-cannot-repair-drift bug is **still filed, not
+  fixed** — `related` reads SQLite while `search` reads Qdrant, so if the two ever disagree
+  check manifest vs Qdrant counts before debugging either.
 
 ### 2026-07-21 — rerank made affordable: `top_n` 50→20 via a new `--ceiling`, + a silent index-drift bug
 - **Did:** answered ask (a) from the previous handoff — make the rerank stage *affordable* before
