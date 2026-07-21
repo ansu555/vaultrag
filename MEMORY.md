@@ -11,6 +11,11 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 - **Phase:** **P2 COMPLETE — all 7 stages DONE (1+2+3+4+5+6+7), and the index-drift bug is
   FIXED. Next: P3** (multi-project keys + tenancy hardening, compression/budget packer,
   query-log mining, optional `answer` mode, compose profiles) — `CLAUDE.md` §4.
+- **Open before P3 (from the 2026-07-21 audit, see the latest session-log entry):** bugs **3**
+  (UTF-8 BOM breaks frontmatter parsing → all tags lost) and **4** (`write_note` never writes the
+  H1 its schema promises → `append_section` can't target agent-created notes) are **unfixed**;
+  bugs 1 (symlink escape) and 2 (writes could destroy a PDF) are fixed on `fix/containment-gaps`.
+  **CI runs only the eval gate** — no ruff/mypy/pytest, so 639 tests aren't merge-blocking.
 - **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
   `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
   module imports `prometheus_client` — interfaces over vendors) + instrumentation in
@@ -383,6 +388,55 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 (later) — two containment bugs fixed: symlink escape + PDF-destroying write
+- **Did:** an audit turned up 4 real bugs the 628-test suite could not see, because each lives in
+  the **gap between two individually-correct components**. Fixed the two serious ones on
+  `fix/containment-gaps` (branched off `main`; one commit + regression tests each).
+- **Bug 1 (HIGH, security) — the walk escaped the vault.** `os.walk(followlinks=False)` only stops
+  the walk *descending* symlinked **directories**; symlinked **files** are still listed, and
+  `scan.py` read straight through them. `notes/leak.md -> /outside/private-diary.md` was indexed
+  and returned by search at rank #1 with full text — while `open("notes/leak.md")` refused the
+  same path as escaping the vault. **Containment was enforced on the read path only**, so the
+  index could hold what the read path would not hand out (§6). Fix: `escapes_vault()` next to
+  `exclusion_reason` (it cannot live *inside* it — that gate is pure string work, this needs the
+  filesystem to learn where a link points), applied on **both** routes that make a file into index
+  content: `walk_vault` (before any read, counted as `ScanStats.escaped`) and `ingest_path` (new
+  `SkipReason.escapes_vault`). Doing only the walk would have left reindex and watch disagreeing
+  about the same vault. In-vault symlinks stay indexable — the gate refuses escapes, not links.
+- **Bug 2 (HIGH, data loss) — `patch_frontmatter` irreversibly destroyed a PDF.** `_contain` asked
+  `exclusion_reason` "is this writable", but that function answers "is this **indexable**" — and
+  **P2 widened it with `.pdf` + image suffixes**, silently making them write targets. Every write
+  path ends in a UTF-8 text write, so a PDF was read with `errors="replace"`, rewritten as
+  markdown, and git-committed (18884 B `%PDF-` → 32013 B `---\n`, 6701 U+FFFD, unrecoverable from
+  the file; only git saved it). Reachable in **two calls with no prior knowledge**, because the
+  409 conflict echoes the live hash. Fix: writability is now **stated, not derived**
+  (`_WRITABLE_SUFFIXES`, refusing `not_markdown` **before** the optimistic lock, so the conflict
+  path no longer leaks a hash for an unwritable file), and the lossy reads that did the damage are
+  strict (`_decode_or_refuse` → `not_utf8`) — an edit rewrites the whole file, so `"replace"` was
+  never a display concern.
+- **The shape both share, worth naming:** one gate correct in isolation, and a second path that
+  never learned about it. Bug 2 in particular was **introduced by a P2 change to a different
+  module** — `writer.py`'s docstring still described the pre-P2 world where indexable and writable
+  coincided. Deriving one permission from another module's set is the defect; both fixes replace
+  the inference with an explicit statement.
+- **Verified:** each regression test confirmed **failing against the pre-fix code** and passing
+  after (not just passing). **639 tests** (+11), ruff, mypy (57). `metrics.py`'s mirrored refusal
+  tuple caught the new enum members — that sync test paid for itself.
+- **Next session:** bugs 3 and 4 from the same audit are unfixed — (3) a **UTF-8 BOM** breaks
+  frontmatter parsing (`read_text(encoding="utf-8")` doesn't strip it, so the first `---` never
+  matches: all tags lost → server-side `filters.tags` silently fails, title becomes raw YAML in
+  every citation; routine on Windows-authored notes; fix is stripping a leading `﻿` in
+  `split_frontmatter`, safe because it doesn't shift line numbers), and (4) **`write_note` never
+  writes the H1 its schema promises** (`server.py:575` tells the model "Becomes the H1/frontmatter
+  title"; `_render_new_note` writes frontmatter only) — so `append_section` can **never** target an
+  agent-created note, breaking the documented "create a note, then grow it" memory loop for
+  exactly the notes agents create.
+- **Also open (process, and probably the root cause):** **CI runs only the eval gate.**
+  `.github/workflows/eval.yml` is the only workflow — no ruff, no mypy, no pytest beyond
+  `tests/test_eval.py`. `CLAUDE.md` §5 says "CI should fail on lint errors"; it currently *can't*,
+  and the 639 tests are **not merge-blocking**. That is plausibly why bugs 1-4 accumulated while
+  everything looked green. Wiring ruff/mypy/pytest into CI is the highest-leverage next step.
 
 ### 2026-07-21 — Stages 1-6 verified, then P2 Stage 7: Prometheus `/metrics` — **P2 COMPLETE**
 - **Did:** Anik: *"if 1-6 stage are fully ready then go for the next"*. Verified stages 1-6 (598
