@@ -11,12 +11,44 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 - **Phase:** **P2 COMPLETE — all 7 stages DONE (1+2+3+4+5+6+7), and the index-drift bug is
   FIXED. Next: P3** (multi-project keys + tenancy hardening, compression/budget packer,
   query-log mining, optional `answer` mode, compose profiles) — `CLAUDE.md` §4.
-- **Open before P3 (from the 2026-07-21 audit, see the latest session-log entry):** bugs **3**
-  (UTF-8 BOM breaks frontmatter parsing → all tags lost) and **4** (`write_note` never writes the
-  H1 its schema promises → `append_section` can't target agent-created notes) are **unfixed**;
-  bugs 1 (symlink escape) and 2 (writes could destroy a PDF) are **fixed and merged** (PR #10), as
-  is `.github/workflows/checks.yml` + branch protection (PR #11). **CI is now genuinely
-  merge-blocking** — 4 required checks on a protected `main`, admin bypass retained.
+- **The 2026-07-21 audit is CLOSED — all 4 bugs fixed and merged** (PR #10 bugs 1-2, PR #11 CI +
+  branch protection, PR #12 bugs 3-4), and **independently re-verified on 2026-07-21** by
+  re-running the four original attack scenarios against the merged code, not by re-reading the
+  fixes: symlink escape refused by `walk_vault` (`escaped=1`) *and* `ingest_path` while an
+  in-vault symlink stays indexable; a PDF survives the two-call `patch_frontmatter` attack
+  **byte-identical, 0 U+FFFD**, refused `not-markdown` *before* the optimistic lock so the 409 no
+  longer leaks the live hash; a BOM'd note keeps `tags=['alpha','beta']` and its real title with
+  **line anchors unshifted**; `write_note` renders its H1 and `append_section` can now target the
+  note it just created. **645 tests, exit 0.** Branch protection confirmed live via the API:
+  4 required checks, `strict`, 0 approvals, `enforce_admins=false`.
+- **Audit item 5 (zero-chunk ghost docs) — INVESTIGATED, and the obvious fix is a REGRESSION.
+  Do not "make the two paths agree".** The report is right about the facts: `empty.md` and a
+  frontmatter-only note each create a `documents` row with **0 chunks**, while Stage 6 evicts a
+  textless *image* on the stated reason that a zero-block row is unretrievable. But applying the
+  image rule to markdown **breaks the link graph**, measured: a frontmatter-only stub note is a
+  **fully live graph node today** — it resolves `[[Stub Note]]` *and* its alias `[[Stubby]]`, and
+  carries its tags. Evicting it would cascade `doc_keys` + `tags` away (`sqlite/DDL`, and
+  `sqlite.py:340` says so outright: "links pointing here go `dst_doc=NULL`"), turning both
+  wikilinks **DANGLING** and dropping the tag. Empty-stub-as-link-target is routine Obsidian
+  practice, so this would silently degrade real vaults.
+  **The two paths differ for a real reason, and that is the answer:** a textless image has no
+  graph identity beyond its path, while a frontmatter-only note carries title, tags and aliases —
+  it is unretrievable *by search* but is not a ghost. The defensible rule is "retrievability and
+  graph identity are different questions"; the cosmetic wart (a 0-chunk row) is the price of
+  keeping stub notes linkable. **Needs a vault decision before any code moves** — written up as
+  `../Rag/agent-inbox/zero-chunk-docs-are-graph-nodes-not-ghosts.md` (status `proposed`; Anik to
+  rule, and it should graduate to `decisions/` if accepted, since the audit already re-opened
+  this once and a future session otherwise will again).
+- **`state/vaultrag.db` is ALREADY UNTRACKED — the handoff item below is stale, ignore it.**
+  Several session-log entries (including the newest, item (c)) say it "is still tracked in git and
+  still needs `git rm --cached` from Anik", escalating to "5 sessions running". **It was done** in
+  `a082466` / PR #9 on 2026-07-21: `git ls-files --error-unmatch state/vaultrag.db` → *"did not
+  match any file(s) known to git"*. Those log entries are left as written (a log records what was
+  true then), but **nothing is outstanding here**. Worth a beat: that claim got repeated forward
+  across sessions — and once by me, out loud, before checking — purely because it was in the
+  handoff. **Verify a carried-forward TODO before re-reporting it**; a stale "still broken" costs
+  a real session's attention and, said confidently enough, invites someone to "fix" what is
+  already fixed.
 - **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
   `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
   module imports `prometheus_client` — interfaces over vendors) + instrumentation in
