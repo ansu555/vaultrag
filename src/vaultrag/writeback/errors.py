@@ -27,6 +27,8 @@ class RefusalReason(StrEnum):
     escapes_vault = "escapes-vault"  # realpath resolves outside the vault root (traversal)
     outside_write_root = "outside-write-root"  # not under any writeback_allow_roots folder
     gated = "gated"  # exclusion_reason fired (secret filename / ragignore / unsupported / pruned)
+    not_markdown = "not-markdown"  # target is an indexable *binary* source (PDF/image), not a note
+    not_utf8 = "not-utf8"  # edit target isn't decodable UTF-8 (a rewrite would lose bytes)
     secret = "secret"  # scan_for_secrets found key material in the content
     exists = "exists"  # write_note target already exists (no silent overwrite)
     not_found = "not-found"  # append/patch target note does not exist

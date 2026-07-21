@@ -81,6 +81,8 @@ WRITE_REFUSAL_REASONS = (
     "escapes-vault",
     "outside-write-root",
     "gated",
+    "not-markdown",
+    "not-utf8",
     "secret",
     "exists",
     "not-found",
