@@ -93,6 +93,7 @@ def chunk_document(document: Document, *, project_id: str) -> list[Chunk]:
                 langs=_langs(piece.blocks),
                 has_code=any(b.type == BlockType.code for b in piece.blocks),
                 type=document.metadata.type,
+                page=_first_page(piece.blocks),
                 created_ts=document.metadata.created_ts,
                 modified_ts=document.metadata.modified_ts,
                 chunk_hash=blake3(text.encode("utf-8")).hexdigest(),
@@ -221,6 +222,19 @@ def _line_span(blocks: list[Block]) -> tuple[int | None, int | None]:
     starts = [b.line_start for b in blocks if b.line_start is not None]
     ends = [b.line_end for b in blocks if b.line_end is not None]
     return (min(starts) if starts else None, max(ends) if ends else None)
+
+
+def _first_page(blocks: list[Block]) -> int | None:
+    """The page a chunk *starts* on — its citation anchor. ``None`` for non-paged docs.
+
+    A chunk can straddle a page break (Docling's markdown flows across them), so a
+    single number is a simplification. Start-of-chunk is the right one: it is where an
+    agent opening the citation should land, and it is what ``page`` means in
+    ``reference-metadata-schema.md``. ``min`` rather than ``blocks[0].page`` so a leading
+    block with no page info doesn't erase the whole chunk's anchor.
+    """
+    pages = [b.page for b in blocks if b.page is not None]
+    return min(pages) if pages else None
 
 
 def _langs(blocks: list[Block]) -> list[str]:

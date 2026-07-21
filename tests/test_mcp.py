@@ -515,6 +515,17 @@ def test_open_blocks_symlink_escape(vault: Path) -> None:
     assert "escapes the vault" in message
 
 
+def test_open_refuses_a_pdf_and_says_where_its_text_lives(vault: Path) -> None:
+    """A PDF is indexable but not readable as text — returning its decoded bytes would
+    hand the agent mojibake. Refuse, and point at the route that does work."""
+    (vault / "handbook.pdf").write_bytes(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\ntrailer\n")
+
+    message = call_expecting_error(build(vault)[0], "open", {"path": "handbook.pdf"})
+
+    assert "PDF" in message
+    assert "search" in message  # actionable, not just "no"
+
+
 def test_open_blocks_secret_filenames(vault: Path) -> None:
     message = call_expecting_error(build(vault)[0], "open", {"path": "aws-credentials.md"})
     assert "secret guard" in message

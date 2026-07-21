@@ -32,7 +32,8 @@ Security posture:
   (CLAUDE.md §6: a client can narrow, never widen).
 * **``open`` enforces the same gates as indexing** — vault containment (a resolved
   path, including through symlinks, must stay under the vault root), the built-in
-  secret guard (filename + content), ``.ragignore``, and the P0 markdown-only scope.
+  secret guard (filename + content), and ``.ragignore``. PDFs are indexable but not
+  text, so ``open`` refuses them and points at ``search``'s page-cited chunks instead.
   Without these, ``open`` would hand an agent exactly the files the scan boundary
   exists to withhold.
 * Retrieved vault text is returned as data, never executed or interpreted (§6).
@@ -57,7 +58,12 @@ from vaultrag.chunking.tokens import CHARS_PER_TOKEN, count_tokens
 from vaultrag.embedding.base import EmbeddingError
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import SearchFilters, SparseEmbedder, VectorStore, VectorStoreError
-from vaultrag.indexer.scan import ExclusionReason, exclusion_reason, load_ignore_spec
+from vaultrag.indexer.scan import (
+    ExclusionReason,
+    exclusion_reason,
+    is_binary_source,
+    load_ignore_spec,
+)
 from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
 from vaultrag.models import BlockType, OpenResult, RelatedResult, SearchResult, WriteResult
@@ -113,7 +119,7 @@ _EXCLUSION_MESSAGES: dict[ExclusionReason, str] = {
     "pruned-dir": "is under a directory the indexer never scans (.git/.obsidian/.trash/…)",
     "secret-filename": "is blocked by the built-in secret guard",
     "ragignore": "is excluded by .ragignore and cannot be opened",
-    "unsupported": "is not a markdown note — P0 serves markdown only",
+    "unsupported": "is not an indexable file (markdown or PDF)",
 }
 
 
@@ -756,6 +762,16 @@ def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
         raise ToolError(f"{rel!r} {_EXCLUSION_MESSAGES[reason]}")
     if not candidate.is_file():
         raise ToolError(f"note not found: {rel!r}")
+
+    # Indexable but not readable *as text*: a PDF's bytes decode to mojibake, and
+    # handing an agent that is worse than a refusal it can act on. `search` still
+    # returns its chunks (with a `page`), which is the way in — so say that, rather
+    # than pretending the path doesn't exist.
+    if is_binary_source(rel):
+        raise ToolError(
+            f"{rel!r} is a PDF — `open` serves text only. Its extracted text is "
+            f"searchable via `search`, and each hit cites the page it came from."
+        )
 
     try:
         text = candidate.read_text(encoding="utf-8", errors="replace")

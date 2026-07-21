@@ -100,6 +100,7 @@ class Block(_Base):
     heading_path: list[str] = Field(default_factory=list)  # H1 ▸ H2 trail above this block
     line_start: int | None = None  # 1-based source line span, for anchors/citations
     line_end: int | None = None
+    page: int | None = None  # 1-based source page (PDFs, P2) — propagates to Chunk.page
 
     @property
     def is_atomic(self) -> bool:
@@ -219,6 +220,10 @@ class Snippet(_Base):
     anchor: str | None = None
     line_start: int | None = None  # 1-based source line range of the cited text
     line_end: int | None = None
+    # 1-based page for PDF hits, absent for notes (P2 Stage 4). `open` cannot serve a
+    # PDF's text, so this is the *only* way an agent can locate a PDF hit in the source
+    # document — without it the page would reach Qdrant and stop there.
+    page: int | None = None
     text: str
     score: float
     tokens: int
