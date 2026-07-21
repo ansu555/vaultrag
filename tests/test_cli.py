@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -267,3 +268,57 @@ def test_mcp_write_back_disabled_by_env_opens_no_store(
     )
     assert result.exit_code == 0, result.output
     assert not (tmp_path / "state" / "vaultrag.db").exists()
+
+
+def _tool_names(server: FastMCP) -> list[str]:
+    """Tool names registered on a server, from a sync context (`list_tools` is async)."""
+    return sorted(t.name for t in asyncio.run(server.list_tools()))
+
+
+def test_mcp_serves_read_only_without_a_state_db_and_omits_related(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only server pointed at a state dir with no index must still come up.
+
+    The graph is a *reader*: it attaches to an existing DB and never conjures one, so this
+    path leaves no empty database behind and simply does not advertise `related` — a server
+    must not offer a tool it has no data for (P2 Stage 3).
+    """
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    tools: list[list[str]] = []
+    monkeypatch.setattr(FastMCP, "run", lambda self, **kwargs: tools.append(_tool_names(self)))
+
+    result = runner.invoke(
+        app,
+        ["mcp", "--project", "test-proj", "--vault", str(vault_dir), "--no-write"],
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "state" / "vaultrag.db").exists()
+    assert tools == [["open", "search"]]
+
+
+def test_mcp_registers_related_when_a_state_db_already_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror case: with an index on disk, the graph attaches even in read-only mode."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    SQLiteMetaStore(tmp_path / "state" / "vaultrag.db").close()  # an already-indexed vault
+    tools: list[list[str]] = []
+    monkeypatch.setattr(FastMCP, "run", lambda self, **kwargs: tools.append(_tool_names(self)))
+
+    result = runner.invoke(
+        app,
+        ["mcp", "--project", "test-proj", "--vault", str(vault_dir), "--no-write"],
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert tools == [["open", "related", "search"]]

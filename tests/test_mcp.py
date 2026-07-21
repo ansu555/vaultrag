@@ -37,6 +37,7 @@ from vaultrag.indexer.pipeline import IngestContext
 from vaultrag.indexer.scan import ExclusionReason
 from vaultrag.mcp import build_mcp_server
 from vaultrag.mcp.server import _EXCLUSION_MESSAGES, SearchFiltersParam, _apply_cap
+from vaultrag.models import DocumentMetadata, Link, LinkKind, document_id
 from vaultrag.retrieval import obsidian_uri
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
@@ -689,3 +690,165 @@ def test_patch_frontmatter_conflict_surfaces_current_hash(vault: Path) -> None:
     )
     assert created["hash"] in message  # 409 echoes the live hash to rebase on
     assert "body" in message  # …and the current content
+
+
+# ---------------------------------------------------------------------------
+# related (P2 Stage 3) — the MCP contract over the link graph
+# ---------------------------------------------------------------------------
+def build_with_graph(
+    vault: Path,
+    *,
+    hits: Sequence[ScoredChunk] = (),
+    vault_name: str | None = None,
+) -> tuple[FastMCP, SQLiteMetaStore]:
+    """A server wired to a *real* SQLite graph holding a two-note linked vault.
+
+    Uses the real store rather than a fake so this exercises the same
+    ``GraphStore`` implementation the CLI composes — the MCP layer's job here is the
+    contract (path normalization, the not-indexed refusal, registration), and a fake store
+    would let the two drift apart unnoticed.
+    """
+    store = SQLiteMetaStore(vault / ".state.db")
+    store.upsert_project(PROJECT, name=PROJECT, vault_path=str(vault))
+    guide = store.upsert_document(
+        PROJECT,
+        DocumentMetadata(path="notes/guide.md", title="Guide", hash="blake3:g", tags=["topic"]),
+    )
+    other = store.upsert_document(
+        PROJECT,
+        DocumentMetadata(path="notes/other.md", title="Other", hash="blake3:o", tags=["topic"]),
+    )
+    store.replace_links(
+        PROJECT,
+        other,
+        [
+            Link(kind=LinkKind.wikilink, target="guide"),
+            Link(kind=LinkKind.wikilink, target="Ghost"),
+        ],
+    )
+    store.reresolve_links(PROJECT, other)
+    assert guide  # the graph is keyed on it
+    server = build_mcp_server(
+        project_id=PROJECT,
+        vault_path=vault,
+        vector_store=FakeVectorStore(hits=hits),
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        graph_store=store,
+        vault_name=vault_name,
+    )
+    return server, store
+
+
+def test_related_returns_the_neighbourhood_with_working_paths(vault: Path) -> None:
+    """The plan's acceptance criterion: neighbours + tag-siblings, as usable paths."""
+    server, store = build_with_graph(vault)
+    try:
+        result = call(server, "related", {"path": "notes/guide.md"})
+        assert result["path"] == "notes/guide.md"
+        assert result["title"] == "Guide"
+        by_path = {n["path"]: n for n in result["notes"]}
+        assert by_path["notes/other.md"]["relation"] == "backlink"
+        assert result["truncated"] is False
+    finally:
+        store.close()
+
+
+def test_related_returns_pointers_not_text(vault: Path) -> None:
+    """Titles + paths only — the whole reason the tool is cheap enough to call freely."""
+    server, store = build_with_graph(vault)
+    try:
+        note = call(server, "related", {"path": "notes/guide.md"})["notes"][0]
+        assert set(note) == {"path", "title", "relation", "hops", "shared_tags", "uri"}
+    finally:
+        store.close()
+
+
+def test_related_reports_dangling_links_for_the_note_asked_about(vault: Path) -> None:
+    server, store = build_with_graph(vault)
+    try:
+        result = call(server, "related", {"path": "notes/other.md"})
+        assert result["unresolved"] == ["Ghost"]
+    finally:
+        store.close()
+
+
+def test_related_stamps_obsidian_uris(vault: Path) -> None:
+    server, store = build_with_graph(vault, vault_name="My Vault")
+    try:
+        note = call(server, "related", {"path": "notes/guide.md"})["notes"][0]
+        assert note["uri"] == obsidian_uri("My Vault", note["path"])
+    finally:
+        store.close()
+
+
+def test_related_refuses_a_path_that_is_not_indexed(vault: Path) -> None:
+    """An unindexed path is a mistake worth naming, not an empty neighbourhood."""
+    server, store = build_with_graph(vault)
+    try:
+        message = call_expecting_error(server, "related", {"path": "notes/nope.md"})
+        assert "not indexed" in message
+    finally:
+        store.close()
+
+
+def test_related_refuses_a_path_that_escapes_the_vault(vault: Path) -> None:
+    """Containment is enforced before any store query, exactly as `open` enforces it."""
+    server, store = build_with_graph(vault)
+    try:
+        message = call_expecting_error(server, "related", {"path": "../outside/external.md"})
+        assert "escapes the vault" in message
+    finally:
+        store.close()
+
+
+def test_related_is_not_registered_without_a_graph_store(vault: Path) -> None:
+    """No graph, no tool: a server must not advertise a capability it cannot serve."""
+    server, _, _, _ = build(vault)
+
+    async def _run() -> list[str]:
+        async with Client(server) as client:
+            return [t.name for t in await client.list_tools()]
+
+    assert "related" not in asyncio.run(_run())
+
+
+def test_related_is_registered_when_a_graph_store_is_given(vault: Path) -> None:
+    server, store = build_with_graph(vault)
+    try:
+
+        async def _run() -> list[str]:
+            async with Client(server) as client:
+                return [t.name for t in await client.list_tools()]
+
+        assert set(asyncio.run(_run())) == {"search", "open", "related"}
+    finally:
+        store.close()
+
+
+def test_search_appends_graph_neighbours_at_no_token_cost(vault: Path) -> None:
+    """Stage 6's append reaches the wire, and `budget_tokens` does not pay for it."""
+    hit = make_hit(path="notes/guide.md", doc_id=document_id(PROJECT, "notes/guide.md"), tokens=7)
+    server, store = build_with_graph(vault, hits=[hit])
+    try:
+        result = call(server, "search", {"query": "guide"})
+        assert [n["path"] for n in result["related"]] == ["notes/other.md"]
+        assert result["total_tokens"] == 7  # the snippet only — pointers are free
+    finally:
+        store.close()
+
+
+def test_search_returns_no_neighbours_without_a_graph_store(vault: Path) -> None:
+    server, _, _, _ = build(vault, hits=[make_hit()])
+    assert call(server, "search", {"query": "q"})["related"] == []
+
+
+def test_compact_mode_still_carries_graph_neighbours(vault: Path) -> None:
+    """Pointers survive the compact re-pack — they were never in the budget to begin with."""
+    hit = make_hit(path="notes/guide.md", doc_id=document_id(PROJECT, "notes/guide.md"))
+    server, store = build_with_graph(vault, hits=[hit])
+    try:
+        result = call(server, "search", {"query": "guide", "mode": "compact"})
+        assert [n["path"] for n in result["related"]] == ["notes/other.md"]
+    finally:
+        store.close()

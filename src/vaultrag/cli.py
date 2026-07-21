@@ -58,7 +58,7 @@ from vaultrag.indexer.pipeline import IngestContext, reindex_vault
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
-from vaultrag.retrieval import load_reranker, rerank_params_for
+from vaultrag.retrieval import graph_params_for, load_reranker, rerank_params_for
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
 
@@ -264,9 +264,10 @@ def mcp(
 
     # By default search reads only Qdrant and open reads only the vault, and neither client
     # connects at construction time, so a read-only server comes up instantly (a down
-    # Qdrant/Ollama surfaces as an actionable per-call error). Two features need more: the
-    # write tools (write_note/…) and --watch both drive the single-file pipeline, so they
-    # open the SQLite manifest/jobs store and reuse the raw embedder for document ingest.
+    # Qdrant/Ollama surfaces as an actionable per-call error). Three features need more: the
+    # write tools (write_note/…) and --watch both drive the single-file pipeline, and graph
+    # expand + `related` read the link graph — all of them want the SQLite store, so it is
+    # opened once and shared (the write/watch paths additionally reuse the raw embedder).
     write_enabled = write and settings.writeback_enabled
     vault_root = vault_path.resolve()
     vector_store: QdrantVectorStore | None = None
@@ -289,9 +290,15 @@ def mcp(
             # configured value, else the vault directory name (a vault named after its folder).
             resolved_vault_name = settings.vault_name or vault_root.name
 
-            # One store, shared by write-back and --watch (SQLite serializes its own writes;
-            # opened check_same_thread=False for exactly this multi-thread reuse).
-            if write_enabled or watch:
+            # One store, shared by write-back, --watch and the graph features (SQLite
+            # serializes its own writes; opened check_same_thread=False for exactly this
+            # multi-thread reuse). The write/watch paths *create* it — they own the manifest
+            # and jobs tables. The graph is only a reader, so it attaches to an existing DB
+            # and never conjures one: a read-only server pointed at a state dir with no
+            # index would otherwise leave an empty database behind, and an index that was
+            # never built has no graph to serve anyway.
+            graph_enabled = settings.graph_expand_enabled and settings.db_path.is_file()
+            if write_enabled or watch or graph_enabled:
                 store = SQLiteMetaStore.from_settings(settings)
 
             writer: NoteWriter | None = None
@@ -325,6 +332,11 @@ def mcp(
                 rerank_params=rerank_params_for(settings),
                 parent_swap_enabled=settings.parent_swap_enabled,
                 parent_max_tokens=settings.parent_max_tokens,
+                # Stage 6 + the `related` tool: one flag drives both, so there is no half-on
+                # state where `related` answers from a graph that search ignores. `store`
+                # can be non-None here purely for write-back/--watch, hence the second term.
+                graph_store=store if settings.graph_expand_enabled else None,
+                graph_params=graph_params_for(settings),
                 vault_name=resolved_vault_name,
                 writer=writer,
             )
@@ -424,6 +436,15 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
             "stays hermetic and fast. A --config overlay setting rerank_mode still wins.",
         ),
     ] = None,
+    graph: Annotated[
+        bool | None,
+        typer.Option(
+            "--graph/--no-graph",
+            help="Retrieval stage 6 (link-graph authority reorder) for this run. Unlike "
+            "--rerank this is NOT pinned: stage 6 is pure SQLite with no model and no "
+            "network, so the gate measures the shipped default. Use --no-graph for the A/B.",
+        ),
+    ] = None,
     record: Annotated[
         bool,
         typer.Option(
@@ -450,6 +471,7 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
         uv run vaultrag eval                          # the gate
         uv run vaultrag eval --golden design          # dogfood the live index
         uv run vaultrag eval --rerank always          # measure the cross-encoder
+        uv run vaultrag eval --no-graph               # A/B retrieval stage 6
         uv run vaultrag eval --config a.yml --config b.yml   # A/B two configs
 
     **The rerank stage is pinned off unless asked for.** The gate inherits every other
@@ -488,6 +510,10 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
         overlays = [("current settings", settings)]
     if rerank is not None:
         overlays = [(label, s.model_copy(update={"rerank_mode": rerank})) for label, s in overlays]
+    if graph is not None:
+        overlays = [
+            (label, s.model_copy(update={"graph_expand_enabled": graph})) for label, s in overlays
+        ]
 
     if project:
         golden_set = replace(golden_set, project_id=project)
