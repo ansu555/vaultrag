@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from blake3 import blake3
 from qdrant_client import QdrantClient
 
 from vaultrag.embedding.base import EmbeddingError, Vector
@@ -295,6 +296,100 @@ def test_write_refuses_path_traversal(
         writer.append_section(path="../../etc/passwd", heading="H", content="x")
     assert exc.value.reason in (RefusalReason.escapes_vault, RefusalReason.outside_write_root)
     assert not (vault.parent / "etc").exists()
+
+
+# ---------------------------------------------------------------------------
+# Markdown-only — writability is not inherited from indexability
+# ---------------------------------------------------------------------------
+# A minimal but genuinely binary PDF: byte 0x80 is invalid UTF-8, so a lossy read
+# followed by a UTF-8 write is unambiguously destructive.
+PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n\x80\x81\xfe\ntrailer\n%%EOF\n"
+
+
+def test_patch_frontmatter_cannot_destroy_a_pdf(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
+) -> None:
+    """The reported two-call kill: 409 leaks the live hash, call two overwrites the file.
+
+    P2 made ``.pdf`` indexable, and the writer inferred writability from that — so a PDF
+    became a legal target for a tool whose every path ends in a UTF-8 text write.
+    """
+    writer = make_writer(vault, store, vector_store)
+    target = vault / "agent-inbox" / "paper.pdf"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(PDF_BYTES)
+
+    # Call 1 — a wrong base_hash must NOT hand back the live hash for a file that could
+    # never be legally written; the suffix gate fires before the optimistic lock.
+    with pytest.raises(WriteRefused) as exc:
+        writer.patch_frontmatter(
+            path="agent-inbox/paper.pdf", updates={"tags": ["x"]}, base_hash=""
+        )
+    assert exc.value.reason is RefusalReason.not_markdown
+
+    # Call 2 — even holding the true hash, the write is refused.
+    with pytest.raises(WriteRefused) as exc:
+        writer.patch_frontmatter(
+            path="agent-inbox/paper.pdf",
+            updates={"tags": ["x"]},
+            base_hash=blake3(PDF_BYTES).hexdigest(),
+        )
+    assert exc.value.reason is RefusalReason.not_markdown
+    assert target.read_bytes() == PDF_BYTES  # byte-identical: nothing was rewritten
+
+
+@pytest.mark.parametrize("name", ["scan.pdf", "diagram.png", "photo.jpeg", "shot.webp"])
+def test_indexable_binaries_are_not_writable(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, name: str
+) -> None:
+    """Every suffix P2 added to the *index* set must stay outside the *write* set."""
+    writer = make_writer(vault, store, vector_store)
+    target = vault / "agent-inbox" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(PDF_BYTES)
+
+    with pytest.raises(WriteRefused) as exc:
+        writer.append_section(path=f"agent-inbox/{name}", heading="H", content="x")
+    assert exc.value.reason is RefusalReason.not_markdown
+    assert target.read_bytes() == PDF_BYTES
+
+
+def test_markdown_stays_writable(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
+) -> None:
+    """The gate narrows writes to markdown — it must not narrow them past markdown."""
+    writer = make_writer(vault, store, vector_store)
+    for rel in ("agent-inbox/a.md", "agent-inbox/b.markdown"):
+        (vault / rel).parent.mkdir(parents=True, exist_ok=True)
+        (vault / rel).write_text("---\ntitle: T\n---\n\n# T\n\nbody\n", encoding="utf-8")
+        result = writer.patch_frontmatter(
+            path=rel,
+            updates={"status": "reviewed"},
+            base_hash=blake3((vault / rel).read_bytes()).hexdigest(),
+        )
+        assert result.action == "patched"
+
+
+def test_undecodable_markdown_is_refused_not_mangled(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
+) -> None:
+    """A .md file holding non-UTF-8 bytes is unfixable by a rewrite — refuse, don't
+    silently commit U+FFFD over the original bytes (the other half of the same defect)."""
+    writer = make_writer(vault, store, vector_store)
+    rel = "agent-inbox/latin1.md"
+    raw = "---\ntitle: Caf\xe9\n---\n\n# Heading\n\nbody\n".encode("latin-1")
+    (vault / rel).parent.mkdir(parents=True, exist_ok=True)
+    (vault / rel).write_bytes(raw)
+
+    with pytest.raises(WriteRefused) as exc:
+        writer.patch_frontmatter(path=rel, updates={"x": 1}, base_hash=blake3(raw).hexdigest())
+    assert exc.value.reason is RefusalReason.not_utf8
+
+    with pytest.raises(WriteRefused) as exc:
+        writer.append_section(path=rel, heading="Heading", content="more")
+    assert exc.value.reason is RefusalReason.not_utf8
+    assert (vault / rel).read_bytes() == raw
+    assert b"\xef\xbf\xbd" not in (vault / rel).read_bytes()  # no U+FFFD committed
 
 
 def test_write_refuses_outside_the_allowlist(

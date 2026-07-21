@@ -14,9 +14,12 @@ what the read side would refuse to serve (repo ``CLAUDE.md`` §6;
    filename / ``.ragignore`` / unsupported suffix / pruned dir) the scanner applies, and
    the content-level :func:`~vaultrag.indexer.secret_guard.scan_for_secrets`. A note whose
    *content* is key material is refused — unwritable **and** (since ``ingest_path`` re-gates)
-   never indexed. Writes are markdown-only, same as the P0 index scope.
-4. **Size + rate caps** — a runaway note or a looping agent is refused, not indexed.
-5. **Optimistic lock** — ``patch_frontmatter`` requires the ``base_hash`` the agent last
+   never indexed.
+4. **Markdown-only** — an *additional*, independently stated gate (``_WRITABLE_SUFFIXES``),
+   because indexable is a strictly wider set than writable: P2 taught the scanner to read
+   PDFs and images, which must not make them targets for a tool that writes UTF-8 text.
+5. **Size + rate caps** — a runaway note or a looping agent is refused, not indexed.
+6. **Optimistic lock** — ``patch_frontmatter`` requires the ``base_hash`` the agent last
    saw; a mismatch is a :class:`~vaultrag.writeback.errors.WriteConflict` carrying the
    current hash + content, so the agent re-reads and retries (no silent overwrite).
    ``append_section`` is additive (it inserts at a section's end), so it takes no lock —
@@ -42,6 +45,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Concatenate, Literal
 
 import structlog
@@ -72,6 +76,15 @@ _MAX_SLUG = 120  # bound a generated filename length
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _Action = Literal["created", "appended", "patched"]
+
+# What a write tool may target, stated outright rather than inferred from what the indexer
+# accepts. The two sets were the same in P1 and are not any more: P2 widened the scanner's
+# `_INDEXABLE_SUFFIXES` with `.pdf` and the image suffixes so those formats could be
+# *converted and read*, which silently made them legal *write* targets — every write path
+# ends in `_commit_write` writing UTF-8 text, so a PDF became a note-shaped overwrite of a
+# binary file. Writability is not a corollary of indexability; deriving one from the other
+# is what let a downstream change reach into this module. See `_contain`.
+_WRITABLE_SUFFIXES = frozenset({".md", ".markdown"})
 
 
 def _observed[**P](
@@ -218,7 +231,7 @@ class NoteWriter:
                 RefusalReason.not_found,
                 f"note not found: {rel!r} — append_section edits an existing note",
             )
-        current = abs_path.read_text(encoding="utf-8", errors="replace")
+        current = _decode_or_refuse(rel, abs_path.read_bytes())
         document = parse_document(path=rel, raw_text=current)
         total = len(current.splitlines())
         span = heading_section(document, heading, total)
@@ -251,10 +264,15 @@ class NoteWriter:
         if not abs_path.is_file():
             raise WriteRefused(RefusalReason.not_found, f"note not found: {rel!r}")
         data = abs_path.read_bytes()
+        # Decoded strictly *before* the lock check: a patch rewrites the whole file, so on
+        # anything not cleanly UTF-8 the old `errors="replace"` read would have committed
+        # U+FFFD over the original bytes — and the conflict path can't hand back content it
+        # cannot faithfully decode either.
+        current_text = _decode_or_refuse(rel, data)
         current_hash = blake3(data).hexdigest()
         if base_hash != current_hash:
-            raise WriteConflict(rel, current_hash, data.decode("utf-8", errors="replace"))
-        existing_meta, body = split_frontmatter(rel, data.decode("utf-8", errors="replace"))
+            raise WriteConflict(rel, current_hash, current_text)
+        existing_meta, body = split_frontmatter(rel, current_text)
         merged: dict[str, Any] = {**existing_meta, **dict(updates)}
         sep = "" if body.startswith("\n") else "\n"
         text = f"{_render_frontmatter(merged)}{sep}{body}"
@@ -292,6 +310,16 @@ class NoteWriter:
                 RefusalReason.gated,
                 f"{rel!r} is not writable ({reason}) — it is excluded from the index, "
                 "so writing it is refused",
+            )
+        # `exclusion_reason` answers "may this be *indexed*", which since P2 includes PDFs
+        # and images. Writing is the narrower question and gets its own answer: every write
+        # path ends in a UTF-8 text write, so accepting a binary target would rewrite it as
+        # markdown. Not a hypothetical — patch_frontmatter destroyed a PDF this way.
+        if Path(rel).suffix.lower() not in _WRITABLE_SUFFIXES:
+            raise WriteRefused(
+                RefusalReason.not_markdown,
+                f"{rel!r} is not a markdown note — write tools produce markdown text and "
+                "would overwrite it; VaultRAG indexes such files but never writes them",
             )
         return rel
 
@@ -411,6 +439,24 @@ class NoteWriter:
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+def _decode_or_refuse(rel: str, data: bytes) -> str:
+    """Decode an edit target's bytes as UTF-8, refusing rather than mangling it.
+
+    ``append_section``/``patch_frontmatter`` read a file, transform the text, and write the
+    whole thing back, so a lossy ``errors="replace"`` read is not a display concern — every
+    undecodable byte is *permanently* replaced by U+FFFD in the file the write commits. A
+    file this cannot decode is one VaultRAG has no safe way to edit; say so instead.
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WriteRefused(
+            RefusalReason.not_utf8,
+            f"{rel!r} is not valid UTF-8 (byte {exc.start}: {exc.reason}) — editing it "
+            "rewrites the whole file, which would replace the undecodable bytes",
+        ) from exc
+
+
 def _render_frontmatter(meta: Mapping[str, Any]) -> str:
     """Serialize a metadata mapping to a ``---``-fenced YAML frontmatter block."""
     body = yaml.safe_dump(dict(meta), sort_keys=False, allow_unicode=True, default_flow_style=False)

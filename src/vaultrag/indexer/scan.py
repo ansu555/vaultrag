@@ -93,6 +93,7 @@ class ScanStats:
     ignored: int = 0  # individual files dropped by .ragignore (dir-level prunes not counted)
     secrets_blocked: int = 0  # dropped by the built-in secret guard (filename or content)
     unsupported: int = 0  # non-markdown (P0 scope)
+    escaped: int = 0  # symlinks whose target resolves outside the vault root
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +172,26 @@ def exclusion_reason(
     return None
 
 
+def escapes_vault(vault_path: Path, rel_path: str) -> bool:
+    """True when ``rel_path`` resolves outside ``vault_path`` — a symlink or ``..`` escape.
+
+    The containment gate :func:`exclusion_reason` cannot be: that one is pure string work
+    on the path, while this needs the filesystem to learn where a link actually points.
+    Both scan and :func:`~vaultrag.indexer.pipeline.ingest_path` call it for the same
+    reason the MCP ``open`` tool has always called its equivalent — ``notes/leak.md`` may
+    be a symlink to ``/outside/private-diary.md``, and indexing it would put out-of-vault
+    content in front of every agent while ``open`` refuses to serve that very file. The
+    index must not be able to hold what the read path won't hand out (``CLAUDE.md`` §6).
+
+    ``os.walk(followlinks=False)`` is not this gate: it stops the walk *descending* a
+    symlinked directory, but symlinked **files** are still listed and read straight
+    through. Both roots are resolved, so a vault that itself lives under a symlink (macOS
+    ``/tmp`` → ``/private/tmp``) is not mistaken for an escape.
+    """
+    root = vault_path.resolve()
+    return not (root / rel_path).resolve().is_relative_to(root)
+
+
 # ---------------------------------------------------------------------------
 # Walk
 # ---------------------------------------------------------------------------
@@ -179,14 +200,16 @@ def walk_vault(
 ) -> tuple[list[ScannedFile], ScanStats]:
     """Walk ``vault_path`` and return (indexable files, stats).
 
-    A file is indexable when it is markdown, not ``.ragignore``-excluded, and passes
-    the built-in secret guard (filename *and* content). Symlinks are not followed, so
-    the walk cannot escape the vault or loop. Emitted paths are vault-relative POSIX.
+    A file is indexable when it is markdown, not ``.ragignore``-excluded, passes the
+    built-in secret guard (filename *and* content), and resolves inside the vault
+    (:func:`escapes_vault`). ``followlinks=False`` stops the walk *descending* symlinked
+    directories — it does not stop symlinked files being listed, which is why containment
+    is checked per file. Emitted paths are vault-relative POSIX.
     """
     vault_path = vault_path.resolve()
     spec = ignore if ignore is not None else load_ignore_spec(vault_path)
     files: list[ScannedFile] = []
-    seen = indexable = ignored = secrets_blocked = unsupported = 0
+    seen = indexable = ignored = secrets_blocked = unsupported = escaped = 0
 
     for dirpath, dirnames, filenames in os.walk(vault_path, followlinks=False):
         rel_dir = os.path.relpath(dirpath, vault_path)
@@ -223,6 +246,14 @@ def walk_vault(
                 unsupported += 1
                 continue
             if reason is not None:
+                continue
+
+            # Containment, before any read: a symlink pointing out of the vault must not
+            # have its bytes hashed, secret-scanned, or indexed. Checked here rather than
+            # inside exclusion_reason because it needs the filesystem, not just the path.
+            if escapes_vault(vault_path, rel):
+                escaped += 1
+                log.warning("scan.escapes_vault", path=rel)
                 continue
 
             # A binary source has no text to scan yet — decoding a PDF's bytes would
@@ -263,6 +294,7 @@ def walk_vault(
         ignored=ignored,
         secrets_blocked=secrets_blocked,
         unsupported=unsupported,
+        escaped=escaped,
     )
     return files, stats
 
@@ -398,6 +430,7 @@ def scan_vault(
         indexable=stats.indexable,
         ignored=stats.ignored,
         secrets_blocked=stats.secrets_blocked,
+        escaped=stats.escaped,
         creates=len(diff.creates),
         updates=len(diff.updates),
         deletes=len(diff.deletes),

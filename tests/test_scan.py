@@ -120,6 +120,50 @@ def test_note_with_embedded_secret_never_indexed(tmp_path: Path) -> None:
     assert stats.secrets_blocked == 3
 
 
+# ---------------------------------------------------------------------------
+# Containment — the walk must not escape the vault
+# ---------------------------------------------------------------------------
+def test_symlinked_file_pointing_outside_vault_is_not_indexed(tmp_path: Path) -> None:
+    """A symlink out of the vault must not be indexed — ``open`` already refuses to serve
+    it, and an index that holds what the read path won't hand out is the escape (§6)."""
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    (outside / "private-diary.md").write_text("# Private\nnot vault content", encoding="utf-8")
+    _write(vault, "real.md", "# Real\nin the vault")
+    (vault / "notes").mkdir(parents=True, exist_ok=True)
+    (vault / "notes" / "leak.md").symlink_to(outside / "private-diary.md")
+
+    files, stats = walk_vault(vault)
+    paths = {f.path for f in files}
+    assert paths == {"real.md"}
+    assert "notes/leak.md" not in paths
+    assert stats.escaped == 1
+
+
+def test_symlinked_dir_pointing_outside_vault_is_not_descended(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    (outside / "secret-notes.md").write_text("# Outside", encoding="utf-8")
+    _write(vault, "real.md", "# Real")
+    (vault / "linked").symlink_to(outside, target_is_directory=True)
+
+    files, _ = walk_vault(vault)
+    assert {f.path for f in files} == {"real.md"}
+
+
+def test_symlink_within_the_vault_is_still_indexed(tmp_path: Path) -> None:
+    """Containment refuses escapes, not symlinks — an in-vault link is legitimate."""
+    vault = tmp_path / "vault"
+    _write(vault, "target.md", "# Target\nreal note")
+    (vault / "alias.md").symlink_to(vault / "target.md")
+
+    files, stats = walk_vault(vault)
+    assert {f.path for f in files} == {"target.md", "alias.md"}
+    assert stats.escaped == 0
+
+
 def test_is_secret_filename_patterns() -> None:
     secret_names = (
         ".env",
