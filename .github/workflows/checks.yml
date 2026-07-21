@@ -1,0 +1,125 @@
+# Lint, types, and the test suite — the merge gate for everything that isn't retrieval
+# quality (that is `eval.yml`, kept separate so a quality regression and a broken build
+# report as different failures).
+#
+# This exists because it didn't: until now `eval.yml` was the only workflow, so ruff, mypy,
+# and 634 tests were advisory — `CLAUDE.md` §5 says "CI should fail on lint errors" and it
+# could not. Four bugs accumulated behind a green checkmark, each in the gap between two
+# individually-correct components (MEMORY.md, 2026-07-21).
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Base install, no `--extra pdf`: mypy must pass for the install people actually run.
+      # `docling` is in pyproject's ignore_missing_imports list precisely so this holds —
+      # without that, mypy resolves docling on a dev box and fails here.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Lint and format are separate steps, not `ruff check --fix`: CI reports, it never
+      # rewrites. A formatting drift should be a red check the author fixes locally.
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Format
+        run: uv run ruff format --check src tests
+
+      - name: Type-check
+        run: uv run mypy src
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Same FastEmbed BM25 artifact `eval.yml` caches — the sparse encoder fetches a small
+      # stopword/stemmer file from HuggingFace on first encode (index/sparse.py).
+      - name: Cache FastEmbed BM25 artifact
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-${{ runner.os }}
+
+      # `-rs` prints the reason for every skip. Deliberate: on a base install the 5
+      # real-conversion PDF/OCR tests skip, and a skip that scrolls past invisibly is how a
+      # suite reports green on code it never ran — the failure mode this workflow exists to
+      # stop. The `formats` job below is what actually runs them.
+      - name: Run the test suite
+        run: uv run pytest -rs
+
+  formats:
+    name: pytest (pdf + ocr extras)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # The `pdf` extra is +79 packages including torch, which is why it is neither the base
+      # install nor folded into the `test` job: it would triple install time for every run to
+      # add 5 tests. Isolated here, it fails loudly on its own and blocks nothing else while
+      # it downloads. Those 5 are the only coverage of *real* Docling conversion and *real*
+      # OCR — P2 Stage 4/6 — so the alternative is not cheaper CI, it is unverified parsers.
+      - name: Install dependencies (with pdf/OCR extras)
+        run: uv sync --frozen --extra pdf
+
+      - name: Cache FastEmbed BM25 artifact
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-${{ runner.os }}
+
+      # The point of this job is that the engines are PRESENT, so assert it before running
+      # anything. Both suites gate their real-conversion tests on `skipif(not available())`:
+      # if the extra silently failed to resolve, those tests would skip and the job would
+      # report green having verified nothing — the same "looked checked, wasn't" shape as the
+      # bugs this workflow was added to catch. A skip is legitimate on a contributor's base
+      # install; here it is a broken job and must fail like one.
+      - name: Assert the engines actually installed
+        run: |
+          uv run python -c "
+          from vaultrag.parsing.pdf import docling_available
+          from vaultrag.parsing.image import rapidocr_available, tesseract_available
+          assert docling_available(), 'docling missing — the pdf extra did not install'
+          assert rapidocr_available() or tesseract_available(), 'no OCR engine available'
+          print('docling + OCR present')
+          "
+
+      # Only the two format suites: the rest is already covered by `test` on the base install,
+      # and re-running 634 tests against a heavier dependency set buys nothing.
+      - name: Run the format suites
+        run: uv run pytest tests/test_pdf.py tests/test_image.py -rs

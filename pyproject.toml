@@ -79,8 +79,15 @@ plugins = ["pydantic.mypy"]
 
 # Reranker ML stack ships no type information (loaded lazily in retrieval/rerank.py).
 # `lzstring` (Excalidraw `compressed-json`, P2 Stage 5) ships none either.
+#
+# `docling` is here for a different reason: it is an *optional extra*, imported lazily in
+# parsing/pdf.py, so on a base install (`uv sync` with no `--extra pdf`) mypy cannot resolve
+# it and fails — which is exactly what CI runs. This suppresses only the *missing* case; when
+# the extra is installed mypy still type-checks against the real package.
 [[tool.mypy.overrides]]
 module = [
+    "docling",
+    "docling.*",
     "onnxruntime",
     "onnxruntime.*",
     "rapidocr",
