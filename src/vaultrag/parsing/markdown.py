@@ -38,6 +38,7 @@ from vaultrag.parsing.frontmatter import (
     frontmatter_line_offset,
     split_frontmatter,
 )
+from vaultrag.parsing.mermaid import extract_diagram_links, is_mermaid_lang
 from vaultrag.parsing.obsidian import (
     expand_nested_tags,
     extract_obsidian_features,
@@ -144,7 +145,13 @@ def _build_blocks(
     def collect(block: Block) -> None:
         blocks.append(block)
         if block.type == BlockType.code:
-            return  # code contents aren't prose; never mined for links/tags/fields
+            # Code contents aren't prose; never mined for links/tags/fields. A Mermaid
+            # fence is the one exception, and only for *diagram* edges (P2 Stage 5): its
+            # node labels are graph data a human drew, while a `[[...]]` or `#tag` that
+            # happens to sit in code is still a code literal, not a link.
+            if is_mermaid_lang(block.lang):
+                links.extend(extract_diagram_links(block.text))
+            return
         b_links, b_tags, b_dv = extract_obsidian_features(block.text)
         links.extend(b_links)
         tag_pool.extend(b_tags)

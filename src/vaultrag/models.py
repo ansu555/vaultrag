@@ -81,6 +81,11 @@ class LinkKind(StrEnum):
 
     wikilink = "wikilink"  # [[Note]] / [[Note#Heading]] / [[Note#^block]]
     embed = "embed"  # ![[...]] transclusion — target indexed once, never duplicated
+    # A node label drawn in a diagram (Mermaid fence / Excalidraw scene), P2 Stage 5.
+    # Anchored on the *containing* note, not node-to-node: `links.src_doc` is the
+    # document whose edges `replace_links` owns, so an edge sourced anywhere else
+    # could never be revoked when that note changes (parsing/mermaid.py).
+    diagram = "diagram"
 
 
 # ---------------------------------------------------------------------------

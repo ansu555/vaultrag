@@ -169,6 +169,15 @@ def reindex(
     # here rather than leaving retrieval to quietly serve a fraction of the vault.
     if drift is not None:
         typer.echo(f"warning: {drift.describe()} — re-run with --force to rebuild", err=True)
+    # Same shape as the drift warning, different cause: here the manifest is *correct*
+    # and still incomplete, because a hash-equal file is skipped even when today's
+    # parser would extract more from it than the parser that indexed it did.
+    if stats.stale_parser:
+        typer.echo(
+            "warning: this index was built by an older parser — re-run with --force to "
+            "pick up newly-extracted data (e.g. Mermaid diagram edges, Excalidraw scenes)",
+            err=True,
+        )
     if stats.failed:
         raise typer.Exit(code=1)
 
