@@ -35,8 +35,20 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   graph identity beyond its path, while a frontmatter-only note carries title, tags and aliases —
   it is unretrievable *by search* but is not a ghost. The defensible rule is "retrievability and
   graph identity are different questions"; the cosmetic wart (a 0-chunk row) is the price of
-  keeping stub notes linkable. **Needs a vault decision before any code moves** — proposed as
-  `../Rag/agent-inbox/zero-chunk-docs-are-graph-nodes-not-ghosts.md` (unwritten; `CLAUDE.md` §1).
+  keeping stub notes linkable. **Needs a vault decision before any code moves** — written up as
+  `../Rag/agent-inbox/zero-chunk-docs-are-graph-nodes-not-ghosts.md` (status `proposed`; Anik to
+  rule, and it should graduate to `decisions/` if accepted, since the audit already re-opened
+  this once and a future session otherwise will again).
+- **`state/vaultrag.db` is ALREADY UNTRACKED — the handoff item below is stale, ignore it.**
+  Several session-log entries (including the newest, item (c)) say it "is still tracked in git and
+  still needs `git rm --cached` from Anik", escalating to "5 sessions running". **It was done** in
+  `a082466` / PR #9 on 2026-07-21: `git ls-files --error-unmatch state/vaultrag.db` → *"did not
+  match any file(s) known to git"*. Those log entries are left as written (a log records what was
+  true then), but **nothing is outstanding here**. Worth a beat: that claim got repeated forward
+  across sessions — and once by me, out loud, before checking — purely because it was in the
+  handoff. **Verify a carried-forward TODO before re-reporting it**; a stale "still broken" costs
+  a real session's attention and, said confidently enough, invites someone to "fix" what is
+  already fixed.
 - **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
   `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
   module imports `prometheus_client` — interfaces over vendors) + instrumentation in
