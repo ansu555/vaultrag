@@ -24,6 +24,7 @@ import typer
 
 from vaultrag import __version__
 from vaultrag.config import RerankMode, Settings, load_settings
+from vaultrag.consistency import check_drift
 from vaultrag.embedding.base import EmbeddingError
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.embedding.ollama import OllamaEmbedder
@@ -97,8 +98,21 @@ def reindex(
     vault: Annotated[
         Path | None, typer.Option("--vault", help="Path to the vault to index.")
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Re-ingest every file, ignoring the manifest — repairs a drifted vector store.",
+        ),
+    ] = False,
 ) -> None:
-    """Build the index from a vault (scan → parse → chunk → embed → upsert)."""
+    """Build the index from a vault (scan → parse → chunk → embed → upsert).
+
+    Idempotent by default: a file whose hash matches the manifest is skipped. Use
+    ``--force`` when the vector store has lost data the manifest still records — an
+    ordinary run cannot detect that and will report the missing documents as
+    ``unchanged``. A drift warning is printed after every run.
+    """
     settings = load_settings()
     configure_logging(settings.log_level)
     log = get_logger("vaultrag.cli")
@@ -123,7 +137,9 @@ def reindex(
             store=store,
             vector_store=vector_store,
             embedder=embedder,
+            force=force,
         )
+        drift = check_drift(project_id, store=store, vector_store=vector_store)
     except (VectorStoreError, EmbeddingError, OSError, sqlite3.Error) as exc:
         log.error("reindex.failed", project=project_id, vault=str(vault_path), error=str(exc))
         typer.echo(f"reindex failed: {exc}", err=True)
@@ -141,6 +157,11 @@ def reindex(
         f"→{stats.renamed} ={stats.unchanged} !{stats.failed} "
         f"({stats.chunks_written} chunks{graph}, {stats.elapsed_ms:.0f} ms)"
     )
+    # The drift this catches is *stable*: re-running plain reindex never converges,
+    # because the skip decision reads the manifest the drift is invisible to. Say so
+    # here rather than leaving retrieval to quietly serve a fraction of the vault.
+    if drift is not None:
+        typer.echo(f"warning: {drift.describe()} — re-run with --force to rebuild", err=True)
     if stats.failed:
         raise typer.Exit(code=1)
 

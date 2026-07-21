@@ -35,6 +35,7 @@ from pathlib import Path
 from qdrant_client import QdrantClient
 
 from vaultrag.config import RerankMode, Settings
+from vaultrag.consistency import DriftError, check_drift
 from vaultrag.embedding.base import Embedder, EmbeddingError
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.embedding.ollama import OllamaEmbedder
@@ -299,13 +300,28 @@ def live_stack(golden: GoldenSet, settings: Settings) -> Iterator[SearchStack]:
 
     Indexes nothing: it scores whatever ``vaultrag reindex`` last put there, which is the
     honest thing to measure when the question is "how is retrieval doing on my vault".
+
+    Refuses to run against a **drifted** index. ``replay_stack`` already guards its own
+    version of this (it raises rather than score a partial index when the fixture went
+    stale); live mode had the same failure mode and no guard. A vector store holding a
+    fraction of the manifest still answers every query plausibly, so the run would
+    produce a real-looking number measured on part of the vault — the silent-green shape
+    this repo has been bitten by repeatedly. See :mod:`vaultrag.consistency`.
     """
     vector_store = QdrantVectorStore.from_settings(settings)
     embedder = OllamaEmbedder.from_settings(settings)
     # The real state DB, read-only in practice — the live graph belongs to the live index,
-    # so dogfooding measures the same stage 6 the served MCP server runs.
-    store = SQLiteMetaStore.from_settings(settings) if settings.graph_expand_enabled else None
+    # so dogfooding measures the same stage 6 the served MCP server runs. Opened
+    # unconditionally because the drift check needs it even when stage 6 is off.
+    store = SQLiteMetaStore.from_settings(settings)
     try:
+        drift = check_drift(golden.project_id, store=store, vector_store=vector_store)
+        if drift is not None:
+            raise DriftError(
+                f"{drift.describe()}. Refusing to score a drifted index — the number would "
+                f"be measured on part of the vault. Repair with: vaultrag reindex --force "
+                f"--project {drift.project_id}"
+            )
         yield SearchStack(
             project_id=golden.project_id,
             vector_store=vector_store,
@@ -313,15 +329,14 @@ def live_stack(golden: GoldenSet, settings: Settings) -> Iterator[SearchStack]:
             sparse=Bm25Embedder(),
             reranker=_maybe_reranker(settings),
             rerank_params=_rerank_params(settings),
-            graph_store=store,
+            graph_store=store if settings.graph_expand_enabled else None,
             graph_params=graph_params_for(settings),
             k=settings.default_top_k,
         )
     finally:
         embedder.close()
         vector_store.close()
-        if store is not None:
-            store.close()
+        store.close()
 
 
 def _rerank_params(settings: Settings) -> RerankParams:

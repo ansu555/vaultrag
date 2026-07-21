@@ -157,12 +157,23 @@ def reindex_vault(
     store: MetaStore,
     vector_store: VectorStore,
     embedder: Embedder,
+    force: bool = False,
 ) -> ReindexStats:
     """Boot-reconcile the index against a vault. Safe to re-run at any time.
 
     Registers the project, ensures the Qdrant collection exists, scans the vault against
     the stored manifest, then processes creates/updates/renames/deletes. Nothing changed
     means zero embedder/Qdrant calls (Step 3's diff is empty; Step 6's cache is untouched).
+
+    ``force`` re-ingests every file regardless of its hash — the documented DR path
+    ("the index is derived; the vault is truth", CLAUDE.md §6), which the default run
+    cannot provide. Ordinary reindex is idempotent against the **manifest** and never
+    consults the vector store, so when Qdrant loses data that SQLite still records
+    (volume wiped, collection recreated, server-vs-``:memory:`` mix-up) it reports the
+    missing documents as ``unchanged`` and skips exactly what needs rebuilding. Forcing
+    is not free — every chunk is re-upserted — but it is cheaper than it looks, because
+    the embed cache is keyed ``(model, dims, chunk_hash)`` and survives, so unchanged
+    text is re-upserted without being re-embedded.
     """
     t0 = time.perf_counter()
     vault_path = vault_path.resolve()
@@ -176,7 +187,7 @@ def reindex_vault(
         embedder=embedder,
     )
 
-    diff, _scan_stats = scan_vault(vault_path, store.document_manifest(project_id))
+    diff, _scan_stats = scan_vault(vault_path, store.document_manifest(project_id), force=force)
 
     created = updated = renamed = deleted = failed = 0
     chunks_written = 0

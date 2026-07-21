@@ -402,6 +402,17 @@ class SQLiteMetaStore:
         with self._conn:
             self._conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
 
+    def chunk_count(self, project_id: str) -> int:
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM chunks c JOIN documents d ON c.doc_id = d.id
+            WHERE d.project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+        return int(row["n"])
+
     # --- tags -----------------------------------------------------------------
     def set_tags(self, project_id: str, doc_id: str, tags: Iterable[str]) -> None:
         with self._conn:
