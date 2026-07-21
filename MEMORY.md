@@ -21,11 +21,22 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   **line anchors unshifted**; `write_note` renders its H1 and `append_section` can now target the
   note it just created. **645 tests, exit 0.** Branch protection confirmed live via the API:
   4 required checks, `strict`, 0 approvals, `enforce_admins=false`.
-- **Still open from that audit (item 5, low, never assigned):** **zero-chunk ghost docs.**
-  Reproduced live — `empty.md` and a frontmatter-only note each create a `documents` row with
-  **0 chunks** while P2 Stage 6 deliberately treats a textless *image* as a skip/evict for the
-  stated reason that a zero-block row is unretrievable. The two paths still disagree; pick one
-  rule and apply it to both.
+- **Audit item 5 (zero-chunk ghost docs) — INVESTIGATED, and the obvious fix is a REGRESSION.
+  Do not "make the two paths agree".** The report is right about the facts: `empty.md` and a
+  frontmatter-only note each create a `documents` row with **0 chunks**, while Stage 6 evicts a
+  textless *image* on the stated reason that a zero-block row is unretrievable. But applying the
+  image rule to markdown **breaks the link graph**, measured: a frontmatter-only stub note is a
+  **fully live graph node today** — it resolves `[[Stub Note]]` *and* its alias `[[Stubby]]`, and
+  carries its tags. Evicting it would cascade `doc_keys` + `tags` away (`sqlite/DDL`, and
+  `sqlite.py:340` says so outright: "links pointing here go `dst_doc=NULL`"), turning both
+  wikilinks **DANGLING** and dropping the tag. Empty-stub-as-link-target is routine Obsidian
+  practice, so this would silently degrade real vaults.
+  **The two paths differ for a real reason, and that is the answer:** a textless image has no
+  graph identity beyond its path, while a frontmatter-only note carries title, tags and aliases —
+  it is unretrievable *by search* but is not a ghost. The defensible rule is "retrievability and
+  graph identity are different questions"; the cosmetic wart (a 0-chunk row) is the price of
+  keeping stub notes linkable. **Needs a vault decision before any code moves** — proposed as
+  `../Rag/agent-inbox/zero-chunk-docs-are-graph-nodes-not-ghosts.md` (unwritten; `CLAUDE.md` §1).
 - **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
   `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
   module imports `prometheus_client` — interfaces over vendors) + instrumentation in
