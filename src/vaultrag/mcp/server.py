@@ -64,6 +64,7 @@ from vaultrag.indexer.scan import (
     ExclusionReason,
     exclusion_reason,
     is_binary_source,
+    is_image_source,
     load_ignore_spec,
 )
 from vaultrag.indexer.secret_guard import scan_for_secrets
@@ -127,7 +128,7 @@ _EXCLUSION_MESSAGES: dict[ExclusionReason, str] = {
     "pruned-dir": "is under a directory the indexer never scans (.git/.obsidian/.trash/…)",
     "secret-filename": "is blocked by the built-in secret guard",
     "ragignore": "is excluded by .ragignore and cannot be opened",
-    "unsupported": "is not an indexable file (markdown, Excalidraw, or PDF)",
+    "unsupported": "is not an indexable file (markdown, Excalidraw, PDF, or image)",
 }
 
 
@@ -780,6 +781,11 @@ def _read_note(vault_root: Path, path: str) -> tuple[str, str]:
     # handing an agent that is worse than a refusal it can act on. `search` still
     # returns its chunks (with a `page`), which is the way in — so say that, rather
     # than pretending the path doesn't exist.
+    if is_image_source(rel):
+        raise ToolError(
+            f"{rel!r} is an image — `open` serves text only. Any text it contains was "
+            f"OCR'd at index time and is searchable via `search`."
+        )
     if is_binary_source(rel):
         raise ToolError(
             f"{rel!r} is a PDF — `open` serves text only. Its extracted text is "

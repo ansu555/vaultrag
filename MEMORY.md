@@ -8,8 +8,49 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 + 4 + 5 DONE, and the index-drift bug is FIXED.
-  Next: Stage 6 (OCR / image text), unblocked.**
+- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 + 4 + 5 + 6 DONE, and the index-drift bug is
+  FIXED. Next: Stage 7 (Prometheus `/metrics`, standalone exporter) — the last P2 stage.**
+- **Stage 6 (OCR / image text) DONE 2026-07-21, and Stages 1-5 were re-verified first.** New
+  `parsing/image.py`: `OcrEngine` protocol with **RapidOCR primary** (it ships inside the Docling
+  stack Stage 4 already installs, so the `pdf` extra buys OCR for free — no new dependency) and a
+  **Tesseract fallback**; `ocr_enabled` (default on, but that only *permits* OCR — with no engine
+  installed images skip cleanly, so the base install is untouched). **`PARSER_VERSION` → 4.**
+  Images are `_BINARY_SUFFIXES`, so their secret gate runs on the **converted** text, as Stage 4
+  established. **The design calls that mattered:** (1) **an image with no text raises `NoTextFound`
+  rather than indexing an empty document** — a zero-block row is unretrievable and shows an agent a
+  "result" with no content; it is a *skip*, and on a previously-indexed image an **evict** (text
+  edited out must leave the index); (2) **`_parser_for` is format-aware** — Docling and an OCR
+  engine install independently, so "is a parser available" had to mean "for *this* format", else
+  every image becomes a dead job the moment the `pdf` extra happens to be present; (3)
+  recognitions below **0.5 confidence are dropped** (OCR garbage never matches a query but does
+  consume a chunk and pollute BM25); (4) lines are emitted in **banded-y-then-x reading order**,
+  since detection order follows the model's box ranking, not the page layout; (5) `open` refuses
+  images like PDFs. **The VLM caption pass stays off *and unbuilt*** (GPU/money, principle #2) —
+  no dead knob. **Verified live end-to-end:** OCR'd image ranked **#1** for both a semantic query
+  and the bare identifier `MER-1422` (the BM25 path), blank image left no ghost document, `open`
+  refused it, and md/excalidraw/pdf were unaffected. **598 tests** (+21), ruff, mypy (56).
+  Gate unmoved 1.000/0.892/0.920.
+- **THREE BUGS FOUND AND FIXED while verifying Stages 1-5 (2026-07-21).** The stages were *not*
+  clean, though tests, lint, mypy and the gate were all green before I started:
+  **(1) SECURITY — the secret guard missed every underscore-prefixed credential name.** A leading
+  `\b` in `_ASSIGNMENT_RE` cannot match inside `AWS_SECRET_ACCESS_KEY` / `GITHUB_TOKEN` /
+  `DB_PASSWORD` / `MY_API_KEY`, because `_` **is** a word character — so the guard caught the bare
+  `password=` form nobody pastes and missed the env-var form everybody does. Pre-existing since
+  P0 and **not OCR-specific** (a markdown note leaked the same way); it was masked because planted
+  secrets in tests/vaults sat in files whose *filename* rule fired first. Fixed by replacing the
+  leading `\b` with `(?<![A-Za-z0-9])`, so `_`/`-` read as boundaries and letters/digits do not.
+  **Zero false positives across `../Rag` (58), the eval corpus (27) and `src` (56).**
+  **(2) Mermaid: an arrow inside a quoted label was parsed as a connector.** `A["draft --> live"]`
+  truncated the node's real name and leaked a garbage edge (`B mapping ]`, unbalanced bracket) —
+  exactly the `unresolved_links` noise the placeholder filter exists to prevent. The module
+  already masked *pipe* labels before splitting; quoted spans (Mermaid's documented escape for
+  grammar characters) were not. Fixed by masking quotes **first**, which also fixed a pipe inside
+  a node label.
+  **(3) A textless image failed the *reconcile* path while `ingest_path` skipped it** — found only
+  by running a real vault, since the unit test used the primitive. One blank screenshot made
+  `reindex` report `failed: 1` and park a dead job. `NoTextFound` now joins `SecretBlocked` on the
+  existing `_WITHHELD` sentinel (counts as `skipped`). **Pinned by a test that uses `reindex_vault`
+  specifically** — the two paths need separate coverage.
 - **Stage 5 (Excalidraw + Mermaid) DONE 2026-07-21.** Mermaid fences now feed `diagram` edges into
   Stage 2's `links` table and Excalidraw scenes are parsed + searchable. **The design call that
   mattered: diagram edges are anchored on the *containing note*, not node-to-node.** `A --> B` in
@@ -307,6 +348,70 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 — Stages 1-5 re-verified (3 bugs found + fixed), then P2 Stage 6: OCR / image text
+- **Did:** Anik: *"check and test upto stage 5 in p2 if everything is working perfectly with no
+  bugs … if any problem or bugs found solve it then go to next stage and test that stage too"*.
+  Re-ran the whole stack, found **three real bugs in "done" stages**, fixed them, then built and
+  verified Stage 6 of `../Rag/projects/vaultrag/p2-step-plan.md`.
+- **The lesson worth keeping: green CI did not mean correct.** Before I touched anything, 576
+  tests / ruff / mypy / the gate were all green and the live vault reindexed clean. All three bugs
+  were found by *exercising* the features against inputs the tests did not contain — a vault with
+  real diagrams and images, not fixtures written alongside the code they test.
+- **Bug 1 (security, pre-existing since P0): the secret guard missed `AWS_SECRET_ACCESS_KEY=…`.**
+  `\b` cannot match inside `AWS_SECRET_ACCESS_KEY` — `_` is a word character — so the
+  keyword-anchored rule caught `password=` and missed every real env-var name (`GITHUB_TOKEN`,
+  `DB_PASSWORD`, `MY_API_KEY`). Not OCR-specific: a plain markdown note leaked identically. It hid
+  because planted secrets lived in files like `secrets-note.md`, where the **filename** rule fired
+  first and masked the content rule's failure. Fix: `(?<![A-Za-z0-9])` instead of the leading `\b`.
+  Checked both directions — 8 realistic credential forms now fire, 7 prose/placeholder forms stay
+  quiet, and a sweep of `../Rag` + the eval corpus + `src` flagged **nothing** (a false positive
+  here silently drops a real note, so that half mattered as much).
+- **Bug 2 (Stage 5): a quoted Mermaid label containing an arrow was split as a connector.**
+  `A["draft --> live"] --> B` truncated the node name and emitted a junk edge with an unbalanced
+  bracket. `parsing/mermaid.py` already masked **pipe** labels before splitting; quoted spans —
+  Mermaid's own escape hatch for grammar characters — were not. Masking quotes *first* fixes it
+  and, as a bonus, fixes a pipe inside a node label (`A["stdout|stderr"]`).
+- **Bug 3 (Stage 6, found live): a blank image failed the reconcile instead of skipping.** My unit
+  test used `ingest_path`, which caught `NoTextFound`; `reindex_vault` runs a **different** path
+  and did not, so one blank screenshot produced `failed: 1` + a dead job. This is Stage 4's "a
+  skip is not a failure" rule recurring, and the fix reuses the `_WITHHELD` sentinel already built
+  for `SecretBlocked`. **The regression test uses `reindex_vault` on purpose.**
+- **Stage 6 as built.** RapidOCR is **already inside the Docling stack** Stage 4 installs, so OCR
+  cost zero new dependencies; Tesseract is the fallback, both behind an `OcrEngine` protocol.
+  `PARSER_VERSION` → **4** (the one-line habit from Stage 5 — otherwise every indexed vault
+  silently never gains image text). Four judgment calls are in the Phase bullet; the one I would
+  re-derive is **`_parser_for` being format-aware**: testing "any parser loaded" would have made
+  every image a dead job on exactly the installs that have the `pdf` extra.
+- **Verified live, not only on fixtures:** a scratch vault carrying all five source types
+  (md + wikilinks, mermaid, `.excalidraw`, PDF, images) through real Qdrant + real MCP stdio. The
+  OCR'd image ranked **#1** for a semantic query *and* for the bare identifier `MER-1422`; a
+  screenshot of an `AWS_SECRET_ACCESS_KEY` was blocked by the **content** gate (renamed to an
+  innocuous filename first, so the filename rule could not mask it again — the same masking that
+  hid bug 1); the blank image left no ghost document; `open` refused images; md/excalidraw/pdf
+  and `related` were unaffected.
+- **Files:** `parsing/image.py` (new), `parsing/__init__.py` (`PARSER_VERSION` 4),
+  `parsing/mermaid.py` (quote masking), `indexer/secret_guard.py` (boundary fix),
+  `indexer/scan.py` (`IMAGE_SUFFIXES`, `is_image_source`), `indexer/pipeline.py` (`image_parser`,
+  `_parser_for`, `SkipReason.no_text`, `NoTextFound` → `_WITHHELD`, per-format `_drop_unparseable`),
+  `config.py` (`ocr_enabled`), `cli.py`, `mcp/server.py` (`open` refuses images), `pyproject.toml`
+  (mypy overrides). Tests: `tests/test_image.py` (new, 18) + 2 in `test_scan.py` + 2 in
+  `test_diagrams.py` + fixtures `diagram-shot.png` / `blank-shot.png`; `test_scan.py`'s fixture
+  swapped its "unsupported" `.png` for a `.zip` (since Stage 6 makes `.png` supported).
+- **Green: 598 tests, ruff, ruff format, mypy (56). Gate unmoved: 1.000 / 0.892 / 0.920.**
+  Live `vaultrag-design` force-reindexed onto parser 4 (58 docs / 187 chunks / **1.7 s**, no
+  re-embedding — the `(model,dims,chunk_hash)` cache absorbs it).
+- **Next / handoff:** **Stage 7 — Prometheus `/metrics`**, the last P2 stage. Things to know:
+  (a) there is still **no `serve`/FastAPI surface**, so it ships **standalone** via
+  `prometheus_client.start_http_server`, not mounted on HTTP (the plan's Decision 5, still open);
+  (b) **bump `PARSER_VERSION` only when the parser extracts something new** — Stage 7 observes,
+  it does not parse, so it should *not* bump; (c) `state/vaultrag.db` **is still tracked in git**
+  and still needs `git rm --cached state/vaultrag.db` from Anik — `.gitignore` is fixed but does
+  not apply to already-tracked files; (d) the **MCP server still does not check drift at startup**,
+  unchanged since Stage 4; (e) CI installs no extras, so the 2 real-OCR tests and the 3 Docling
+  tests skip there — run `uv sync --extra pdf` locally before claiming those paths are green;
+  (f) the secret-guard fix is worth a vault note — the *filename rule masking a content-rule
+  failure* is a general testing trap, not a one-off.
 
 ### 2026-07-21 — P2 Stage 5: Excalidraw + Mermaid diagram extraction
 - **Did:** Anik: *"implement next stage and completely implement, if any bug or anything comes

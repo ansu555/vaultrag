@@ -32,6 +32,7 @@ from pathspec import PathSpec
 from pathspec.patterns.gitignore.spec import GitIgnoreSpecPattern
 
 from vaultrag.indexer.secret_guard import is_secret_filename, scan_for_secrets
+from vaultrag.parsing.image import IMAGE_SUFFIXES
 
 log = structlog.get_logger(__name__)
 
@@ -45,8 +46,8 @@ log = structlog.get_logger(__name__)
 _TEXT_SUFFIXES = frozenset({".md", ".markdown", ".excalidraw"})
 # Formats whose *bytes* are not the indexable text: they need a converter before any
 # text exists, so the walk cannot content-scan them and the pipeline must route them to
-# a format parser. PDFs land here in P2 Stage 4.
-_BINARY_SUFFIXES = frozenset({".pdf"})
+# a format parser. PDFs land here in P2 Stage 4, images (OCR) in P2 Stage 6.
+_BINARY_SUFFIXES = frozenset({".pdf"}) | IMAGE_SUFFIXES
 _INDEXABLE_SUFFIXES = _TEXT_SUFFIXES | _BINARY_SUFFIXES
 
 # Directory names always pruned from the walk regardless of .ragignore, so we never
@@ -407,12 +408,17 @@ def scan_vault(
 
 
 def iter_indexable_suffixes() -> Iterable[str]:
-    """The file suffixes scan currently treats as indexable (markdown + PDF)."""
+    """The file suffixes scan currently treats as indexable (markdown + PDF + images)."""
     return _INDEXABLE_SUFFIXES
 
 
+def is_image_source(rel_path: str) -> bool:
+    """True when a path is a raster image, i.e. OCR is what turns it into text."""
+    return Path(rel_path).suffix.lower() in IMAGE_SUFFIXES
+
+
 def is_binary_source(rel_path: str) -> bool:
-    """True when a path's bytes are not its indexable text (today: PDFs).
+    """True when a path's bytes are not its indexable text (PDFs and images).
 
     Two things branch on this and must agree, which is why it lives beside
     :func:`exclusion_reason` rather than in either caller: the walk cannot run the

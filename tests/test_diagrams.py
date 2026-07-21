@@ -132,6 +132,35 @@ def test_every_node_shape_unwraps_to_its_label() -> None:
     ]
 
 
+def test_an_arrow_inside_a_quoted_label_is_not_a_connector() -> None:
+    """Quoting is Mermaid's escape hatch, so a label may legitimately contain an arrow.
+
+    Left unmasked the label splits: the node keeps only the text before the arrow and
+    the remainder leaks out as an edge to a target nobody drew (``B mapping ]``) — the
+    same ``unresolved_links`` noise the placeholder filter exists to prevent.
+    """
+    assert targets('flowchart TD\n  A["draft --> live"] --> B[Archive]') == [
+        "draft --> live",
+        "Archive",
+    ]
+    assert targets('flowchart TD\n  A[Gateway] -- "a --> b" --> B[Store]') == [
+        "Gateway",
+        "Store",
+    ]
+    assert targets('flowchart TD\n  A["x --> y"] --> B["y --> z"]') == [
+        "x --> y",
+        "y --> z",
+    ]
+
+
+def test_a_pipe_inside_a_quoted_label_is_not_an_edge_label() -> None:
+    """Masking quotes *before* the pipe form is what keeps this label whole."""
+    assert targets('flowchart TD\n  A["stdout|stderr"] --> B[Log]') == [
+        "stdout|stderr",
+        "Log",
+    ]
+
+
 def test_a_label_ending_in_a_paren_survives() -> None:
     """Closing brackets are matched by *length*, not stripped greedily."""
     assert targets("flowchart TD\n  A[Gateway (v2)] --> B[Store (cold)]") == [

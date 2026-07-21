@@ -103,9 +103,15 @@ _SECRET_KEYWORD = (
     r"(?:api[_-]?key|secret[_-]?key|secret|token|passwd|password|"
     r"access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token)"
 )
+# The opening boundary is `(?<![A-Za-z0-9])`, NOT `\b`. `_` is a word character, so a
+# leading `\b` does not match inside `AWS_SECRET_ACCESS_KEY` / `GITHUB_TOKEN` /
+# `DB_PASSWORD` — i.e. it missed the single most common way a real credential is
+# written, while catching the bare `password=` form nobody pastes. Underscore and hyphen
+# are name separators here, so they must read as boundaries; letters and digits still
+# must not, which is what keeps `not_a_token_value` from anchoring a match.
 _ASSIGNMENT_RE = re.compile(
     rf"""(?ix)
-    \b{_SECRET_KEYWORD}\b        # a secret-ish name
+    (?<![A-Za-z0-9]){_SECRET_KEYWORD}\b   # a secret-ish name, `_`/`-` count as boundaries
     \s*[:=]\s*                   # : or =
     ['"]?                        # optional opening quote
     (?P<val>[A-Za-z0-9+/_\-]{{20,}})   # the candidate value
