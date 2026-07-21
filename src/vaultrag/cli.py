@@ -59,6 +59,7 @@ from vaultrag.indexer.pipeline import IngestContext, reindex_vault
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
+from vaultrag.parsing.pdf import load_pdf_parser
 from vaultrag.retrieval import graph_params_for, load_reranker, rerank_params_for
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
@@ -138,6 +139,9 @@ def reindex(
             vector_store=vector_store,
             embedder=embedder,
             force=force,
+            # Composition root owns the optional parser: None (no `pdf` extra) means
+            # PDFs are skipped, not failed.
+            pdf_parser=load_pdf_parser(),
         )
         drift = check_drift(project_id, store=store, vector_store=vector_store)
     except (VectorStoreError, EmbeddingError, OSError, sqlite3.Error) as exc:
@@ -152,9 +156,12 @@ def reindex(
     # The graph backfill is silent when there's nothing to do (the steady state), but
     # worth surfacing on the one run that upgrades a pre-P2-Stage-2 index.
     graph = f", {stats.graph_backfilled} graph backfilled" if stats.graph_backfilled else ""
+    # Surfaced only when non-zero: on a markdown-only vault this is always 0 and would
+    # be noise, but "your PDFs were skipped" must never be silent.
+    skipped = f" ?{stats.skipped}" if stats.skipped else ""
     typer.echo(
         f"reindex complete: +{stats.created} ~{stats.updated} -{stats.deleted} "
-        f"→{stats.renamed} ={stats.unchanged} !{stats.failed} "
+        f"→{stats.renamed} ={stats.unchanged} !{stats.failed}{skipped} "
         f"({stats.chunks_written} chunks{graph}, {stats.elapsed_ms:.0f} ms)"
     )
     # The drift this catches is *stable*: re-running plain reindex never converges,
@@ -217,6 +224,7 @@ def watch(
             store=store,
             vector_store=vector_store,
             embedder=embedder,
+            pdf_parser=load_pdf_parser(),
         )
         watcher = VaultWatcher(
             ctx,
@@ -322,6 +330,10 @@ def mcp(
             if write_enabled or watch or graph_enabled:
                 store = SQLiteMetaStore.from_settings(settings)
 
+            # Only the paths that *ingest* need it (write-back, --watch); a read-only
+            # server never converts anything, so don't pay for the parser it won't use.
+            pdf_parser = load_pdf_parser() if (write_enabled or watch) else None
+
             writer: NoteWriter | None = None
             if write_enabled:
                 assert store is not None  # opened just above when write_enabled
@@ -332,6 +344,7 @@ def mcp(
                         store=store,
                         vector_store=vector_store,
                         embedder=embedder,
+                        pdf_parser=pdf_parser,
                     ),
                     author=settings.writeback_author,
                     allow_roots=settings.writeback_allow_roots,
@@ -372,6 +385,7 @@ def mcp(
                         store=store,
                         vector_store=vector_store,
                         embedder=embedder,
+                        pdf_parser=pdf_parser,
                     ),
                     debounce_seconds=settings.watch_debounce_seconds,
                     workers=settings.watch_workers,

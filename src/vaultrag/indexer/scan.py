@@ -35,10 +35,14 @@ from vaultrag.indexer.secret_guard import is_secret_filename, scan_for_secrets
 
 log = structlog.get_logger(__name__)
 
-# P0 indexes markdown only; other formats (PDF, Excalidraw, images) arrive in P2.
-# Non-indexable extensions are skipped quietly — they are not "excluded", just not
-# yet supported — so scan stats stay meaningful.
-_INDEXABLE_SUFFIXES = frozenset({".md", ".markdown"})
+# Non-indexable extensions are skipped quietly — they are not "excluded", just not yet
+# supported — so scan stats stay meaningful. (Excalidraw + images arrive in P2 Stages 5-6.)
+_TEXT_SUFFIXES = frozenset({".md", ".markdown"})
+# Formats whose *bytes* are not the indexable text: they need a converter before any
+# text exists, so the walk cannot content-scan them and the pipeline must route them to
+# a format parser. PDFs land here in P2 Stage 4.
+_BINARY_SUFFIXES = frozenset({".pdf"})
+_INDEXABLE_SUFFIXES = _TEXT_SUFFIXES | _BINARY_SUFFIXES
 
 # Directory names always pruned from the walk regardless of .ragignore, so we never
 # descend huge machine-managed trees. .ragignore can add more but not remove these.
@@ -215,6 +219,17 @@ def walk_vault(
             if reason is not None:
                 continue
 
+            # A binary source has no text to scan yet — decoding a PDF's bytes would
+            # produce mojibake and a meaningless secret scan. Its content gate runs on
+            # the *converted* text instead, in the ingest pipeline, so nothing skips the
+            # guardrail; it just moves to the point where text first exists.
+            if is_binary_source(rel):
+                scanned = _scanned_file(abs_path, rel)
+                if scanned is not None:
+                    files.append(scanned)
+                    indexable += 1
+                continue
+
             try:
                 text = abs_path.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
@@ -230,16 +245,10 @@ def walk_vault(
                 log.warning("scan.secret_blocked", path=rel, rule=rule)
                 continue
 
-            try:
-                stat = abs_path.stat()
-                digest = _hash_file(abs_path)
-            except OSError as exc:
-                log.warning("scan.hash_failed", path=rel, error=str(exc))
+            scanned = _scanned_file(abs_path, rel)
+            if scanned is None:
                 continue
-
-            files.append(
-                ScannedFile(path=rel, hash=digest, size=stat.st_size, mtime=int(stat.st_mtime))
-            )
+            files.append(scanned)
             indexable += 1
 
     stats = ScanStats(
@@ -250,6 +259,18 @@ def walk_vault(
         unsupported=unsupported,
     )
     return files, stats
+
+
+def _scanned_file(abs_path: Path, rel: str) -> ScannedFile | None:
+    """Stat + hash one vetted file. ``None`` (logged) if either fails — one unreadable
+    file must not abort the walk."""
+    try:
+        stat = abs_path.stat()
+        digest = _hash_file(abs_path)
+    except OSError as exc:
+        log.warning("scan.hash_failed", path=rel, error=str(exc))
+        return None
+    return ScannedFile(path=rel, hash=digest, size=stat.st_size, mtime=int(stat.st_mtime))
 
 
 # ---------------------------------------------------------------------------
@@ -381,5 +402,16 @@ def scan_vault(
 
 
 def iter_indexable_suffixes() -> Iterable[str]:
-    """The file suffixes scan currently treats as indexable (P0: markdown)."""
+    """The file suffixes scan currently treats as indexable (markdown + PDF)."""
     return _INDEXABLE_SUFFIXES
+
+
+def is_binary_source(rel_path: str) -> bool:
+    """True when a path's bytes are not its indexable text (today: PDFs).
+
+    Two things branch on this and must agree, which is why it lives beside
+    :func:`exclusion_reason` rather than in either caller: the walk cannot run the
+    content secret-scan on such a file (there is no text yet — the scan happens after
+    conversion instead, in the ingest pipeline), and ``open`` cannot serve it as text.
+    """
+    return Path(rel_path).suffix.lower() in _BINARY_SUFFIXES

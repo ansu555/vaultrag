@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
@@ -66,14 +66,17 @@ from vaultrag.embedding.cache import embed_chunks
 from vaultrag.index.base import VectorStore
 from vaultrag.indexer.scan import (
     Rename,
+    ScanDiff,
     ScannedFile,
     exclusion_reason,
+    is_binary_source,
     load_ignore_spec,
     scan_vault,
 )
 from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.models import Document, document_id
 from vaultrag.parsing.markdown import parse_document
+from vaultrag.parsing.pdf import PdfError, PdfParser
 from vaultrag.store.base import JobKind, JobState, MetaStore
 
 log = structlog.get_logger(__name__)
@@ -96,6 +99,9 @@ class IngestContext:
     store: MetaStore
     vector_store: VectorStore
     embedder: Embedder
+    # None = no PDF support installed (the base install). PDFs are then skipped
+    # cleanly rather than failing, so a vault of notes+PDFs still indexes its notes.
+    pdf_parser: PdfParser | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +122,7 @@ class SkipReason(StrEnum):
     excluded = "excluded"  # exclusion_reason fired (secret filename / ragignore / unsupported)
     secret = "secret"  # scan_for_secrets found key material in the content
     gone = "gone"  # the file is missing or unreadable on disk
+    no_parser = "no_parser"  # format is indexable but its converter isn't installed
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +152,7 @@ class ReindexStats:
     renamed: int = 0
     unchanged: int = 0
     failed: int = 0
+    skipped: int = 0  # deliberately not indexed (no converter installed / secret content)
     chunks_written: int = 0
     graph_backfilled: int = 0  # unchanged docs whose link edges were built after the fact
     elapsed_ms: float = 0.0
@@ -158,6 +166,7 @@ def reindex_vault(
     vector_store: VectorStore,
     embedder: Embedder,
     force: bool = False,
+    pdf_parser: PdfParser | None = None,
 ) -> ReindexStats:
     """Boot-reconcile the index against a vault. Safe to re-run at any time.
 
@@ -185,9 +194,11 @@ def reindex_vault(
         store=store,
         vector_store=vector_store,
         embedder=embedder,
+        pdf_parser=pdf_parser,
     )
 
     diff, _scan_stats = scan_vault(vault_path, store.document_manifest(project_id), force=force)
+    diff, skipped = _drop_unparseable(ctx, diff)
 
     created = updated = renamed = deleted = failed = 0
     chunks_written = 0
@@ -196,6 +207,8 @@ def reindex_vault(
         n = _process_scanned(ctx, f)
         if n is None:
             failed += 1
+        elif isinstance(n, _Withheld):
+            skipped += 1
         else:
             created += 1
             chunks_written += n
@@ -204,6 +217,8 @@ def reindex_vault(
         n = _process_scanned(ctx, f)
         if n is None:
             failed += 1
+        elif isinstance(n, _Withheld):
+            skipped += 1
         else:
             updated += 1
             chunks_written += n
@@ -212,6 +227,8 @@ def reindex_vault(
         n = _process_rename(ctx, r)
         if n is None:
             failed += 1
+        elif isinstance(n, _Withheld):
+            skipped += 1
         else:
             renamed += 1
             chunks_written += n
@@ -231,6 +248,7 @@ def reindex_vault(
         renamed=renamed,
         unchanged=len(diff.unchanged),
         failed=failed,
+        skipped=skipped,
         chunks_written=chunks_written,
         graph_backfilled=graph_backfilled,
         elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
@@ -285,17 +303,27 @@ def ingest_path(
     # Hash the raw bytes (matches scan's _hash_file), decode for parse/secret-scan. Using
     # the same bytes for hash+parse closes the TOCTOU window a re-read would open.
     content_hash = blake3(data).hexdigest()
-    text = data.decode("utf-8", errors="replace")
+    binary = is_binary_source(path)
 
-    if scan_for_secrets(text) is not None:
+    # A text file's content gate runs here, before anything expensive. A binary source
+    # has no text yet, so its gate runs inside _parse_source, after conversion.
+    if not binary and scan_for_secrets(data.decode("utf-8", errors="replace")) is not None:
         log.warning("ingest.secret_blocked", path=path)
         return _evict(ctx, path, SkipReason.secret)
 
+    # Checked before conversion, not after: converting a PDF costs ~0.6 s per page, and
+    # an unchanged file must stay free (the property live-watch depends on).
     prior = ctx.store.get_document(ctx.project_id, path)
     if prior is not None and prior.hash == content_hash:
         return IngestOutcome(path, IngestStatus.unchanged)
 
-    n = _ingest_file(ctx, path=path, raw_text=text, content_hash=content_hash, mtime=mtime)
+    if binary and ctx.pdf_parser is None:
+        return _evict(ctx, path, SkipReason.no_parser)
+
+    try:
+        n = _ingest_file(ctx, path=path, data=data, content_hash=content_hash, mtime=mtime)
+    except SecretBlocked:
+        return _evict(ctx, path, SkipReason.secret)
     return IngestOutcome(path, IngestStatus.indexed, chunks=n)
 
 
@@ -320,11 +348,57 @@ def _evict(ctx: IngestContext, path: str, reason: SkipReason) -> IngestOutcome:
 # ---------------------------------------------------------------------------
 # Per-file work (the actual pipeline) — shared by reconcile and the primitive
 # ---------------------------------------------------------------------------
+class SecretBlocked(Exception):
+    """A converted document's text tripped the secret guard — withhold, don't fail.
+
+    Only binary sources can raise this: a markdown file's content is scanned earlier
+    (at the walk, and again in :func:`ingest_path`), but a PDF has no text until it is
+    converted, so its content gate necessarily runs later. Distinct from an ingest
+    *error* because the file is fine — the index must simply not hold it (CLAUDE.md §6).
+    """
+
+
+def _parse_source(
+    ctx: IngestContext,
+    *,
+    path: str,
+    data: bytes,
+    content_hash: str | None,
+    mtime: int | None,
+) -> Document:
+    """Bytes → :class:`Document`, routed by format. The one place formats branch.
+
+    Everything downstream (chunk → embed → upsert) is format-agnostic by design
+    (arch §5), so a new source type is a new branch here and nothing else.
+
+    Raises :class:`~vaultrag.parsing.pdf.PdfError` if conversion fails and
+    :class:`SecretBlocked` if the converted text carries key material — the content
+    gate the walk could not apply to bytes.
+    """
+    if not is_binary_source(path):
+        return parse_document(
+            path=path,
+            raw_text=data.decode("utf-8", errors="replace"),
+            content_hash=content_hash,
+            mtime=mtime,
+        )
+
+    if ctx.pdf_parser is None:  # guarded by callers; defensive, never the normal path
+        raise PdfError(f"no PDF parser available for {path!r} (install vaultrag[pdf])")
+
+    document = ctx.pdf_parser.parse(path=path, data=data, content_hash=content_hash, mtime=mtime)
+    rule = scan_for_secrets("\n\n".join(block.text for block in document.blocks))
+    if rule is not None:
+        log.warning("ingest.secret_blocked", path=path, rule=rule)
+        raise SecretBlocked(path)
+    return document
+
+
 def _ingest_file(
     ctx: IngestContext,
     *,
     path: str,
-    raw_text: str,
+    data: bytes,
     content_hash: str,
     mtime: int,
 ) -> int:
@@ -334,7 +408,7 @@ def _ingest_file(
     #1) and only commits the document's real ``hash`` after every write succeeds (the
     partial-failure safety described in the module docstring).
     """
-    document = parse_document(path=path, raw_text=raw_text, content_hash=content_hash, mtime=mtime)
+    document = _parse_source(ctx, path=path, data=data, content_hash=content_hash, mtime=mtime)
     chunks = chunk_document(document, project_id=ctx.project_id)
     vectors = embed_chunks(ctx.embedder, ctx.store, chunks)
 
@@ -436,9 +510,9 @@ def _read_and_ingest(ctx: IngestContext, path: str, content_hash: str) -> int:
     and carry the scan hash — so it skips :func:`ingest_path`'s re-gating.
     """
     abs_path = ctx.vault_path / path
-    raw_text = abs_path.read_text(encoding="utf-8", errors="replace")
+    data = abs_path.read_bytes()
     mtime = int(abs_path.stat().st_mtime)
-    return _ingest_file(ctx, path=path, raw_text=raw_text, content_hash=content_hash, mtime=mtime)
+    return _ingest_file(ctx, path=path, data=data, content_hash=content_hash, mtime=mtime)
 
 
 def _delete_file(ctx: IngestContext, path: str) -> None:
@@ -452,12 +526,63 @@ def _delete_file(ctx: IngestContext, path: str) -> None:
 # Job-tracked wrappers for the boot reconcile: one row in `jobs` per changed path,
 # dead-parked on failure so a single bad file can't abort the rest of the run.
 # ---------------------------------------------------------------------------
-def _process_scanned(ctx: IngestContext, f: ScannedFile) -> int | None:
-    """Run one create/update ingest job. Returns chunks written, or ``None`` on failure."""
+def _drop_unparseable(ctx: IngestContext, diff: ScanDiff) -> tuple[ScanDiff, int]:
+    """Remove files whose format has no converter installed, counting them as skipped.
+
+    Done once, up front, rather than per file: without a PDF parser every PDF in the
+    vault would otherwise become a dead job, and a base install indexing a vault that
+    happens to contain PDFs would report a wall of failures for working as designed.
+    A skip is honest; a failure is not (CLAUDE.md §4 — the base install stays light).
+    """
+    if ctx.pdf_parser is not None:
+        return diff, 0
+
+    creates = [f for f in diff.creates if not is_binary_source(f.path)]
+    updates = [f for f in diff.updates if not is_binary_source(f.path)]
+    renames = [r for r in diff.renames if not is_binary_source(r.new_path)]
+    skipped = (
+        len(diff.creates)
+        - len(creates)
+        + len(diff.updates)
+        - len(updates)
+        + len(diff.renames)
+        - len(renames)
+    )
+    if skipped:
+        log.info("reindex.format_skipped", project=ctx.project_id, count=skipped, extra="pdf")
+    return (
+        replace(diff, creates=creates, updates=updates, renames=renames),
+        skipped,
+    )
+
+
+class _Withheld:
+    """Sentinel: the job ran and deliberately indexed nothing (not a failure)."""
+
+    __slots__ = ()
+
+
+_WITHHELD = _Withheld()
+
+_JobResult = int | None | _Withheld
+
+
+def _process_scanned(ctx: IngestContext, f: ScannedFile) -> _JobResult:
+    """Run one create/update ingest job.
+
+    Returns chunks written, ``None`` on failure, or :data:`_WITHHELD` when the file
+    converted fine but must not be indexed (its text tripped the secret guard). The
+    third case is a *success* for job purposes — retrying it would block again — so the
+    job is marked done, not dead.
+    """
     job_id = ctx.store.enqueue_job(ctx.project_id, JobKind.ingest, f.path, f.hash)
     ctx.store.set_job_state(job_id, JobState.running)
     try:
         n = _read_and_ingest(ctx, f.path, f.hash)
+    except SecretBlocked:
+        _delete_file(ctx, f.path)
+        ctx.store.set_job_state(job_id, JobState.done)
+        return _WITHHELD
     except Exception as exc:
         ctx.store.set_job_state(job_id, JobState.dead, error=str(exc), increment_attempts=True)
         log.error("reindex.ingest_failed", path=f.path, error=str(exc))
@@ -466,13 +591,17 @@ def _process_scanned(ctx: IngestContext, f: ScannedFile) -> int | None:
     return n
 
 
-def _process_rename(ctx: IngestContext, r: Rename) -> int | None:
+def _process_rename(ctx: IngestContext, r: Rename) -> _JobResult:
     """Move a renamed file: delete at ``old_path``, ingest at ``new_path`` (trap #2)."""
     job_id = ctx.store.enqueue_job(ctx.project_id, JobKind.ingest, r.new_path, r.hash)
     ctx.store.set_job_state(job_id, JobState.running)
     try:
         _delete_file(ctx, r.old_path)
         n = _read_and_ingest(ctx, r.new_path, r.hash)
+    except SecretBlocked:
+        _delete_file(ctx, r.new_path)
+        ctx.store.set_job_state(job_id, JobState.done)
+        return _WITHHELD
     except Exception as exc:
         ctx.store.set_job_state(job_id, JobState.dead, error=str(exc), increment_attempts=True)
         log.error("reindex.rename_failed", old_path=r.old_path, new_path=r.new_path, error=str(exc))

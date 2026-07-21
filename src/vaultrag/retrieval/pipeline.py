@@ -154,6 +154,8 @@ def _to_snippet(hit: ScoredChunk) -> Snippet:
         anchor=_as_str(payload.get("anchor")),
         line_start=_as_int(payload.get("line_start")),
         line_end=_as_int(payload.get("line_end")),
+        # Absent on notes — the payload omits `page` entirely rather than storing null.
+        page=_as_int(payload.get("page")),
         text=str(payload.get("text", "")),
         score=hit.score,
         tokens=int(tokens) if isinstance(tokens, (int, float)) else 0,

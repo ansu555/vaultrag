@@ -229,6 +229,9 @@ def _parent_snippet(
         anchor=section.anchor,
         line_start=section.line_start,
         line_end=section.line_end,
+        # The representative child's page: a swapped-in parent section spans the same
+        # region, and the child is the hit the page should point at.
+        page=_as_int(rep_payload.get("page")),
         text=section.text,
         score=score,
         tokens=section.tokens,
@@ -245,3 +248,8 @@ def _hit_tokens(payload: Mapping[str, object]) -> int:
 
 def _as_str(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _as_int(value: object) -> int | None:
+    # bool is an int subclass; a stray True/False in the payload isn't a page number.
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None

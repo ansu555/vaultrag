@@ -8,8 +8,40 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 DONE, and the index-drift bug is now FIXED.
-  Next: Stage 4 (PDF via Docling), unblocked.**
+- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 + 4 DONE, and the index-drift bug is FIXED.
+  Next: Stage 5 (Excalidraw + Mermaid diagram extraction), unblocked.**
+- **Stage 4 (PDF via Docling) DONE 2026-07-21. Decision 3 settled: `vaultrag[pdf]`, an optional
+  extra.** Measured, not assumed — `docling` resolves to **101 packages incl. torch/torchvision/
+  transformers (~2.5 GB)**; requiring that in the base install would contradict principle #2
+  outright. (`docling-slim` looked like a lighter path and **is not** — it can't even
+  `import DocumentConverter`, missing scipy.) **The pipeline stayed format-agnostic:** Docling
+  converts PDF → markdown, that markdown goes through the *existing* markdown parser, so
+  chunking/embedding/indexing never learned PDFs exist — one new branch in one function
+  (`_parse_source`). **Pages survive by construction:** per-page markdown exports are
+  *concatenated* into one document (so the heading tree stays continuous across page breaks —
+  parsing each page alone would stop an H1 on page 1 from scoping page 2) with each page's start
+  line recorded; blocks already carry `line_start`, so stamping `Block.page` is a lookup, not a
+  second parse. `Chunk.page` = the **first** page of the chunk (where an agent should land), since
+  a chunk can straddle a break. **The page had to be carried all the way to the agent** — it
+  reached the Qdrant payload but `Snippet` had no `page` field, so the plan's acceptance criterion
+  was silently unmet until `Snippet.page` was added + populated in both citation paths.
+  **The secret guard MOVED rather than disappeared:** the walk content-scans every indexable file,
+  but a PDF's bytes aren't text (decoding → mojibake → meaningless scan), so binary sources are
+  excluded from the walk's scan and gated on their **converted** text inside the pipeline —
+  without that, Stage 4 would have opened a hole in CLAUDE.md §6. **`open` refuses PDFs** with an
+  actionable message pointing at `search`'s page-cited chunks (serving decoded PDF bytes is worse
+  than a refusal) — a real limitation, since opening a page's text needs re-conversion or stored
+  extraction. **A missing extra is a SKIP, not a failure** (new `ReindexStats.skipped`, CLI `?N`):
+  otherwise a base install on a mixed vault reports a wall of failures for working as designed.
+  **Verified on real PDFs:** a committed 3-page fixture pins the mapping in tests, and a real
+  **25-page / 1.2 MB** PDF indexed live → 48 chunks, **every one page-stamped**, 20+ distinct
+  pages, notes alongside carrying none; over real MCP stdio `search` returned correct hits with
+  page anchors and **pages 5/7/9 were independently confirmed** against Docling's own per-page
+  export (the check that catches an off-by-one). **Perf:** first conversion ~220 s but that is
+  almost all one-time model download; warm is **~0.6 s/page** (trivial PDF) and **~2.7 s/page**
+  (real image-heavy one). `do_ocr=False` measured **no** difference on a born-digital PDF (1.7 vs
+  1.8 s, identical output) so no knob was added. **510 tests** (+16), split so Docling-dependent
+  ones skip without the extra. Gate unmoved 1.000/0.892/0.920.
 - **Stage 3 (`related` + graph-expand) DONE 2026-07-21, and it ships ON.** The plan's
   condition ("on only if a measured non-regression on the Stage 1 gate") was met: gate
   **recall@10 1.000 · MRR@5 0.892 unchanged · nDCG@10 0.919 → 0.920, PASS**, plus a real gain
@@ -234,6 +266,52 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 — P2 Stage 4: PDF ingestion via Docling (optional extra)
+- **Did:** Stage 4 of `../Rag/projects/vaultrag/p2-step-plan.md`, straight after the drift fix in
+  the same session. New `parsing/pdf.py` (`PdfParser` protocol + `DoclingPdfParser` +
+  `load_pdf_parser` graceful-skip), `.pdf` added to the scanner, format routing in
+  `indexer/pipeline._parse_source`, `Block.page` → `Chunk.page` → payload → **`Snippet.page`**,
+  `pyproject` extra `pdf`, and `open` refusing PDFs.
+- **Decision 3 settled with a measurement, not a preference.** `docling` = **101 packages incl.
+  torch/torchvision/transformers**. I checked `docling-slim` first hoping for a light path — it
+  is not one (can't `import DocumentConverter`, missing scipy). So: optional extra, base install
+  untouched.
+- **Three things that would have been silent bugs.** (1) **`Snippet` had no `page`** — the number
+  reached Qdrant and stopped there, so the acceptance criterion "the citation lets an agent open
+  the right page" was unmet while every intermediate layer looked correct. (2) **The secret guard
+  would have had a hole**: the walk content-scans indexable files, but a PDF's bytes decode to
+  mojibake, so the scan was meaningless — moved to run on the *converted* text inside the
+  pipeline. (3) **A missing extra would have read as failure**: without the filter, every PDF in a
+  vault becomes a dead job and a base install reports a wall of errors for behaving as designed.
+- **Design call worth remembering: per-page exports are concatenated, not parsed separately.**
+  Parsing each page as its own document would break the heading tree (an H1 on page 1 stops
+  scoping page 2) and the chunker's entire model is heading-path sections. Concatenating and
+  recording each page's start line keeps the tree continuous and makes page-stamping a lookup.
+- **Verified on a real 25-page PDF, not just the committed fixture:** 48 chunks all page-stamped;
+  over real MCP stdio, `search` returned semantically correct hits and **pages 5/7/9 were
+  independently re-derived** from Docling's own per-page export. My first version of that test
+  *failed* — but the code was right and the test was wrong (a dict comprehension collapsing
+  multiple blocks per page), which is the good direction for that failure to point.
+- **Measured perf (don't re-panic about the first number):** the first conversion took **220 s**,
+  which is almost entirely **one-time model download** — warm is **~0.6 s/page** trivial,
+  **~2.7 s/page** real. `do_ocr=False` made **no** measurable difference on a born-digital PDF
+  (1.7 vs 1.8 s, identical output), so no knob was added for it.
+- **Files:** `parsing/pdf.py` (new), `models.py` (`Block.page`, `Snippet.page`),
+  `chunking/chunker.py` (`_first_page`), `indexer/scan.py` (`_BINARY_SUFFIXES`,
+  `is_binary_source`, no content-scan for binary, `_scanned_file` helper),
+  `indexer/pipeline.py` (`_parse_source`, `SecretBlocked`, `SkipReason.no_parser`,
+  `ReindexStats.skipped`, `_drop_unparseable`), `retrieval/{pipeline,parents}.py` (carry `page`),
+  `mcp/server.py` (`open` refuses PDFs), `cli.py`, `pyproject.toml`. Tests: `tests/test_pdf.py`
+  (new, 15) + `tests/fixtures/handbook.pdf` (18 KB, 3 pages) + 1 in `test_mcp.py`.
+  **Vault:** `p2-step-plan.md` Log + Decision 3 marked settled.
+- **Next / handoff:** **Stage 5 — Excalidraw + Mermaid** (Mermaid `A --> B` → `diagram_edge` in
+  Stage 2's `links` table; add `diagram` to `LinkKind`). Things to know: (a) **CI does not install
+  the `pdf` extra**, so the 3 Docling tests skip there — run `uv sync --extra pdf` locally before
+  claiming the PDF path is green; (b) `open` refusing PDFs is a **known limitation**, and the fix
+  (storing extracted text, or a `page=` arg that re-converts) is a real design question, not a
+  bug to patch casually; (c) Stage 5 adds `.excalidraw`, which is **text** (JSON) — so it belongs
+  in `_TEXT_SUFFIXES`, not `_BINARY_SUFFIXES`, and needs no new secret-guard placement.
 
 ### 2026-07-21 — index-drift bug fixed: `reindex --force` + a live-eval refusal + a warning
 - **Did:** Anik asked whether Stage 4 was safe to start or whether anything needed resolving
