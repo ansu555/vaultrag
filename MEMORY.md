@@ -390,10 +390,11 @@ Prepend newest first. Template:
 
 ## Session log
 
-### 2026-07-21 (later) — two containment bugs fixed: symlink escape + PDF-destroying write
+### 2026-07-21 (later) — all 4 audit bugs fixed, CI wired, and `main` finally gated
 - **Did:** an audit turned up 4 real bugs the 628-test suite could not see, because each lives in
-  the **gap between two individually-correct components**. Fixed the two serious ones on
-  `fix/containment-gaps` (branched off `main`; one commit + regression tests each).
+  the **gap between two individually-correct components**. **All 4 are now fixed and merged**
+  (PR #10 bugs 1-2, PR #11 CI + branch protection, PR #12 bugs 3-4), each with regression tests
+  confirmed **failing against the pre-fix code** before being accepted. **645 tests.**
 - **Bug 1 (HIGH, security) — the walk escaped the vault.** `os.walk(followlinks=False)` only stops
   the walk *descending* symlinked **directories**; symlinked **files** are still listed, and
   `scan.py` read straight through them. `notes/leak.md -> /outside/private-diary.md` was indexed
@@ -424,15 +425,25 @@ Prepend newest first. Template:
 - **Verified:** each regression test confirmed **failing against the pre-fix code** and passing
   after (not just passing). **639 tests** (+11), ruff, mypy (57). `metrics.py`'s mirrored refusal
   tuple caught the new enum members — that sync test paid for itself.
-- **Next session:** bugs 3 and 4 from the same audit are unfixed — (3) a **UTF-8 BOM** breaks
-  frontmatter parsing (`read_text(encoding="utf-8")` doesn't strip it, so the first `---` never
-  matches: all tags lost → server-side `filters.tags` silently fails, title becomes raw YAML in
-  every citation; routine on Windows-authored notes; fix is stripping a leading `﻿` in
-  `split_frontmatter`, safe because it doesn't shift line numbers), and (4) **`write_note` never
-  writes the H1 its schema promises** (`server.py:575` tells the model "Becomes the H1/frontmatter
-  title"; `_render_new_note` writes frontmatter only) — so `append_section` can **never** target an
-  agent-created note, breaking the documented "create a note, then grow it" memory loop for
-  exactly the notes agents create.
+- **Bugs 3 and 4 also fixed (PR #12) — the audit is now fully closed.**
+  - **(3) UTF-8 BOM destroyed frontmatter parsing.** `read_text(encoding="utf-8")` does **not**
+    strip U+FEFF (only `utf-8-sig` does), so the delimiter test `lines[0].strip() != "---"` failed
+    and the entire YAML block parsed as **prose**: every tag lost (→ server-side `filters.tags`
+    **silently** stops matching that note), title became raw YAML in every citation, frontmatter
+    indexed as body text. Routine on Windows-authored notes. Fixed in **`split_frontmatter` +
+    `frontmatter_line_offset`** — the two entry points — so markdown, excalidraw *and* write-back
+    inherit it without changes. A BOM is one character on line 1, never a line, so **citation
+    anchors are unchanged** — the test asserts that rather than trusting it.
+  - **(4) `write_note` never wrote the H1 its own schema promises.** `server.py` tells the model
+    `title` "Becomes the H1/frontmatter title"; `_render_new_note` wrote frontmatter only, so the
+    file had **no heading** and `append_section` could never target a note VaultRAG had just
+    created ("headings here: (none)") — the documented *create a note, then grow it* memory loop
+    was broken for **exactly the notes agents write**, and their snippets came back `anchor=None`.
+    Now renders `# {title}`, **unless** the content already opens with an H1 (two would split the
+    note and make `append_section(heading=title)` ambiguous); content opening at `##` still gets
+    one. **Checked the vault first** (`write-back-design.md`, `reference-mcp-tools.md`): no
+    decision covers note rendering, so this makes the code match its own stated contract rather
+    than overriding a design call.
 - **Then wired CI (the root cause).** `eval.yml` was the only workflow, so ruff, mypy, and 634
   tests never ran on a PR — `CLAUDE.md` §5's "CI should fail on lint errors" *could not* hold.
   New `.github/workflows/checks.yml`: **`static`** (ruff check + ruff format --check + mypy),
