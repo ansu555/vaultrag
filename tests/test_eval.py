@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from vaultrag.config import Settings, load_settings
+from vaultrag.config import RerankMode, Settings, load_settings
 from vaultrag.embedding.base import EmbeddingError
 from vaultrag.eval import (
     CORPUS_VAULT_PATH,
@@ -54,6 +54,17 @@ from vaultrag.eval import (
 # Metrics
 # ---------------------------------------------------------------------------
 RANKED = ["a.md", "b.md", "c.md", "d.md", "e.md"]
+
+
+def gate_settings() -> Settings:
+    """Settings for a hermetic measurement — rerank pinned off, exactly like `vaultrag eval`.
+
+    Nothing that measures retrieval may *inherit* the rerank mode. The product default is
+    `auto`, which builds a cross-encoder: a ~600 MB download and ~50 scored passages per
+    query would turn this suite into a slow, network-dependent one and silently change what
+    the gate is measuring. The gate states its mode; it never assumes it.
+    """
+    return load_settings().model_copy(update={"rerank_mode": RerankMode.never})
 
 
 def test_first_relevant_rank_is_one_based() -> None:
@@ -226,8 +237,8 @@ def test_verify_paths_names_the_missing_note(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 def test_overlay_reads_yaml(tmp_path: Path) -> None:
     path = tmp_path / "a.yaml"
-    path.write_text("rerank_enabled: true\ndefault_top_k: 5\n", encoding="utf-8")
-    assert load_overlay(path) == {"rerank_enabled": True, "default_top_k": 5}
+    path.write_text("rerank_mode: always\ndefault_top_k: 5\n", encoding="utf-8")
+    assert load_overlay(path) == {"rerank_mode": "always", "default_top_k": 5}
 
 
 def test_overlay_reads_json(tmp_path: Path) -> None:
@@ -308,7 +319,7 @@ def test_missing_fixture_file_says_how_to_make_one(tmp_path: Path) -> None:
 
 
 def test_committed_fixture_covers_the_shipped_config() -> None:
-    settings = load_settings()
+    settings = gate_settings()
     with VectorFixture(VECTOR_FIXTURE_PATH) as fixture:
         assert fixture.count(settings.embed_model, settings.embed_dims) > 0, (
             "the committed fixture holds no vectors for the configured model/dims — "
@@ -323,7 +334,7 @@ def test_committed_fixture_covers_the_shipped_config() -> None:
 def shipped_report():  # type: ignore[no-untyped-def]
     """Run the real hermetic gate once and share it across the assertions below."""
     golden = load_corpus_golden()
-    settings = load_settings()
+    settings = gate_settings()
     with replay_stack(golden, settings, fixture_path=VECTOR_FIXTURE_PATH) as stack:
         return run_eval(golden, stack, label="shipped")
 
@@ -354,7 +365,7 @@ def test_the_gate_actually_bites_on_a_bad_config() -> None:
     observed the passing case, which any no-op implementation also produces.
     """
     golden = load_corpus_golden()
-    broken = apply_overlay(load_settings(), {"default_top_k": 1})
+    broken = apply_overlay(gate_settings(), {"default_top_k": 1})
     with replay_stack(golden, broken, fixture_path=VECTOR_FIXTURE_PATH) as stack:
         report = run_eval(golden, stack, label="top_k=1")
     assert not report.metrics.meets_targets()
@@ -365,7 +376,7 @@ def test_the_gate_actually_bites_on_a_bad_config() -> None:
 def test_the_harness_is_offline() -> None:
     """Replay mode must not reach Ollama — CI has no model server (Decision 1)."""
     golden = load_corpus_golden()
-    settings = apply_overlay(load_settings(), {"ollama_url": "http://127.0.0.1:1"})
+    settings = apply_overlay(gate_settings(), {"ollama_url": "http://127.0.0.1:1"})
     with replay_stack(golden, settings, fixture_path=VECTOR_FIXTURE_PATH) as stack:
         report = run_eval(golden, stack, label="offline")
     assert report.metrics.meets_targets()
@@ -390,6 +401,6 @@ def test_a_stale_fixture_aborts_instead_of_scoring_a_partial_index(tmp_path: Pat
 
     with (
         pytest.raises(EmbeddingError, match="incomplete index"),
-        replay_stack(stale, load_settings(), fixture_path=VECTOR_FIXTURE_PATH) as stack,
+        replay_stack(stale, gate_settings(), fixture_path=VECTOR_FIXTURE_PATH) as stack,
     ):
         run_eval(stale, stack, label="stale")

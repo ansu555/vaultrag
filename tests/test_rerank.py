@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from tests.fakes import FakeReranker
+from vaultrag.config import RerankMode
 from vaultrag.index.base import ScoredChunk
 from vaultrag.retrieval.rerank import (
     NoOpReranker,
@@ -18,6 +19,7 @@ from vaultrag.retrieval.rerank import (
     RerankParams,
     load_reranker,
     rerank_candidates,
+    should_rerank,
 )
 
 
@@ -165,7 +167,7 @@ def test_score_count_mismatch_raises() -> None:
 # Composition-root loader
 # ---------------------------------------------------------------------------
 def test_load_reranker_returns_none_when_disabled() -> None:
-    assert load_reranker(enabled=False) is None
+    assert load_reranker(mode=RerankMode.never) is None
 
 
 def test_load_reranker_falls_back_to_noop_when_the_model_cannot_load(
@@ -178,4 +180,67 @@ def test_load_reranker_falls_back_to_noop_when_the_model_cannot_load(
         raise RerankError("simulated offline / missing export")
 
     monkeypatch.setattr("vaultrag.retrieval.rerank.BgeReranker.load", _boom)
-    assert isinstance(load_reranker(enabled=True), NoOpReranker)
+    assert isinstance(load_reranker(mode=RerankMode.always), NoOpReranker)
+
+
+# ---------------------------------------------------------------------------
+# RerankMode (P2): the user's choice, and `auto`'s per-query decision
+# ---------------------------------------------------------------------------
+def test_always_forces_the_gate_open() -> None:
+    params = RerankParams.for_mode(RerankMode.always, dominant_ratio=1.5)
+    assert params.dominant_ratio == 0
+    assert should_rerank([_cand("a", 10.0, "x"), _cand("b", 0.1, "y")], params)
+
+
+def test_auto_keeps_the_configured_decision_boundary() -> None:
+    assert RerankParams.for_mode(RerankMode.auto, dominant_ratio=1.5).dominant_ratio == 1.5
+
+
+def test_auto_skips_the_model_when_fusion_is_confident() -> None:
+    # top1 is 10x top2 — both retrievers agree; a cross-encoder can only do damage.
+    params = RerankParams.for_mode(RerankMode.auto, dominant_ratio=1.5)
+    assert not should_rerank([_cand("a", 1.0, "x"), _cand("b", 0.1, "y")], params)
+
+
+def test_auto_reranks_when_fusion_is_undecided() -> None:
+    params = RerankParams.for_mode(RerankMode.auto, dominant_ratio=1.5)
+    assert should_rerank([_cand("a", 1.0, "x"), _cand("b", 0.95, "y")], params)
+
+
+def test_auto_does_not_claim_confidence_without_a_runner_up() -> None:
+    params = RerankParams.for_mode(RerankMode.auto, dominant_ratio=1.5)
+    # A zero-scored second place is not evidence the first is right.
+    assert should_rerank([_cand("a", 1.0, "x"), _cand("b", 0.0, "y")], params)
+    # ...but a lone candidate has nothing to reorder.
+    assert not should_rerank([_cand("a", 1.0, "x")], params)
+
+
+def test_mode_survives_a_round_trip_through_settings() -> None:
+    from vaultrag.config import Settings
+    from vaultrag.retrieval.rerank import rerank_params_for
+
+    auto = rerank_params_for(Settings(rerank_mode=RerankMode.auto, rerank_dominant_ratio=2.0))
+    always = rerank_params_for(Settings(rerank_mode=RerankMode.always, rerank_dominant_ratio=2.0))
+    assert (auto.dominant_ratio, always.dominant_ratio) == (2.0, 0.0)
+
+
+def test_mode_values_are_not_yaml_booleans() -> None:
+    # A/B overlays are YAML, and YAML 1.1 turns bare `on`/`off` into booleans. Naming the
+    # members `never`/`always` is what keeps `rerank_mode: always` a string in an overlay.
+    import yaml
+
+    assert yaml.safe_load("rerank_mode: always")["rerank_mode"] == RerankMode.always
+    assert yaml.safe_load("rerank_mode: never")["rerank_mode"] == RerankMode.never
+    assert yaml.safe_load("mode: on")["mode"] is True  # the trap being avoided
+
+
+def test_the_retired_rerank_enabled_env_var_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Silently ignoring it would let someone set =true, see no reranking, and conclude the
+    # stage is broken. pydantic-settings drops unknown env vars, so this must be explicit.
+    from vaultrag.config import Settings
+
+    monkeypatch.setenv("VAULTRAG_RERANK_ENABLED", "true")
+    with pytest.raises(ValueError, match="VAULTRAG_RERANK_MODE"):
+        Settings()

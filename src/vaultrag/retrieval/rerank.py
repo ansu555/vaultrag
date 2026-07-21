@@ -9,10 +9,12 @@ The stage (:func:`rerank_candidates`) is model-agnostic policy:
 
 * pull the top ``top_n`` fused candidates (~50) and rerank **children, not parents**
   (less dilution — ``../Rag/projects/vaultrag/chunking-strategy.md``);
-* a **score threshold** (default 0.3) drops garbage instead of padding to ``k`` — an honest
-  "nothing relevant" beats confident noise, and agents handle empty results fine;
-* a **known-item fast path** skips the model entirely when the top-1 fusion score already
-  dominates the top-2 (a verbatim-identifier hit doesn't need re-ranking).
+* a **score threshold** (default 0.0 — no floor) drops garbage instead of padding to ``k``
+  — an honest "nothing relevant" beats confident noise, and agents handle empty results;
+* a **per-query decision** (:func:`should_rerank`) skips the model when the top-1 fusion
+  score already dominates the top-2 — both retrievers agreeing means a verbatim-identifier
+  or exact-title hit that doesn't need re-ranking. :class:`RerankMode` turns that from an
+  internal fast path into the user's choice: ``never`` / ``auto`` / ``always``.
 
 The model itself sits behind the :class:`Reranker` protocol (CLAUDE.md §5, interfaces over
 vendors). :class:`BgeReranker` is the local default (bge-reranker-v2-m3, ONNX int8, loaded
@@ -27,6 +29,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, runtime_checkable
 
+from vaultrag.config import RerankMode, Settings
 from vaultrag.index.base import ScoredChunk
 from vaultrag.logging import get_logger
 
@@ -64,14 +67,82 @@ class RerankParams:
     """Tunables for the rerank stage — all env-configurable (see :class:`Settings`).
 
     ``top_n`` candidates go to the model; survivors of ``threshold`` are returned (capped
-    to the caller's ``k``). ``dominant_ratio`` gates the known-item fast path: when the
-    top-1 fusion score is at least this multiple of the top-2, fusion is trusted and the
-    model is skipped. ``0`` disables the fast path (always rerank).
+    to the caller's ``k``). ``dominant_ratio`` gates the per-query decision: when the top-1
+    fusion score is at least this multiple of the top-2, fusion is trusted and the model is
+    skipped. ``0`` means never skip — which is exactly how :attr:`RerankMode.always` is
+    expressed, so mode and gating are one mechanism rather than two that can disagree.
     """
 
     top_n: int = DEFAULT_TOP_N
     threshold: float = DEFAULT_THRESHOLD
     dominant_ratio: float = DEFAULT_DOMINANT_RATIO
+
+    @classmethod
+    def for_mode(
+        cls,
+        mode: RerankMode,
+        *,
+        top_n: int = DEFAULT_TOP_N,
+        threshold: float = DEFAULT_THRESHOLD,
+        dominant_ratio: float = DEFAULT_DOMINANT_RATIO,
+    ) -> RerankParams:
+        """Build the params a mode implies. ``always`` forces the gate open (ratio 0).
+
+        ``never`` needs no params at all — the composition root simply builds no reranker —
+        but it maps to the same "always" shape so a caller can construct params without
+        branching.
+        """
+        return cls(
+            top_n=top_n,
+            threshold=threshold,
+            dominant_ratio=0.0 if mode is not RerankMode.auto else dominant_ratio,
+        )
+
+
+def rerank_params_for(settings: Settings) -> RerankParams:
+    """The stage-4 tunables a config implies, with the mode already folded in.
+
+    Lives here rather than on :class:`~vaultrag.config.Settings` because ``config`` is a
+    dependency-free leaf module — everything imports it, so it must import nothing back.
+    One place decides how a mode becomes gating behaviour, so the CLI and the eval harness
+    cannot drift into measuring something other than what the server runs.
+    """
+    return RerankParams.for_mode(
+        settings.rerank_mode,
+        top_n=settings.rerank_top_n,
+        threshold=settings.rerank_threshold,
+        dominant_ratio=settings.rerank_dominant_ratio,
+    )
+
+
+def should_rerank(candidates: Sequence[ScoredChunk], params: RerankParams) -> bool:
+    """``auto``'s per-query decision: does fusion look undecided enough to be worth it?
+
+    The signal is the **top-1/top-2 RRF margin**, which is a real statement about
+    retriever agreement rather than a heuristic about the query text. An RRF score is
+    ``Σ 1/(60 + rank)`` over the lists a chunk appears in, so a chunk ranked #1 by *both*
+    dense and BM25 scores roughly twice one that only one retriever surfaced. A dominant
+    top-1 therefore means "both retrievers independently agree on this hit" — the
+    known-item case (a verbatim identifier, an exact title) where a cross-encoder has
+    nothing to add and everything to lose.
+
+    Deliberately **not** an LLM call, and deliberately not query-text classification:
+    this must stay $0, local, and deterministic enough that the eval gate reproduces it
+    exactly (CLAUDE.md §2/§6). It is arithmetic on scores the fusion stage already
+    computed, so ``auto`` costs nothing to *decide* — it only ever saves model calls.
+
+    Note the threshold is score-distribution-dependent and so is per-vault, not a
+    universal constant — see
+    ``../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md``.
+    """
+    if params.dominant_ratio <= 0:
+        return True  # mode `always` — gate held open
+    if len(candidates) < 2:
+        return False  # nothing to compare, and nothing for a reranker to reorder
+    top1, top2 = candidates[0].score, candidates[1].score
+    if top2 <= 0:
+        return True  # no runner-up to measure against; don't claim confidence
+    return top1 < params.dominant_ratio * top2
 
 
 @runtime_checkable
@@ -131,11 +202,9 @@ def rerank_candidates(
     if reranker is None or len(candidates) <= 1:
         return candidates[:keep]
 
-    if params.dominant_ratio > 0 and len(candidates) >= 2:
-        top1, top2 = candidates[0].score, candidates[1].score
-        if top2 > 0 and top1 >= params.dominant_ratio * top2:
-            log.debug("rerank.skip_dominant", top1=top1, top2=top2)
-            return candidates[:keep]
+    if not should_rerank(candidates, params):
+        log.debug("rerank.skip_dominant", top1=candidates[0].score, top2=candidates[1].score)
+        return candidates[:keep]
 
     subset = candidates[: params.top_n]
     scores = reranker.score(query, [_candidate_text(c) for c in subset])
@@ -262,18 +331,20 @@ class BgeReranker:
 
 def load_reranker(
     *,
-    enabled: bool,
+    mode: RerankMode,
     repo_id: str = DEFAULT_RERANK_REPO,
     model_file: str = DEFAULT_RERANK_FILE,
 ) -> Reranker | None:
     """Composition-root helper: build the configured reranker, degrading gracefully.
 
-    Returns ``None`` when reranking is disabled (the stage is skipped and only ``k``
-    candidates are fetched). When enabled, returns a :class:`BgeReranker`, or — if the
-    model can't be fetched/opened — a :class:`NoOpReranker` so the server still starts and
-    search still works, just without the rerank lift (a logged, observable degradation).
+    Returns ``None`` for :attr:`RerankMode.never` (the stage is skipped and only ``k``
+    candidates are fetched — no model, no download). For ``auto``/``always``, returns a
+    :class:`BgeReranker`, or — if the model can't be fetched/opened — a
+    :class:`NoOpReranker` so the server still starts and search still works, just without
+    the rerank lift (a logged, observable degradation). This is what keeps ``auto`` a safe
+    default on an offline or light install: it costs fusion order, not a crash.
     """
-    if not enabled:
+    if mode is RerankMode.never:
         return None
     try:
         return BgeReranker.load(repo_id=repo_id, model_file=model_file)

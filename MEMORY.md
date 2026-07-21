@@ -8,7 +8,42 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P2 IN PROGRESS — Stage 1 (full eval harness + merge-blocking CI gate) DONE.**
+- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 DONE. Next: Stage 3 (`related` tool +
+  graph-expand), now unblocked.**
+- **Rerank is a user-chosen mode (2026-07-21, Anik's ruling).** `rerank_enabled: bool` →
+  **`rerank_mode: never | auto | always`** (`VAULTRAG_RERANK_MODE`), default **`never`**.
+  `auto` decides **per query** from the top-1/top-2 RRF margin — **not** an LLM call, so it stays
+  $0/local/deterministic; it skips **37.5%** of corpus queries at the default ratio.
+  **The default is `never` for LATENCY, not quality:** bge-v2-m3 measures **~500 ms per passage**
+  on this box (int8 502 / quantized 509 — quantization isn't the bottleneck), so `top_n=50` costs
+  **~25 s per reranked query** — unusable for an interactive tool, regardless of the real +0.036
+  MRR@5. Making the stage *affordable* (drop `rerank_top_n` first — cost is linear in it) now
+  ranks ahead of calibrating it; see
+  `../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md`. **The eval gate pins
+  its mode explicitly** (`vaultrag eval --rerank`, default `never`) rather than inheriting the
+  product default — a PR check must never pick up a 600 MB model by accident.
+- **Stage 2 (link-graph persistence) DONE 2026-07-21.** The wikilink graph is now *data*:
+  links were parsed-then-discarded since P0, and they now live in a **`links` table** written on
+  every ingest. New `store/links.py` (pure resolver), `links` + `doc_keys` DDL, 10 `MetaStore`
+  methods (`replace_links`/`reresolve_links`/`outgoing_links`/`linked_docs`/`backlinks`/
+  `neighbors`/`tag_siblings`/`unresolved_links`/`doc_key_count`), pipeline wiring + a **graph
+  backfill**. **Decision 4 settled** — resolution ladder **`path` → `basename` → `title` →
+  `alias`** (the plan said title-then-alias; `basename` had to be added *above* title because
+  `[[Note]]` addresses the **file**, and a note's `title` is frontmatter-else-heading-else-stem
+  and often differs). Ambiguity inside the winning tier → `dst_doc=NULL` + `dst_raw` kept
+  (**never guess**); a lower tier never breaks a higher tier's tie. **Re-resolution is broader
+  than the plan's "NULL set"**: an already-resolved edge can go stale too (a new `Gateway.md`
+  outranks an edge pointing at a note *titled* Gateway) and a **delete** can un-break a tie, so
+  every edge naming a changed doc is re-derived, on both add and delete — still bounded to that
+  doc's names. **Verified live, not just on fixtures:** the real pre-Stage-2 `state/vaultrag.db`
+  (82 docs, **no `links` table at all**) backfilled **54 docs with 0 chunks re-embedded**;
+  **147 edges, 90.5% resolved**; the 14 danglers are the vault's own *docs about wikilink syntax*
+  (`[[Note]]`, `[[...]]`) + one deliberately-unwritten note — i.e. correct. **0 cross-project
+  edges.** Found + fixed a real parsing bug on the way: `[[Note\|alias]]` (Obsidian's escaped
+  pipe inside a table) stranded the `\` on the target, so **every link in a markdown table failed
+  to resolve**. Eval gate unmoved (1.000/0.892/0.919 — Stage 2 doesn't touch retrieval).
+  **Green: 412 tests** (+53), ruff, ruff format, mypy (49 src files).
+- **(Stage 1 archive)** **Stage 1 (full eval harness + merge-blocking CI gate) DONE.**
   Retrieval quality is now a **number in CI**, not a vibe. New **`src/vaultrag/eval/`** package
   (`metrics`/`golden`/`replay`/`harness`/`overlay`/`report`) + **`vaultrag eval`** CLI. **Decisions
   1 + 2 of the P2 plan settled as recommended** (3-5 still open, each for its own stage).
@@ -42,7 +77,6 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   **non-deterministic** (0.871–0.892 on an unchanged index), which empirically justifies the
   hermetic gate; and **rerank-on beats fusion on this corpus (+0.036 MRR@5)**, inverting the P1
   finding the shipped default rests on — **open for Anik** (session log).
-  **Next: Stage 2 (link-graph persistence — the `links` table + resolver).**
 - **(P2 plan)** P2 is decomposed into
   **7 implement-one-at-a-time stages** in the vault: `../Rag/projects/vaultrag/p2-step-plan.md`
   (sibling of `p0-`/`p1-step-plan.md`). Order (dependency-driven): **1** full eval harness +
@@ -59,10 +93,11 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
   Mermaid-edge/OCR parser; **no** FastAPI `serve`/`api/` (so Prometheus ships standalone via
   `prometheus_client.start_http_server`, not mounted on HTTP). (The "eval is a minimal 20-pair set,
   no CI gate" line of that check is now **superseded — Stage 1 built it**.) Of the 5 open decisions,
-  **(1) CI determinism and (2) the fixture corpus were settled + built in Stage 1** (details in the
-  Phase bullet above). **Still open, each for its own stage:** (3) Docling as an optional extra
-  `vaultrag[pdf]` (Stage 4); (4) link-resolution collision / re-resolution rules (Stage 2);
-  (5) standalone Prometheus exporter now, mount on `serve` later (Stage 7).
+  **(1) CI determinism and (2) the fixture corpus were settled + built in Stage 1**, and
+  **(4) link-resolution collision / re-resolution was settled + built in Stage 2** (details in the
+  Phase bullets above). **Still open, each for its own stage:** (3) Docling as an optional extra
+  `vaultrag[pdf]` (Stage 4); (5) standalone Prometheus exporter now, mount on `serve` later
+  (Stage 7).
 - **(P1 archive)** **P1 CODE-COMPLETE — all 5 stages done + LIVE-verified; the memory loop is
   closed.** Stage 1 rerank (bge-v2-m3 ONNX-int8, behind a flag, **OFF** by default) · Stage 2
   parent-child + parent-swap (**ON**, superset-guarded / non-lossy) · Stage 3 `obsidian://`
@@ -134,6 +169,149 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 — Anik's 3 rulings: `doc_keys` kept, no tag edges, rerank becomes a mode
+- **Did:** Anik ruled on the two Stage-2 open questions **and** the long-open rerank default.
+  **(1) `doc_keys` — KEEP + document** (*"It's derived data and rebuilt automatically, so it isn't
+  introducing another authoritative source of truth"*). Written into
+  `../Rag/reference/reference-database-schema.md` with the FK semantics + the resolution ladder,
+  and into `knowledge-graph-integration.md`. **(2) Tag edges — don't duplicate**; ratified as
+  built, and the reference schema's `kind` is now `wiki|embed|diagram` (was
+  `wiki|embed|tag|diagram`). **(3) Rerank** — *"don't make it default yes. but give user to chose
+  yes or not. while set the value AI will desice when the best result come with or without
+  reranker."*
+- **Rerank as built:** `rerank_enabled: bool` → **`rerank_mode: never | auto | always`**
+  (`VAULTRAG_RERANK_MODE`). `auto` is the "AI decides" case: a **per-query** decision on the
+  **top-1/top-2 RRF margin**, deliberately **not** an LLM call — it's arithmetic on scores fusion
+  already computed, so it's $0, local, and deterministic enough for the gate to reproduce exactly.
+  Mechanically it promotes the existing `dominant_ratio` fast path from an internal optimization
+  to the user-facing policy, so mode and gating are **one** mechanism that can't disagree
+  (`always` = ratio 0). Values are `never`/`always` **not** `on`/`off` because A/B overlays are
+  YAML and **YAML 1.1 parses bare `on`/`off` as booleans** — `rerank_mode: on` would arrive as
+  `True`. The retired `VAULTRAG_RERANK_ENABLED` now **raises** instead of being silently dropped
+  (pydantic-settings ignores unknown vars; a silent no-op reads as "the stage is broken").
+- **THE finding — rerank is latency-bound, not quality-bound.** Choosing the default forced the
+  first real timing of stage 4. Measured on this box (Apple Silicon, onnxruntime CPU):
+  **~500 ms per passage** — `model_int8` **502**, `model_quantized` **509**, i.e. **quantization
+  is not the bottleneck** (fp16 failed to open; fp32 needs a 2.3 GB external-data sidecar, untested).
+  At the shipped `rerank_top_n=50` that is **~25 s for one reranked query**. `search` is an
+  interactive MCP tool an agent blocks on, so **default = `never`** — not because the +0.036 MRR@5
+  isn't real, but because nobody waits 25 s for it. Also measured the `auto` gate's firing rate on
+  the 72-case corpus (fusion scores only, no model needed — cheap to re-run per vault):
+  top1/top2 ratio **min 1.000 / median 1.291 / max 2.804**; at the shipped ratio **1.5 it skips
+  37.5%** of queries (1.1 → 70.8%, 2.0 → 25.0%). So `auto` is a real middle ground, not `always`
+  with extra steps — but 25 s on the 62.5% it *does* rerank is still 25 s.
+- **Corrected a mistake I made mid-session:** I first defaulted the product to `auto`, which made
+  the **test suite** start downloading and running a cross-encoder (the run hung >40 min). Two
+  fixes: default → `never`, and — the durable one — **anything that measures retrieval now pins
+  its rerank mode explicitly instead of inheriting it.** `vaultrag eval` gained `--rerank`
+  (default `never`; precedence `--rerank` > `--config` overlay > pinned-off) and the eval tests
+  use a `gate_settings()` helper. A gate must state what it measures; a PR check must never
+  acquire a 600 MB model and a 25 s/query stage by accident.
+- **Files:** `config.py` (`RerankMode` enum lives here — `retrieval` can't be imported by the
+  dependency-free leaf without a cycle; `rerank_mode` field; legacy-env validator),
+  `retrieval/rerank.py` (`RerankParams.for_mode`, **`should_rerank`**, `rerank_params_for`,
+  `load_reranker(mode=…)`), `retrieval/__init__.py`, `cli.py` (`--rerank`), `eval/harness.py`
+  (`EvalReport.rerank_mode`, reconstructed from what actually ran, not read back from Settings),
+  `eval/report.py`, `eval/overlay.py`. Tests: +8 in `test_rerank.py`, `gate_settings()` in
+  `test_eval.py`. **Vault:** `reference-database-schema.md`, `knowledge-graph-integration.md`,
+  `p2-step-plan.md`, `agent-inbox/rerank-threshold-should-be-per-vault-not-global.md` (the
+  latency table + a reprioritized open-questions list). **420 tests** green, ruff, mypy (49),
+  gate unchanged at 1.000 / 0.892 / 0.919.
+- **Next / handoff:** **Stage 3 (`related` + graph-expand)** is unblocked — the rerank question
+  that gated it is now settled. Before spending anything more on rerank *quality*, the open work
+  is making the stage **affordable**, in this order (now in the agent-inbox note): (a) drop
+  `rerank_top_n` 50 → 5-10, since cost is **linear** in it and this is untested; (b) test fp32
+  `onnx/model.onnx` + sidecar — int8 often lacks optimized ARM kernels, so it may not be the
+  fast one; (c) a smaller cross-encoder (bge-reranker-base / MiniLM) — the `Reranker` protocol
+  already makes it a config change, but the model is pinned in
+  `reference-technology-stack.md` so it needs a decision note; (d) profile batch/thread settings.
+  Also still unmeasured: **`auto`'s actual quality** on either golden set — I have its firing
+  rate and `always`'s quality (+0.036 MRR@5, previous session) but the `auto` eval run was killed
+  at 40 min. Run it with a reduced `rerank_top_n` once (a) lands.
+
+### 2026-07-21 — P2 Stage 2: link-graph persistence (`links` table + resolver)
+- **Did:** Anik: *"impliment the next stage"* → Stage 2 of
+  `../Rag/projects/vaultrag/p2-step-plan.md`. Wikilinks have been parsed since P0 and thrown
+  away ever since; they now persist. **(1) Schema:** `links(id, project_id, src_doc, dst_doc
+  NULL, dst_raw, dst_key, kind, anchor)` exactly as `reference-database-schema.md` specifies,
+  **plus a `dst_key` column** (the normalized target — what re-resolution joins on) and **plus a
+  new `doc_keys(project_id, doc_id, kind, key)` table**, a derived reverse index of the four
+  names a doc answers to so resolving a target is one indexed lookup instead of four. FK actions
+  carry the semantics: `src_doc` **CASCADE** (deleting a note removes the links it wrote),
+  `dst_doc` **SET NULL** (links *pointing at* it dangle, as they do in Obsidian). **(2) Resolver**
+  — new pure module `store/links.py`: `normalize_key` (casefold / whitespace-collapse / `.md`-strip
+  / separator-normalize), `doc_keys_for`, `link_edges`, `resolve_key`. **(3) Store API:** 10
+  methods on `MetaStore` incl. `backlinks`, `neighbors` (recursive CTE, both directions, `UNION`
+  to terminate on cycles, `MIN(hops)` for shortest), `tag_siblings`, `unresolved_links`.
+  **(4) Pipeline:** `_write_graph` after the document commits, + a **graph backfill** in
+  `reindex_vault`. **(5)** `ReindexStats.graph_backfilled` + CLI surfacing.
+- **Decision 4 settled — but the recommended ladder was wrong and got a tier.** The plan said
+  resolve "by normalized title, then alias". That is **not Obsidian's semantics**: `[[Note]]`
+  addresses the **file**, whereas `title` is frontmatter-else-first-heading-else-stem and often
+  differs from the filename. A vault where `services/gateway-service.md` is titled "Gateway
+  Service" must resolve `[[gateway-service]]`, and title-first misses it. Shipped ladder:
+  **`path` → `basename` → `title` → `alias`**. Everything else in the recommendation held:
+  ambiguity inside the winning tier → `dst_doc=NULL` + `dst_raw` kept (**never guess**), and a
+  lower tier never breaks a higher tier's tie (an alias does not settle a title collision — both
+  notes really are called that).
+- **Re-resolution is broader than the plan's "re-resolve the NULL set", on purpose.** Two cases
+  the NULL-only rule misses: **(a)** an *already-resolved* edge goes stale when a new note
+  outranks the match it settled for (a real `Gateway.md` appearing must steal `[[Gateway]]` from
+  a note merely *titled* Gateway); **(b)** a **delete** can *un*-break a tie — two notes titled
+  "Foo" blocked every `[[Foo]]`, delete one and the survivor should win. So every edge whose
+  target names the changed doc is re-derived, on both add and delete. Still bounded to that doc's
+  names, never a full-graph sweep. Both cases have tests.
+- **The backfill is the part that would have been silently forgotten.** Edges are written on
+  ingest — but an existing vault's files still hash-match, so the diff calls them `unchanged` and
+  **no ingest ever runs**. Stage 2 would have landed as an **empty graph on every already-indexed
+  vault**, looking perfectly healthy while `related` found nothing — the same silent-green shape
+  as the Stage 1 fixture bug. `reindex_vault` now re-parses docs with **zero `doc_keys` rows**
+  (the reliable pre-Stage-2 marker — every ingested doc has at least a `path` key) and writes
+  metadata + edges only: no chunking, no embedding, no Qdrant call.
+- **Verify (measured on the real vault, not only fixtures):** the live `state/vaultrag.db` was
+  genuinely pre-Stage-2 (82 docs, **`links` table did not exist**) → reindex backfilled **54 docs,
+  `chunks_written` for those = 0** (nothing re-embedded); **147 edges, 133 resolved = 90.5%**;
+  the **14 danglers are all correct** — the vault's own prose *documenting* wikilink syntax
+  (`[[Note]]` ×6, `[[...]]`, `[[wikilinks]]`) plus one deliberately-unwritten `[[Future Note]]`;
+  **0 cross-project edges** (SQL-verified over the whole table); second reindex = 95 ms no-op,
+  `graph_backfilled` 0. Eval gate **unmoved** at recall@10 1.000 / MRR@5 0.892 / nDCG@10 0.919
+  (Stage 2 is a data layer — it does not touch retrieval). Hub/orphan analytics come out for free
+  and look sane (`evaluation-framework.md` = 8 backlinks, 8 neighbours at 1 hop, 41 at 2).
+- **Found + fixed a real parsing bug:** `[[Note\|alias]]` — how Obsidian escapes a pipe **inside a
+  markdown table** — left the `\` stranded on the target (`Note\`), so **every wikilink in a table
+  failed to resolve**. Normalization now strips it. Pre-existing since P0, only visible once
+  something actually consumed the links.
+- **Files:** `src/vaultrag/store/links.py` (new), `store/base.py` (+`LinkRow`/`LinkedDoc`/
+  `NeighborDoc`/`SiblingDoc` + 10 protocol methods), `store/sqlite.py` (+`links`/`doc_keys` DDL +
+  impls + delete-time re-resolution), `store/__init__.py` (exports), `indexer/pipeline.py`
+  (`_write_graph`, `_backfill_graph`, `ReindexStats.graph_backfilled`), `cli.py` (surface the
+  backfill count). Tests: `tests/test_links.py` (new, 44) + 8 end-to-end in
+  `test_indexer_pipeline.py`. **Vault:** `p2-step-plan.md` Log (Stage 2 done + decision 4).
+  Green: **412 tests** (+53), ruff, ruff format, mypy (49).
+- **Both open questions RULED by Anik, same session (2026-07-21):**
+  **(a) `doc_keys` — KEEP + document.** *"It's derived data and rebuilt automatically, so it isn't
+  introducing another authoritative source of truth."* Written into
+  `../Rag/reference/reference-database-schema.md` (with the FK semantics and the resolution
+  ladder) and into `knowledge-graph-integration.md`.
+  **(b) Tag edges — do NOT duplicate into `links`.** Ratified as built. The reference schema's
+  `kind` now reads `wiki|embed|diagram` (was `wiki|embed|tag|diagram`); siblings stay served from
+  `tags`.
+- **Next / handoff:** **Stage 3 — `related` MCP tool + graph-expand (retrieval stage 6)**, which
+  is the first consumer of all of this; `backlinks`/`neighbors`/`tag_siblings`/`linked_docs` are
+  already shaped for it (they return path + title, which is what `related` returns). Things to
+  know: (a) the rerank-default question from the previous session is **still unruled and now
+  matters more** — Stage 3 reorders results, so settle it before tuning a stage-6 boost;
+  (b) `neighbors` walks **resolved edges only**, so a vault with many dangling links has a
+  sparser graph than its author thinks — `unresolved_links` is the hygiene signal to surface via
+  `overview`; (c) `tag_siblings` counts **prefix-expanded** tags (`a/b/c` → `a`, `a/b`, `a/b/c`),
+  so a shared top-level namespace inflates the count — it is a ranking weight, not a literal
+  shared-tag count; (d) the hermetic eval gate still **cannot** exercise a payload index (the
+  in-memory Qdrant caveat from last session stands) — irrelevant to Stage 2, which is pure
+  SQLite, but Stage 3's boost should get a server-Qdrant check if it touches filtering.
+  Working tree: new `store/links.py` + `tests/test_links.py`, edits to `store/*`,
+  `indexer/pipeline.py`, `cli.py`, `MEMORY.md`; vault plan note edited (separate repo). Commit
+  when Anik asks.
 
 ### 2026-07-21 — Stage 1 re-tested against the REAL Qdrant server (tenancy + rerank findings)
 - **Did:** Anik: *"run the qdrant and test it using that"*. Brought up `docker compose up -d qdrant`

@@ -23,7 +23,7 @@ from typing import Annotated
 import typer
 
 from vaultrag import __version__
-from vaultrag.config import Settings, load_settings
+from vaultrag.config import RerankMode, Settings, load_settings
 from vaultrag.embedding.base import EmbeddingError
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.embedding.ollama import OllamaEmbedder
@@ -56,7 +56,7 @@ from vaultrag.indexer.pipeline import IngestContext, reindex_vault
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
-from vaultrag.retrieval import RerankParams, load_reranker
+from vaultrag.retrieval import load_reranker, rerank_params_for
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
 
@@ -131,10 +131,13 @@ def reindex(
             if closer is not None:
                 closer.close()
 
+    # The graph backfill is silent when there's nothing to do (the steady state), but
+    # worth surfacing on the one run that upgrades a pre-P2-Stage-2 index.
+    graph = f", {stats.graph_backfilled} graph backfilled" if stats.graph_backfilled else ""
     typer.echo(
         f"reindex complete: +{stats.created} ~{stats.updated} -{stats.deleted} "
         f"→{stats.renamed} ={stats.unchanged} !{stats.failed} "
-        f"({stats.chunks_written} chunks, {stats.elapsed_ms:.0f} ms)"
+        f"({stats.chunks_written} chunks{graph}, {stats.elapsed_ms:.0f} ms)"
     )
     if stats.failed:
         raise typer.Exit(code=1)
@@ -276,7 +279,7 @@ def mcp(
             # visibly, not mid-query. load_reranker never raises: a fetch/load failure
             # degrades to a no-op reranker so the server still serves (rerank-off).
             reranker = load_reranker(
-                enabled=settings.rerank_enabled,
+                mode=settings.rerank_mode,
                 repo_id=settings.rerank_model,
                 model_file=settings.rerank_model_file,
             )
@@ -317,11 +320,7 @@ def mcp(
                 default_k=settings.default_top_k,
                 default_budget_tokens=settings.budget_tokens,
                 reranker=reranker,
-                rerank_params=RerankParams(
-                    top_n=settings.rerank_top_n,
-                    threshold=settings.rerank_threshold,
-                    dominant_ratio=settings.rerank_dominant_ratio,
-                ),
+                rerank_params=rerank_params_for(settings),
                 parent_swap_enabled=settings.parent_swap_enabled,
                 parent_max_tokens=settings.parent_max_tokens,
                 vault_name=resolved_vault_name,
@@ -414,6 +413,15 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
         bool,
         typer.Option("--show-cases", help="Print the per-case rank table, not just the summary."),
     ] = False,
+    rerank: Annotated[
+        RerankMode | None,
+        typer.Option(
+            "--rerank",
+            help="Rerank mode for this run (never|auto|always). Defaults to 'never' — the "
+            "gate pins it rather than inheriting the product default, so the CI number "
+            "stays hermetic and fast. A --config overlay setting rerank_mode still wins.",
+        ),
+    ] = None,
     record: Annotated[
         bool,
         typer.Option(
@@ -429,12 +437,23 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
     in-memory Qdrant using frozen Qwen3 vectors, so it needs no Docker, no Ollama and no
     network, and returns the same numbers on every machine. That is what CI runs::
 
-        uv run vaultrag eval                      # the gate
-        uv run vaultrag eval --golden design      # dogfood the live index
-        uv run vaultrag eval --config base.yaml --config rerank-on.yaml   # A/B
+        uv run vaultrag eval                          # the gate
+        uv run vaultrag eval --golden design          # dogfood the live index
+        uv run vaultrag eval --rerank always          # measure the cross-encoder
+        uv run vaultrag eval --config a.yml --config b.yml   # A/B two configs
+
+    **The rerank stage is pinned off unless asked for.** The gate inherits every other
+    setting from the environment, but not this one: a cross-encoder run downloads a ~600 MB
+    ONNX model and scores ~50 passages per query, which would turn a hermetic sub-minute
+    check into a slow, network-dependent one. Measuring rerank is a deliberate act
+    (``--rerank``/an overlay), not something a PR gate does by accident.
     """
     settings = load_settings()
     configure_logging(settings.log_level)
+
+    # Pinned first so an A/B overlay can still opt in; --rerank is applied after the
+    # overlays below, so precedence reads: --rerank > overlay > pinned-off.
+    settings = settings.model_copy(update={"rerank_mode": RerankMode.never})
 
     try:
         golden_set = _resolve_golden(golden)
@@ -457,6 +476,8 @@ def eval(  # shadows the builtin: `eval` is the documented subcommand name
         raise typer.Exit(code=2) from exc
     if not overlays:
         overlays = [("current settings", settings)]
+    if rerank is not None:
+        overlays = [(label, s.model_copy(update={"rerank_mode": rerank})) for label, s in overlays]
 
     if project:
         golden_set = replace(golden_set, project_id=project)

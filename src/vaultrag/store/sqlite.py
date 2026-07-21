@@ -2,9 +2,9 @@
 
 Zero-ops, single-file, single-writer — the right default for a single-user box
 (``../Rag/decisions/metadata-store-sqlite-to-postgres.md``). The DDL is written to
-carry forward to Postgres 16 unchanged (``reference-database-schema.md``). P0 tables
-only: ``projects, documents, chunks, jobs, embed_cache, tags`` — ``links, api_keys,
-query_log`` are deferred (p0-step-plan.md Step 2).
+carry forward to Postgres 16 unchanged (``reference-database-schema.md``). Tables:
+``projects, documents, chunks, tags, jobs, embed_cache`` (P0) + ``links, doc_keys``
+(P2 Stage 2 — the wikilink graph); ``api_keys, query_log`` remain deferred to P3.
 
 Identity is content-addressed (``vaultrag.models``): a document is
 ``document_id(project, path)`` and a chunk is ``chunk_point_id(project, path, ix)``,
@@ -23,18 +23,26 @@ from types import TracebackType
 from typing import Any
 
 from vaultrag.config import Settings
-from vaultrag.models import Chunk, DocumentMetadata, document_id
+from vaultrag.models import Chunk, DocumentMetadata, Link, document_id
 from vaultrag.store.base import (
     ChunkRow,
     DocumentRow,
     JobRow,
     JobState,
+    LinkedDoc,
+    LinkRow,
+    NeighborDoc,
     ProjectRow,
+    SiblingDoc,
 )
+from vaultrag.store.links import DocKeyKind, doc_keys_for, link_edges, resolve_key
 
 # jobs are idempotent by (project, path, hash); a deterministic id makes re-enqueue
 # a PK no-op rather than a duplicate row.
 _JOB_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "vaultrag://jobs")
+# Edges are identified by what they *are* — (source, kind, normalized target, anchor) —
+# so replacing a document's links rewrites the same ids rather than churning the table.
+_LINK_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "vaultrag://links")
 _SEP = "\x1f"
 
 # Same DDL runs on SQLite now and Postgres 16 later (reference-database-schema.md).
@@ -81,6 +89,39 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE INDEX IF NOT EXISTS idx_tags_project_tag ON tags(project_id, tag);
 
+-- The wikilink graph (P2 Stage 2). `dst_doc` is NULL while a target names no indexed
+-- document; `dst_key` is the normalized target (store/links.normalize_key) and is what
+-- re-resolution joins on when a note later appears or disappears.
+--   src_doc CASCADE   — deleting a note removes the links it wrote.
+--   dst_doc SET NULL  — deleting a note does NOT remove links pointing at it; they
+--                       dangle, exactly as they do in Obsidian, and re-resolve if the
+--                       note comes back (or if its removal breaks a title tie).
+CREATE TABLE IF NOT EXISTS links (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL,
+    src_doc     TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    dst_doc     TEXT REFERENCES documents(id) ON DELETE SET NULL,
+    dst_raw     TEXT NOT NULL,
+    dst_key     TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    anchor      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_doc);
+CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst_doc);
+CREATE INDEX IF NOT EXISTS idx_links_key ON links(project_id, dst_key);
+
+-- Reverse index of "what can this document be linked by" — path / basename / title /
+-- alias, normalized. Derived entirely from `documents` + frontmatter, so it is rebuilt
+-- on every upsert; it exists so resolving a target is one indexed lookup, not four.
+CREATE TABLE IF NOT EXISTS doc_keys (
+    project_id  TEXT NOT NULL,
+    doc_id      TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    PRIMARY KEY (doc_id, kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_keys_lookup ON doc_keys(project_id, key);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
     project_id  TEXT NOT NULL,
@@ -110,6 +151,35 @@ def _now() -> int:
 
 def _job_id(project_id: str, path: str | None, hash: str | None) -> str:
     return str(uuid.uuid5(_JOB_NAMESPACE, f"{project_id}{_SEP}{path or ''}{_SEP}{hash or ''}"))
+
+
+def _link_id(src_doc: str, kind: str, dst_key: str, anchor: str | None) -> str:
+    return str(
+        uuid.uuid5(_LINK_NAMESPACE, f"{src_doc}{_SEP}{kind}{_SEP}{dst_key}{_SEP}{anchor or ''}")
+    )
+
+
+def _link_row(row: sqlite3.Row) -> LinkRow:
+    return LinkRow(
+        id=row["id"],
+        project_id=row["project_id"],
+        src_doc=row["src_doc"],
+        dst_doc=row["dst_doc"],
+        dst_raw=row["dst_raw"],
+        dst_key=row["dst_key"],
+        kind=row["kind"],
+        anchor=row["anchor"],
+    )
+
+
+def _linked_doc(row: sqlite3.Row) -> LinkedDoc:
+    return LinkedDoc(
+        doc_id=row["id"],
+        path=row["path"],
+        title=row["title"],
+        kind=row["kind"],
+        anchor=row["anchor"],
+    )
 
 
 class SQLiteMetaStore:
@@ -229,6 +299,7 @@ class SQLiteMetaStore:
                 ),
             )
             self._replace_tags(project_id, doc_id, meta.tags)
+            self._replace_doc_keys(project_id, doc_id, meta)
         return doc_id
 
     def get_document(self, project_id: str, path: str) -> DocumentRow | None:
@@ -256,12 +327,17 @@ class SQLiteMetaStore:
         return {row["path"]: row["hash"] for row in rows}
 
     def delete_document(self, project_id: str, path: str) -> None:
+        doc_id = document_id(project_id, path)
+        # Read the doc's names BEFORE the delete cascades `doc_keys` away: losing a
+        # document can *un*-break a tie (two notes titled "Foo" blocked every [[Foo]];
+        # delete one and the survivor now wins), so those targets need re-resolving.
+        keys = self._keys_for_doc(doc_id)
         with self._conn:
-            # chunks + tags cascade via ON DELETE CASCADE.
-            self._conn.execute(
-                "DELETE FROM documents WHERE id = ?",
-                (document_id(project_id, path),),
-            )
+            # chunks + tags + doc_keys cascade, and links pointing here go dst_doc=NULL,
+            # via the FK actions declared in _SCHEMA.
+            self._conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        if keys:
+            self._reresolve_keys(project_id, keys)
 
     # --- chunks ---------------------------------------------------------------
     def upsert_chunks(self, chunks: Sequence[Chunk]) -> None:
@@ -346,6 +422,219 @@ class SQLiteMetaStore:
             "SELECT tag FROM tags WHERE doc_id = ? ORDER BY tag", (doc_id,)
         ).fetchall()
         return [row["tag"] for row in rows]
+
+    # --- doc_keys (the resolver's reverse index) ------------------------------
+    def _replace_doc_keys(self, project_id: str, doc_id: str, meta: DocumentMetadata) -> None:
+        """Rebuild a document's addressable names. Caller owns the transaction frame."""
+        self._conn.execute("DELETE FROM doc_keys WHERE doc_id = ?", (doc_id,))
+        keys = doc_keys_for(meta)
+        if keys:
+            self._conn.executemany(
+                "INSERT INTO doc_keys (project_id, doc_id, kind, key) VALUES (?, ?, ?, ?)",
+                [(project_id, doc_id, str(k.kind), k.key) for k in keys],
+            )
+
+    def _keys_for_doc(self, doc_id: str) -> set[str]:
+        rows = self._conn.execute("SELECT key FROM doc_keys WHERE doc_id = ?", (doc_id,)).fetchall()
+        return {row["key"] for row in rows}
+
+    def doc_key_count(self, doc_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM doc_keys WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        return int(row["n"])
+
+    # --- links / graph --------------------------------------------------------
+    def _resolve_keys(self, project_id: str, keys: Iterable[str]) -> dict[str, str | None]:
+        """Resolve normalized targets → doc id (or ``None``), in one indexed sweep.
+
+        Batched deliberately: a document with 40 links must not become 40 queries.
+        """
+        wanted = list(dict.fromkeys(k for k in keys if k))
+        if not wanted:
+            return {}
+        # key -> tier -> [doc_id]; resolve_key() applies the precedence + no-guess rule.
+        buckets: dict[str, dict[DocKeyKind, list[str]]] = {k: {} for k in wanted}
+        for start in range(0, len(wanted), 900):  # SQLite's 999-variable ceiling
+            batch = wanted[start : start + 900]
+            placeholders = ",".join("?" * len(batch))
+            rows = self._conn.execute(
+                "SELECT key, kind, doc_id FROM doc_keys "
+                f"WHERE project_id = ? AND key IN ({placeholders}) "
+                "ORDER BY doc_id",  # stable: an ambiguous tier must look ambiguous every run
+                (project_id, *batch),
+            ).fetchall()
+            for row in rows:
+                buckets[row["key"]].setdefault(DocKeyKind(row["kind"]), []).append(row["doc_id"])
+        return {key: resolve_key(key, tiers) for key, tiers in buckets.items()}
+
+    def replace_links(self, project_id: str, src_doc: str, links: Iterable[Link]) -> int:
+        edges = link_edges(links)
+        resolved = self._resolve_keys(project_id, (e.dst_key for e in edges))
+        rows = [
+            (
+                _link_id(src_doc, e.kind, e.dst_key, e.anchor),
+                project_id,
+                src_doc,
+                resolved.get(e.dst_key),
+                e.dst_raw,
+                e.dst_key,
+                e.kind,
+                e.anchor,
+            )
+            for e in edges
+        ]
+        with self._conn:
+            # Replace, don't merge: a document's edges are whatever its text says now,
+            # so a deleted wikilink must leave the graph on the next ingest.
+            self._conn.execute("DELETE FROM links WHERE src_doc = ?", (src_doc,))
+            if rows:
+                self._conn.executemany(
+                    "INSERT INTO links "
+                    "(id, project_id, src_doc, dst_doc, dst_raw, dst_key, kind, anchor) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+        return len(rows)
+
+    def reresolve_links(self, project_id: str, doc_id: str) -> int:
+        keys = self._keys_for_doc(doc_id)
+        return self._reresolve_keys(project_id, keys) if keys else 0
+
+    def _reresolve_keys(self, project_id: str, keys: Iterable[str]) -> int:
+        """Re-point every edge whose target is one of ``keys``. Returns rows changed.
+
+        Runs over *all* matching edges, not just the dangling ones. An edge that
+        already resolved can still be wrong after a change: a new note whose basename
+        matches now outranks the title match the edge was pointing at, and a deleted
+        note can leave a previously-ambiguous target with a single winner. Re-deriving
+        both directions from the current index is what keeps the graph a pure function
+        of the vault (CLAUDE.md §6) instead of a pile of history.
+        """
+        resolved = self._resolve_keys(project_id, keys)
+        if not resolved:
+            return 0
+        changed = 0
+        with self._conn:
+            for key, dst in resolved.items():
+                cur = self._conn.execute(
+                    "UPDATE links SET dst_doc = ? "
+                    "WHERE project_id = ? AND dst_key = ? AND dst_doc IS NOT ?",
+                    (dst, project_id, key, dst),
+                )
+                changed += cur.rowcount
+        return changed
+
+    def outgoing_links(self, project_id: str, doc_id: str) -> list[LinkRow]:
+        rows = self._conn.execute(
+            "SELECT * FROM links WHERE project_id = ? AND src_doc = ? ORDER BY dst_key, kind",
+            (project_id, doc_id),
+        ).fetchall()
+        return [_link_row(row) for row in rows]
+
+    def linked_docs(self, project_id: str, doc_id: str) -> list[LinkedDoc]:
+        rows = self._conn.execute(
+            """
+            SELECT d.id, d.path, d.title, l.kind, l.anchor
+              FROM links l
+              JOIN documents d ON d.id = l.dst_doc
+             WHERE l.project_id = ? AND l.src_doc = ? AND l.dst_doc IS NOT ?
+             ORDER BY d.path, l.kind
+            """,
+            (project_id, doc_id, doc_id),  # IS NOT doc_id: drop [[self]] links
+        ).fetchall()
+        return [_linked_doc(row) for row in rows]
+
+    def backlinks(self, project_id: str, doc_id: str) -> list[LinkedDoc]:
+        rows = self._conn.execute(
+            """
+            SELECT d.id, d.path, d.title, l.kind, l.anchor
+              FROM links l
+              JOIN documents d ON d.id = l.src_doc
+             WHERE l.project_id = ? AND l.dst_doc = ? AND l.src_doc IS NOT ?
+             ORDER BY d.path, l.kind
+            """,
+            (project_id, doc_id, doc_id),
+        ).fetchall()
+        return [_linked_doc(row) for row in rows]
+
+    def neighbors(
+        self,
+        project_id: str,
+        doc_id: str,
+        hops: int = 1,
+        limit: int = 50,
+    ) -> list[NeighborDoc]:
+        if hops < 1:
+            return []
+        rows = self._conn.execute(
+            # UNION (not UNION ALL) terminates on cycles — a vault's graph is dense and
+            # very much not a DAG. It dedupes (doc, hops) pairs, so the same document can
+            # still arrive at two depths; MIN(hops) below collapses it to the shortest.
+            """
+            WITH RECURSIVE reach(doc_id, hops) AS (
+                SELECT ?, 0
+                UNION
+                SELECT CASE WHEN l.src_doc = reach.doc_id THEN l.dst_doc ELSE l.src_doc END,
+                       reach.hops + 1
+                  FROM links l, reach
+                 WHERE reach.hops < ?
+                   AND l.project_id = ?
+                   AND l.dst_doc IS NOT NULL
+                   AND (l.src_doc = reach.doc_id OR l.dst_doc = reach.doc_id)
+            )
+            SELECT d.id, d.path, d.title, MIN(reach.hops) AS hops
+              FROM reach
+              JOIN documents d ON d.id = reach.doc_id
+             WHERE reach.doc_id IS NOT ? AND d.project_id = ?
+             GROUP BY d.id
+             ORDER BY hops, d.path
+             LIMIT ?
+            """,
+            (doc_id, hops, project_id, doc_id, project_id, limit),
+        ).fetchall()
+        return [
+            NeighborDoc(
+                doc_id=row["id"], path=row["path"], title=row["title"], hops=int(row["hops"])
+            )
+            for row in rows
+        ]
+
+    def tag_siblings(self, project_id: str, doc_id: str, limit: int = 20) -> list[SiblingDoc]:
+        rows = self._conn.execute(
+            # Note: `tags` holds prefix-expanded tags (a/b/c → a, a/b, a/b/c), so a shared
+            # top-level namespace counts. That is intentional — a shared `project/x` root
+            # is a real (if weak) sibling signal — but it means the count is a ranking
+            # weight, not a claim about how many literal tags two notes share.
+            """
+            SELECT d.id, d.path, d.title, COUNT(*) AS shared
+              FROM tags mine
+              JOIN tags theirs ON theirs.tag = mine.tag AND theirs.doc_id IS NOT mine.doc_id
+              JOIN documents d ON d.id = theirs.doc_id
+             WHERE mine.doc_id = ? AND theirs.project_id = ?
+             GROUP BY d.id
+             ORDER BY shared DESC, d.path
+             LIMIT ?
+            """,
+            (doc_id, project_id, limit),
+        ).fetchall()
+        return [
+            SiblingDoc(
+                doc_id=row["id"],
+                path=row["path"],
+                title=row["title"],
+                shared_tags=int(row["shared"]),
+            )
+            for row in rows
+        ]
+
+    def unresolved_links(self, project_id: str, limit: int = 100) -> list[LinkRow]:
+        rows = self._conn.execute(
+            "SELECT * FROM links WHERE project_id = ? AND dst_doc IS NULL "
+            "ORDER BY dst_key, src_doc LIMIT ?",
+            (project_id, limit),
+        ).fetchall()
+        return [_link_row(row) for row in rows]
 
     # --- jobs -----------------------------------------------------------------
     def enqueue_job(

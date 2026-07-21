@@ -32,7 +32,7 @@ from pathlib import Path
 
 from qdrant_client import QdrantClient
 
-from vaultrag.config import Settings
+from vaultrag.config import RerankMode, Settings
 from vaultrag.embedding.base import Embedder, EmbeddingError
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.embedding.ollama import OllamaEmbedder
@@ -43,7 +43,13 @@ from vaultrag.index.base import SparseEmbedder, VectorStore
 from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.index.sparse import Bm25Embedder
 from vaultrag.indexer.pipeline import reindex_vault
-from vaultrag.retrieval import Reranker, RerankParams, load_reranker, search
+from vaultrag.retrieval import (
+    Reranker,
+    RerankParams,
+    load_reranker,
+    rerank_params_for,
+    search,
+)
 from vaultrag.store.sqlite import SQLiteMetaStore
 
 # Big enough that the budget packer never truncates a 10-hit result list. See the module
@@ -119,6 +125,9 @@ class EvalReport:
     metrics: Metrics
     results: list[CaseResult]
     reranked: bool
+    # Reconstructed from what actually ran (reranker present? gate open?), not read back
+    # from Settings — a results table must describe the run, not the intent.
+    rerank_mode: str = str(RerankMode.never)
 
     @property
     def misses(self) -> list[CaseResult]:
@@ -135,6 +144,12 @@ def run_eval(golden: GoldenSet, stack: SearchStack, *, label: str = "config") ->
     actually receives. With rerank off the two passes would be identical, so only one runs.
     """
     reranked = stack.reranker is not None
+    if not reranked:
+        mode = RerankMode.never
+    elif stack.rerank_params.dominant_ratio <= 0:
+        mode = RerankMode.always
+    else:
+        mode = RerankMode.auto
     results: list[CaseResult] = []
     post_rankings: list[tuple[Sequence[str], frozenset[str]]] = []
     pre_rankings: list[tuple[Sequence[str], frozenset[str]]] = []
@@ -159,6 +174,7 @@ def run_eval(golden: GoldenSet, stack: SearchStack, *, label: str = "config") ->
         metrics=aggregate(post_rankings, pre_rerank=pre_rankings),
         results=results,
         reranked=reranked,
+        rerank_mode=str(mode),
     )
 
 
@@ -277,11 +293,7 @@ def live_stack(golden: GoldenSet, settings: Settings) -> Iterator[SearchStack]:
 
 
 def _rerank_params(settings: Settings) -> RerankParams:
-    return RerankParams(
-        top_n=settings.rerank_top_n,
-        threshold=settings.rerank_threshold,
-        dominant_ratio=settings.rerank_dominant_ratio,
-    )
+    return rerank_params_for(settings)
 
 
 def _maybe_reranker(settings: Settings) -> Reranker | None:
@@ -292,10 +304,8 @@ def _maybe_reranker(settings: Settings) -> Reranker | None:
     fusion while reporting "reranked" would be a lie in a results table, so the harness
     checks and the caller surfaces it.
     """
-    if not settings.rerank_enabled:
-        return None
     return load_reranker(
-        enabled=True,
+        mode=settings.rerank_mode,
         repo_id=settings.rerank_model,
         model_file=settings.rerank_model_file,
     )

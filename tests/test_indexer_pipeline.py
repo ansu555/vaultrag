@@ -293,3 +293,160 @@ def test_partial_failure_reserves_hash_none_and_retries_next_run(
     assert doc2 is not None
     assert doc2.hash is not None
     assert inner.count(PROJECT) == 1
+
+
+# ---------------------------------------------------------------------------
+# Link graph (P2 Stage 2): the pipeline persists edges, and a reindex rebuilds them
+# ---------------------------------------------------------------------------
+def _linked_note(title: str, *targets: str) -> str:
+    body = " ".join(f"[[{t}]]" for t in targets)
+    return f"# {title}\n\n{body}\n\n" + _paragraph(150, title.lower().replace(" ", ""))
+
+
+def test_reindex_persists_the_link_graph(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    vault = write_vault(
+        tmp_path,
+        {"alpha.md": _linked_note("Alpha", "beta"), "beta.md": _linked_note("Beta", "alpha")},
+    )
+    run(vault, store, vector_store, embedder)
+
+    alpha = document_id(PROJECT, "alpha.md")
+    beta = document_id(PROJECT, "beta.md")
+    assert [link.dst_doc for link in store.outgoing_links(PROJECT, alpha)] == [beta]
+    assert [d.doc_id for d in store.backlinks(PROJECT, alpha)] == [beta]
+
+
+def test_a_link_to_a_not_yet_written_note_resolves_when_it_lands(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    vault = write_vault(tmp_path, {"alpha.md": _linked_note("Alpha", "Future Note")})
+    run(vault, store, vector_store, embedder)
+    assert [link.dst_raw for link in store.unresolved_links(PROJECT)] == ["Future Note"]
+
+    (vault / "future-note.md").write_text(_linked_note("Future Note"), encoding="utf-8")
+    run(vault, store, vector_store, embedder)
+
+    assert store.unresolved_links(PROJECT) == []
+    alpha = document_id(PROJECT, "alpha.md")
+    assert [link.dst_doc for link in store.outgoing_links(PROJECT, alpha)] == [
+        document_id(PROJECT, "future-note.md")
+    ]
+
+
+def test_editing_a_note_updates_its_edges(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    vault = write_vault(
+        tmp_path,
+        {
+            "alpha.md": _linked_note("Alpha", "beta"),
+            "beta.md": _linked_note("Beta"),
+            "gamma.md": _linked_note("Gamma"),
+        },
+    )
+    run(vault, store, vector_store, embedder)
+    (vault / "alpha.md").write_text(_linked_note("Alpha", "gamma"), encoding="utf-8")
+    run(vault, store, vector_store, embedder)
+
+    alpha = document_id(PROJECT, "alpha.md")
+    assert [link.dst_doc for link in store.outgoing_links(PROJECT, alpha)] == [
+        document_id(PROJECT, "gamma.md")
+    ]
+    assert store.backlinks(PROJECT, document_id(PROJECT, "beta.md")) == []
+
+
+def test_deleting_a_note_dangles_the_links_pointing_at_it(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    vault = write_vault(
+        tmp_path, {"alpha.md": _linked_note("Alpha", "beta"), "beta.md": _linked_note("Beta")}
+    )
+    run(vault, store, vector_store, embedder)
+    (vault / "beta.md").unlink()
+    run(vault, store, vector_store, embedder)
+
+    (edge,) = store.outgoing_links(PROJECT, document_id(PROJECT, "alpha.md"))
+    assert edge.dst_doc is None
+    assert edge.dst_raw == "beta"
+
+
+def test_a_bare_vault_reindex_rebuilds_the_whole_graph(
+    tmp_path: Path, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    # The index is a derived cache (CLAUDE.md §6): throwing the database away and
+    # reindexing must reproduce the graph exactly, not a subset.
+    vault = write_vault(
+        tmp_path,
+        {"alpha.md": _linked_note("Alpha", "beta"), "beta.md": _linked_note("Beta", "alpha")},
+    )
+    first = SQLiteMetaStore(tmp_path / "state" / "one.db")
+    run(vault, first, vector_store, embedder)
+    alpha = document_id(PROJECT, "alpha.md")
+    before = store_graph(first, alpha)
+    first.close()
+
+    second = SQLiteMetaStore(tmp_path / "state" / "two.db")
+    run(vault, second, make_vector_store(), embedder)
+    assert store_graph(second, alpha) == before
+    second.close()
+
+
+def store_graph(store: SQLiteMetaStore, doc_id: str) -> list[tuple[str, str | None]]:
+    return [(link.dst_key, link.dst_doc) for link in store.outgoing_links(PROJECT, doc_id)]
+
+
+def test_reindex_backfills_the_graph_for_docs_indexed_before_stage_2(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    # Simulate a pre-Stage-2 index: documents and chunks exist, but no edges and no
+    # doc_keys. Their hashes still match disk, so the diff calls them "unchanged" and no
+    # ingest would ever run — without the backfill the graph would silently stay empty.
+    vault = write_vault(
+        tmp_path,
+        {"alpha.md": _linked_note("Alpha", "beta"), "beta.md": _linked_note("Beta", "alpha")},
+    )
+    run(vault, store, vector_store, embedder)
+    alpha = document_id(PROJECT, "alpha.md")
+    store._conn.execute("DELETE FROM links")
+    store._conn.execute("DELETE FROM doc_keys")
+    store._conn.commit()
+    assert store.outgoing_links(PROJECT, alpha) == []
+
+    stats = run(vault, store, vector_store, embedder)
+
+    assert stats.unchanged == 2
+    assert stats.graph_backfilled == 2
+    assert stats.chunks_written == 0  # metadata + edges only: nothing was re-embedded
+    assert [link.dst_doc for link in store.outgoing_links(PROJECT, alpha)] == [
+        document_id(PROJECT, "beta.md")
+    ]
+
+
+def test_backfill_is_a_no_op_once_the_graph_exists(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    vault = write_vault(tmp_path, {"alpha.md": _linked_note("Alpha", "beta")})
+    run(vault, store, vector_store, embedder)
+    assert run(vault, store, vector_store, embedder).graph_backfilled == 0
+
+
+def test_backfill_preserves_the_stored_hash(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    # The backfill re-parses without re-hashing; if it wrote a different hash the next
+    # reindex would see a spurious update and re-embed the whole vault.
+    vault = write_vault(tmp_path, {"alpha.md": _linked_note("Alpha", "beta")})
+    run(vault, store, vector_store, embedder)
+    doc = store.get_document(PROJECT, "alpha.md")
+    assert doc is not None
+    store._conn.execute("DELETE FROM doc_keys")
+    store._conn.commit()
+
+    run(vault, store, vector_store, embedder)
+
+    after = store.get_document(PROJECT, "alpha.md")
+    assert after is not None
+    assert after.hash == doc.hash
+    assert run(vault, store, vector_store, embedder).updated == 0

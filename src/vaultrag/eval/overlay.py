@@ -6,13 +6,13 @@ same golden set against two configs side by side". An overlay is a small file of
 environment-derived settings, so a comparison file says only what differs::
 
     # rerank-on.yaml
-    rerank_enabled: true
+    rerank_mode: always
     rerank_threshold: 0.1
 
 Anything not named keeps its normal value. Both YAML and JSON are accepted — the extension
 decides — because the documented interface says ``.yaml`` and JSON costs nothing to allow.
 
-Unknown keys are **rejected**, not ignored. A typo like ``rerank_enable: true`` would
+Unknown keys are **rejected**, not ignored. A typo like ``rerank_mod: always`` would
 otherwise produce an overlay that silently changes nothing and an A/B that reports two
 identical configs as a real comparison.
 """

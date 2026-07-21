@@ -31,6 +31,8 @@ from vaultrag.retrieval.rerank import (
     RerankParams,
     load_reranker,
     rerank_candidates,
+    rerank_params_for,
+    should_rerank,
 )
 
 __all__ = [
@@ -52,5 +54,7 @@ __all__ = [
     "obsidian_uri",
     "parent_swap",
     "rerank_candidates",
+    "rerank_params_for",
     "search",
+    "should_rerank",
 ]

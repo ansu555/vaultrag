@@ -55,7 +55,7 @@ def format_summary(report: EvalReport) -> str:
     lines = [
         "=" * _WIDTH,
         f"{report.label}  ·  {report.golden_name}  ·  {m.cases} cases"
-        f"  ·  rerank {'on' if report.reranked else 'off'}",
+        f"  ·  rerank {report.rerank_mode}",
         "-" * _WIDTH,
         f"{'metric':<20}{'value':>12}{'target':>12}   ",
         f"{'recall@10':<20}{m.recall_at_10:>12.3f}{RECALL_TARGET:>12.3f}   "

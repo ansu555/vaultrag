@@ -50,6 +50,7 @@ next reconcile, instead of looking done while it isn't (CLAUDE.md §5/§6).
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -71,7 +72,7 @@ from vaultrag.indexer.scan import (
     scan_vault,
 )
 from vaultrag.indexer.secret_guard import scan_for_secrets
-from vaultrag.models import document_id
+from vaultrag.models import Document, document_id
 from vaultrag.parsing.markdown import parse_document
 from vaultrag.store.base import JobKind, JobState, MetaStore
 
@@ -145,6 +146,7 @@ class ReindexStats:
     unchanged: int = 0
     failed: int = 0
     chunks_written: int = 0
+    graph_backfilled: int = 0  # unchanged docs whose link edges were built after the fact
     elapsed_ms: float = 0.0
 
 
@@ -209,6 +211,8 @@ def reindex_vault(
         else:
             failed += 1
 
+    graph_backfilled = _backfill_graph(ctx, diff.unchanged)
+
     stats = ReindexStats(
         created=created,
         updated=updated,
@@ -217,6 +221,7 @@ def reindex_vault(
         unchanged=len(diff.unchanged),
         failed=failed,
         chunks_written=chunks_written,
+        graph_backfilled=graph_backfilled,
         elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
     )
     log.info("reindex.complete", project=project_id, vault=str(vault_path), **asdict(stats))
@@ -338,7 +343,79 @@ def _ingest_file(
     # Commit last: only now does the manifest agree with disk, so a crash anywhere above
     # leaves this path looking unindexed (hash=None) rather than falsely "done".
     ctx.store.upsert_document(ctx.project_id, document.metadata)
+    _write_graph(ctx, doc_id, document)
     return len(chunks)
+
+
+def _write_graph(ctx: IngestContext, doc_id: str, document: Document) -> None:
+    """Persist this document's link edges, then let its arrival fix everyone else's.
+
+    Two halves, and both are needed for the graph to be a pure function of the vault
+    (P2 Stage 2; ``../Rag/projects/vaultrag/knowledge-graph-integration.md``):
+
+    * **Outgoing** — replace the doc's own edges from the links just parsed. Targets
+      that name no indexed document are stored dangling (``dst_doc=NULL``), not
+      dropped.
+    * **Incoming** — re-resolve every edge anywhere in the project that *this*
+      document's names could satisfy. A note appearing is what turns a dangling
+      ``[[Future Note]]`` into a real edge, and it can also re-point an edge that had
+      settled for a weaker match (basename beats title). Bounded to targets naming
+      this doc, so it stays O(edges-that-mention-me), not O(graph).
+
+    Runs after ``upsert_document`` commits, because both halves read ``doc_keys`` —
+    which that call is what writes.
+    """
+    ctx.store.replace_links(ctx.project_id, doc_id, document.links)
+    ctx.store.reresolve_links(ctx.project_id, doc_id)
+
+
+def _backfill_graph(ctx: IngestContext, unchanged: Sequence[str]) -> int:
+    """Build link edges for already-indexed documents that never got any.
+
+    Without this, P2 Stage 2 would land as a **silently empty graph** on every vault
+    that was indexed before it: those files' hashes still match, so the diff calls them
+    ``unchanged`` and no ingest ever runs to write their edges. The index would look
+    healthy and ``related``/graph-expand would simply find nothing — the class of
+    silent-green failure the eval-gate session was burned by.
+
+    Cheap by construction: it re-parses only documents with **zero** ``doc_keys`` rows
+    (the marker of pre-Stage-2 data — every ingested doc has at least a ``path`` key),
+    and it writes only metadata + edges. No chunking, no embedding, no Qdrant call, so
+    the vectors are untouched. Once a vault is backfilled this scans a counter and does
+    nothing.
+
+    A file that fails to parse is logged and skipped: a bad note must not abort a
+    reconcile that had nothing else to do.
+    """
+    backfilled = 0
+    for path in unchanged:
+        doc_id = document_id(ctx.project_id, path)
+        if ctx.store.doc_key_count(doc_id) > 0:
+            continue
+        try:
+            abs_path = ctx.vault_path / path
+            raw_text = abs_path.read_text(encoding="utf-8", errors="replace")
+            document = parse_document(
+                path=path,
+                raw_text=raw_text,
+                content_hash=None,
+                mtime=int(abs_path.stat().st_mtime),
+            )
+            # Preserve the stored hash: this path is genuinely unchanged, and rewriting
+            # the manifest with a fresh one would be a lie if parsing ever normalizes.
+            prior = ctx.store.get_document(ctx.project_id, path)
+            meta = document.metadata.model_copy(
+                update={"hash": prior.hash if prior else document.metadata.hash}
+            )
+            ctx.store.upsert_document(ctx.project_id, meta)
+            _write_graph(ctx, doc_id, document)
+        except Exception as exc:  # one bad note can't abort the backfill
+            log.warning("reindex.graph_backfill_failed", path=path, error=str(exc))
+            continue
+        backfilled += 1
+    if backfilled:
+        log.info("reindex.graph_backfilled", project=ctx.project_id, documents=backfilled)
+    return backfilled
 
 
 def _read_and_ingest(ctx: IngestContext, path: str, content_hash: str) -> int:

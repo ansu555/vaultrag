@@ -10,10 +10,58 @@ See ``../Rag/reference/reference-technology-stack.md`` for the stack these defau
 
 from __future__ import annotations
 
+import os
+from enum import StrEnum
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class RerankMode(StrEnum):
+    """Whether the cross-encoder runs — the user-facing choice (``VAULTRAG_RERANK_MODE``).
+
+    Defined here, not in retrieval.rerank, because config is a dependency-free
+    leaf that everything imports — it cannot import a retrieval module back without a
+    cycle. rerank.py imports this enum from here.
+
+    Reranking is not a free win: it is the single biggest accuracy lever *and* a measured
+    regression on some vaults, and the two golden sets disagree for an understood reason.
+    On the **P1 design-vault set** (title-matchy: queries share tokens with the target's
+    title) fusion already ranks near-perfectly and the cross-encoder can only shuffle a
+    correct #1 down — measured 1.00/0.775 fusion vs 0.95/0.743 reranked. On the **P2
+    Meridian corpus** (deliberately paraphrased: most queries share no title token) the
+    cross-encoder is what closes the semantic gap — measured MRR@5 0.892 → 0.928.
+
+    Neither result is wrong; they are the same model meeting two different query
+    distributions. A single global boolean has to be wrong on one of them, which is why
+    the choice is a mode rather than a flag:
+
+    * ``never``  — the stage never runs. Cheapest, and no model download.
+    * ``auto``   — run it **per query**, only when fusion looks *undecided* (see
+      :func:`should_rerank`). Confident known-item hits keep fusion's answer and pay
+      nothing; ambiguous paraphrase queries get the cross-encoder. Zero-LLM and
+      deterministic — the decision is arithmetic on scores already computed.
+    * ``always`` — run it for every query, no gating. The honest A/B baseline, and the
+      right pick for a vault measured to want it everywhere.
+
+    **Why the default is** ``never`` **— latency, not quality.** Measured 2026-07-21
+    (Apple Silicon, onnxruntime CPU): bge-v2-m3 costs **~500 ms per passage**
+    (``model_int8`` 502, ``model_quantized`` 509 — quantization is not the bottleneck), so
+    at the default ``rerank_top_n=50`` one reranked query spends **~25 s** in this stage.
+    ``search`` is an interactive tool an agent blocks on, so that is not a trade-off worth
+    offering by default. ``auto`` halves the exposure (it skips 37.5% of the corpus
+    queries) but 25 s on the remainder is still 25 s. The quality lift is real — take it
+    with ``always`` plus a smaller ``rerank_top_n`` on hardware that can afford it, or on a
+    GPU/API reranker behind the same :class:`~vaultrag.retrieval.rerank.Reranker` protocol.
+    """
+
+    # Values are `never`/`always`, not `on`/`off`, on purpose: A/B overlays are YAML,
+    # and YAML 1.1 parses bare `on`/`off` as *booleans* — `rerank_mode: on` would arrive
+    # as True and fail validation in the one workflow this mode exists to support.
+    never = "never"
+    auto = "auto"
+    always = "always"
 
 
 class Settings(BaseSettings):
@@ -83,21 +131,33 @@ class Settings(BaseSettings):
         description="Default token budget a search response must respect.",
     )
 
-    # --- reranker (retrieval stage 4; P1 Stage 1) -----------------------------
+    # --- reranker (retrieval stage 4; P1 Stage 1, mode added P2) --------------
     # bge-reranker-v2-m3 ONNX-int8, loaded directly via onnxruntime (no torch/transformers).
     # See ../Rag/decisions/reranker-bge-v2-m3.md and projects/vaultrag/reranking.md.
-    # DISABLED by default: on the P1 golden set, fusion-only beats rerank (re-measured
-    # 2026-07-16 on the Stage-2 index: fusion recall@10 1.00 / MRR@5 0.775 vs rerank 0.95 /
-    # 0.743 — rerank even drops a note out of recall@10). Exact numbers drift with the index;
-    # the ordering (fusion > rerank on this title-matchy set) is the stable finding. We don't
-    # ship a measured regression on by default. The stage is code-complete behind this flag;
-    # flip on with VAULTRAG_RERANK_ENABLED=true once it beats fusion on a harder golden set. See
-    # ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md. When on, a
-    # missing/unfetchable model degrades gracefully to a no-op reranker (fusion order).
-    rerank_enabled: bool = Field(
-        default=False,
-        description="Run the cross-encoder rerank stage after RRF fusion. Off by default "
-        "(fusion currently scores higher on the golden set); enable per-vault once it wins.",
+    #
+    # A tri-state, not a boolean, because the two golden sets genuinely disagree and both
+    # are right: on the title-matchy P1 design set fusion beats rerank (1.00/0.775 vs
+    # 0.95/0.743 — the cross-encoder shuffles an already-correct #1 down), while on the
+    # paraphrase-heavy P2 Meridian corpus rerank wins (MRR@5 0.892 → 0.928). A single
+    # global boolean has to be wrong on one of those distributions. `auto` decides per
+    # query from the top-1/top-2 fusion margin (retrieval/rerank.should_rerank) — no LLM,
+    # so the decision itself is free and only ever *saves* model calls (measured: it skips
+    # 37.5% of the corpus queries at the default ratio).
+    #
+    # DEFAULT `never`, and the reason is LATENCY, not quality. Measured 2026-07-21 on this
+    # box (Apple Silicon, onnxruntime CPU): bge-v2-m3 costs ~500 ms **per passage** —
+    # model_int8 502, model_quantized 509 — so a default top_n=50 query spends ~25 s in
+    # stage 4. `search` is an interactive MCP tool an agent blocks on; 25 s is not a
+    # quality/latency trade-off, it is unusable. The +0.036 MRR@5 is real and worth having
+    # on a box that can afford it (or with a smaller rerank_top_n), which is exactly why
+    # this is a user-set mode rather than a shipped default. See
+    # ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md.
+    # `auto`/`always` degrade to a no-op reranker (fusion order) when the model can't be
+    # fetched, so an offline or light install loses the lift, never the search.
+    rerank_mode: RerankMode = Field(
+        default=RerankMode.never,
+        description="Cross-encoder rerank stage: 'never', 'auto' (per query, only when the "
+        "fusion margin says the result is undecided), or 'always' (every query).",
     )
     rerank_model: str = Field(
         default="onnx-community/bge-reranker-v2-m3-ONNX",
@@ -120,8 +180,10 @@ class Settings(BaseSettings):
     )
     rerank_dominant_ratio: float = Field(
         default=1.5,
-        description="Skip reranking when the top-1 fusion score is at least this multiple "
-        "of the top-2 (known-item fast path). Set to 0 to always rerank.",
+        description="The 'auto' decision boundary: skip reranking when the top-1 fusion "
+        "score is at least this multiple of the top-2 (both retrievers agree — a known-item "
+        "hit). Higher reranks more often; 0 always reranks. Ignored unless mode is 'auto'. "
+        "Score-distribution-dependent, so it is a per-vault knob, not a universal constant.",
     )
 
     # --- parent-swap (retrieval stage 5; P1 Stage 2) --------------------------
@@ -205,6 +267,26 @@ class Settings(BaseSettings):
         default="INFO",
         description="Root log level for structlog output.",
     )
+
+    @model_validator(mode="after")
+    def _reject_retired_rerank_env(self) -> Settings:
+        """Fail loudly if the retired ``VAULTRAG_RERANK_ENABLED`` is still set.
+
+        ``rerank_enabled`` (bool) became :attr:`rerank_mode` (never/auto/always) in P2.
+        pydantic-settings ignores env vars that match no field, so leaving the old one in a
+        shell profile or compose file would silently do **nothing** — someone would set
+        ``=true``, see no reranking, and conclude the stage is broken. An unhelpful error
+        beats a silent no-op (CLAUDE.md §6: quality is measured, not assumed).
+        """
+        legacy = os.environ.get("VAULTRAG_RERANK_ENABLED")
+        if legacy is not None:
+            wanted = "always" if legacy.strip().lower() in {"1", "true", "yes", "on"} else "never"
+            raise ValueError(
+                "VAULTRAG_RERANK_ENABLED was replaced by VAULTRAG_RERANK_MODE "
+                f"(never|auto|always) — unset it and use VAULTRAG_RERANK_MODE={wanted}, "
+                "or 'auto' to let the fusion margin decide per query."
+            )
+        return self
 
     @property
     def db_path(self) -> Path:
