@@ -17,7 +17,31 @@ from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.store.sqlite import SQLiteMetaStore
 
-runner = CliRunner()
+# Every assertion below matches help/error *text*, so the output must be unstyled. Rich
+# renders a flag as two spans — `--force` becomes
+# `ESC[1;2;36m-ESC[0m ESC[1;2;36m-forceESC[0m` — and the literal substring is then absent
+# from the output entirely. That only bites where color is forced, so it passed on every dev
+# box (a captured, non-tty run is uncolored) and failed on the very first CI run, which sets
+# FORCE_COLOR. Reproduce the CI condition locally with `FORCE_COLOR=1 uv run pytest`.
+#
+# `TERM=dumb` is the switch that actually wins: Rich's FORCE_COLOR beats NO_COLOR, so
+# NO_COLOR alone does not strip the styling. Both are set because they state the same intent
+# and `test_cli_output_is_unstyled` pins the outcome rather than the mechanism — if a Rich
+# upgrade changes the precedence, that one canary fails with a clear reason instead of a
+# dozen confusing substring mismatches.
+runner = CliRunner(env={"TERM": "dumb", "NO_COLOR": "1"})
+
+
+def test_cli_output_is_unstyled() -> None:
+    """The canary for every text assertion in this module (see ``runner`` above).
+
+    Rich splits a flag across styled spans, so styled output makes ``"--force" in output``
+    false even though the help plainly shows ``--force``. Asserting the *absence of escape
+    codes* fails once, and legibly, instead of as a scatter of substring mismatches.
+    """
+    result = runner.invoke(app, ["reindex", "--help"])
+    assert result.exit_code == 0
+    assert "\x1b[" not in result.output, "CLI output is styled; text assertions will misfire"
 
 
 def test_help_lists_subcommands() -> None:
