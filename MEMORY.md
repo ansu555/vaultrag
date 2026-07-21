@@ -14,8 +14,9 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 - **Open before P3 (from the 2026-07-21 audit, see the latest session-log entry):** bugs **3**
   (UTF-8 BOM breaks frontmatter parsing → all tags lost) and **4** (`write_note` never writes the
   H1 its schema promises → `append_section` can't target agent-created notes) are **unfixed**;
-  bugs 1 (symlink escape) and 2 (writes could destroy a PDF) are fixed on `fix/containment-gaps`.
-  **CI runs only the eval gate** — no ruff/mypy/pytest, so 639 tests aren't merge-blocking.
+  bugs 1 (symlink escape) and 2 (writes could destroy a PDF) are fixed on `fix/containment-gaps`,
+  which also adds `.github/workflows/checks.yml` (ruff + mypy + pytest, previously advisory).
+  **Still open: `main` has no branch protection**, so no check is actually merge-blocking yet.
 - **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
   `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
   module imports `prometheus_client` — interfaces over vendors) + instrumentation in
@@ -432,11 +433,27 @@ Prepend newest first. Template:
   title"; `_render_new_note` writes frontmatter only) — so `append_section` can **never** target an
   agent-created note, breaking the documented "create a note, then grow it" memory loop for
   exactly the notes agents create.
-- **Also open (process, and probably the root cause):** **CI runs only the eval gate.**
-  `.github/workflows/eval.yml` is the only workflow — no ruff, no mypy, no pytest beyond
-  `tests/test_eval.py`. `CLAUDE.md` §5 says "CI should fail on lint errors"; it currently *can't*,
-  and the 639 tests are **not merge-blocking**. That is plausibly why bugs 1-4 accumulated while
-  everything looked green. Wiring ruff/mypy/pytest into CI is the highest-leverage next step.
+- **Then wired CI (the root cause).** `eval.yml` was the only workflow, so ruff, mypy, and 634
+  tests never ran on a PR — `CLAUDE.md` §5's "CI should fail on lint errors" *could not* hold.
+  New `.github/workflows/checks.yml`: **`static`** (ruff check + ruff format --check + mypy),
+  **`test`** (full suite, **base** install — the one people actually run), **`formats`**
+  (`test_pdf.py` + `test_image.py` under `--extra pdf`). `formats` is split out because the extra
+  is **+79 packages incl. torch** (116 → 195): folding it into `test` triples install time on
+  every run to add 5 tests; dropping it leaves real Docling conversion + real OCR with **zero** CI
+  coverage. **Two things the wiring itself exposed** — (1) **mypy failed on a base install**:
+  `docling` is imported lazily and was missing from `ignore_missing_imports`, so it resolved on a
+  dev box and errored in CI; a naive workflow would have been red on arrival (found by actually
+  `uv sync --frozen`-ing down to base and running it, not by reading it). (2) the `formats` job
+  **asserts docling/OCR import before running** — both suites `skipif` on availability, so a
+  silently-failed extra would skip those 5 tests and report **green having verified nothing**, the
+  same "looked checked, wasn't" shape as the bugs themselves. `test` passes `-rs` so its 5
+  legitimate base-install skips stay visible. All three jobs verified locally, with *and* without
+  extras (base: 634 passed / 5 skipped; extras: 639 passed / 0 skipped).
+- **STILL OPEN, and it matters: `main` has no branch protection** (`gh api .../protection` → 404).
+  So `checks.yml` and `eval.yml` **run but do not block** — CLAUDE.md calls the eval gate
+  "merge-blocking" and it has never actually been so. Wiring the workflows was necessary but is
+  **not sufficient**; someone must mark these as required checks on `main`. Left for Anik to
+  decide, since requiring PRs changes the direct-push-to-main workflow.
 
 ### 2026-07-21 — Stages 1-6 verified, then P2 Stage 7: Prometheus `/metrics` — **P2 COMPLETE**
 - **Did:** Anik: *"if 1-6 stage are fully ready then go for the next"*. Verified stages 1-6 (598
