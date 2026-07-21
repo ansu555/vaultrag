@@ -24,7 +24,8 @@ from vaultrag.parsing.sections import heading_section, normalize_heading, parent
 #   1 — P0/P1: markdown, frontmatter, wikilinks/embeds, callouts, dataview
 #   2 — P2 Stage 4: PDFs via Docling (``Block.page``)
 #   3 — P2 Stage 5: Mermaid ``diagram`` edges + Excalidraw scenes
-PARSER_VERSION = 3
+#   4 — P2 Stage 6: image OCR (RapidOCR/Tesseract)
+PARSER_VERSION = 4
 
 __all__ = [
     "PARSER_VERSION",

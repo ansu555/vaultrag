@@ -34,8 +34,10 @@ def _make_vault(root: Path) -> None:
     _write(root, "index.md", "# Home\nwelcome")
     _write(root, "projects/vaultrag/chunking.md", "# Chunking\nheading-tree")
     _write(root, "daily/2026-07-15.md", "# Today\nnotes")
-    # non-markdown → unsupported (skipped, not a secret)
-    _write(root, "assets/diagram.png", "not really a png")
+    # unsupported extension → skipped, not a secret. Deliberately *not* an image: since
+    # P2 Stage 6 `.png` is an indexable (OCR'd) source, so it would no longer stand for
+    # "a format the indexer does not handle". See test_image.py for image coverage.
+    _write(root, "assets/archive.zip", "not really a zip")
     # machine-managed tree → always pruned
     _write(root, ".obsidian/workspace.json", "{}")
     # .ragignore excludes the private/ folder (dir-level prune) and a single file
@@ -143,6 +145,39 @@ def test_scan_for_secrets_precision() -> None:
     assert scan_for_secrets("id: 550e8400-e29b-41d4-a716-446655440000") is None  # UUID
     assert scan_for_secrets("api_key = your_api_key_here") is None  # placeholder
     assert scan_for_secrets("the secret to good code is tests") is None  # prose
+
+
+def test_underscore_prefixed_secret_names_are_caught() -> None:
+    """`AWS_SECRET_ACCESS_KEY=…` is how a credential is actually written.
+
+    A leading `\\b` does not match inside `AWS_SECRET_ACCESS_KEY` — `_` is a word
+    character — so the guard used to miss every env-var-style name while catching the
+    bare `password=` form nobody pastes into a note. This is the shape a leaked `.env`
+    takes, in a note or in an OCR'd screenshot of one.
+    """
+    for text in (
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIbKb7MDENGbPxRfiCYEXAMPLEKEY",
+        "GITHUB_TOKEN=ghjKl93MnbVcXz0912MnbVcXzAsdFgHjKl45",
+        "DB_PASSWORD=S3cr3tP4ssw0rdWithHighEntropy99",
+        "MY_API_KEY=aZ92mVnbQ0plKjhGfdSaZxCvBnM12345",
+        "app-secret: kJ8x2mNbVcXzAsdFgHjKlQwErTyUi9900",
+    ):
+        assert scan_for_secrets(text) == "high-entropy-secret-assignment", text
+
+
+def test_underscore_boundary_does_not_widen_into_false_positives() -> None:
+    """Only `_`/`-` read as boundaries — a letter or digit before the keyword must not.
+
+    A false positive is not a harmless over-block: the note is silently never indexed.
+    """
+    for text in (
+        "my_secret_recipe = a wonderful blend of herbs and spices",
+        "SECRET_SANTA_ORGANIZER=alice",
+        "The retention_token_lifetime is documented in the handbook appendix",
+        "notoken = shortvalue",
+        "The password field is required and must be at least twelve characters",
+    ):
+        assert scan_for_secrets(text) is None, text
 
 
 # ---------------------------------------------------------------------------

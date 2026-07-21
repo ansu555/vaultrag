@@ -59,6 +59,7 @@ from vaultrag.indexer.pipeline import IngestContext, reindex_vault
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
+from vaultrag.parsing.image import load_image_parser
 from vaultrag.parsing.pdf import load_pdf_parser
 from vaultrag.retrieval import graph_params_for, load_reranker, rerank_params_for
 from vaultrag.store.sqlite import SQLiteMetaStore
@@ -139,9 +140,10 @@ def reindex(
             vector_store=vector_store,
             embedder=embedder,
             force=force,
-            # Composition root owns the optional parser: None (no `pdf` extra) means
-            # PDFs are skipped, not failed.
+            # Composition root owns the optional parsers: None (no `pdf` extra / no OCR
+            # engine) means those formats are skipped, not failed.
             pdf_parser=load_pdf_parser(),
+            image_parser=load_image_parser(enabled=settings.ocr_enabled),
         )
         drift = check_drift(project_id, store=store, vector_store=vector_store)
     except (VectorStoreError, EmbeddingError, OSError, sqlite3.Error) as exc:
@@ -234,6 +236,7 @@ def watch(
             vector_store=vector_store,
             embedder=embedder,
             pdf_parser=load_pdf_parser(),
+            image_parser=load_image_parser(enabled=settings.ocr_enabled),
         )
         watcher = VaultWatcher(
             ctx,
@@ -341,7 +344,9 @@ def mcp(
 
             # Only the paths that *ingest* need it (write-back, --watch); a read-only
             # server never converts anything, so don't pay for the parser it won't use.
-            pdf_parser = load_pdf_parser() if (write_enabled or watch) else None
+            ingests = write_enabled or watch
+            pdf_parser = load_pdf_parser() if ingests else None
+            image_parser = load_image_parser(enabled=settings.ocr_enabled) if ingests else None
 
             writer: NoteWriter | None = None
             if write_enabled:
@@ -354,6 +359,7 @@ def mcp(
                         vector_store=vector_store,
                         embedder=embedder,
                         pdf_parser=pdf_parser,
+                        image_parser=image_parser,
                     ),
                     author=settings.writeback_author,
                     allow_roots=settings.writeback_allow_roots,
@@ -395,6 +401,7 @@ def mcp(
                         vector_store=vector_store,
                         embedder=embedder,
                         pdf_parser=pdf_parser,
+                        image_parser=image_parser,
                     ),
                     debounce_seconds=settings.watch_debounce_seconds,
                     workers=settings.watch_workers,

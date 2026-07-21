@@ -153,6 +153,17 @@ class Settings(BaseSettings):
     # box-dependent. See ../Rag/agent-inbox/rerank-threshold-should-be-per-vault-not-global.md.
     # `auto`/`always` degrade to a no-op reranker (fusion order) when the model can't be
     # fetched, so an offline or light install loses the lift, never the search.
+    # P2 Stage 6. On by default, but that only *permits* OCR — with no engine installed
+    # `load_image_parser` returns None and images are skipped cleanly, so the base
+    # install is unaffected (principle #2). Turn it off to skip images on a box that has
+    # an engine but where OCR'ing a screenshot-heavy vault costs more than it is worth.
+    # There is deliberately no `vlm_caption_enabled`: captioning needs a GPU or a paid
+    # API, so the P2 plan keeps it off *and unbuilt* rather than shipping a dead knob.
+    ocr_enabled: bool = Field(
+        default=True,
+        description="Whether images (.png/.jpg/…) are OCR'd into searchable text. "
+        "Skipped cleanly when no OCR engine is installed.",
+    )
     rerank_mode: RerankMode = Field(
         default=RerankMode.never,
         description="Cross-encoder rerank stage: 'never', 'auto' (per query, only when the "

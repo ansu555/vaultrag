@@ -134,6 +134,17 @@ _FLOW_CONNECTORS: tuple[re.Pattern[str], ...] = (
 # `-->|label|` — the pipe form of an edge label, stripped before splitting.
 _PIPE_LABEL_RE = re.compile(r"\|[^|\n]*\|")
 
+# A double-quoted span. Quoting is Mermaid's documented way to put characters that are
+# otherwise grammar into a label — including an arrow (`A["draft --> live"]`,
+# `A -- "a --> b" --> B`). Such a span is masked to a connector-free placeholder before
+# the line is split and restored once the endpoints are known, so the arrow *inside* the
+# label can never be read as a connector. Without it the label splits: the node's real
+# name is truncated at the arrow and the remainder leaks in as an edge to a target
+# nobody drew (`B mapping ]`), which is the noise `_PLACEHOLDER_ID_RE` exists to keep
+# out of `unresolved_links`. The pipe form needs no such care — it is discarded whole.
+_QUOTED_RE = re.compile(r'"[^"\n]*"')
+_MASK = "\x01"
+
 # Sequence-diagram arrows: `->>`, `-->>`, `->`, `-->`, `-x`, `--x`, `-)`, `--)`.
 _SEQ_ARROW_RE = re.compile(r"-{1,2}(?:>>?|x|\))")
 _SEQ_PARTICIPANT_RE = re.compile(
@@ -211,15 +222,16 @@ def _flowchart_nodes(lines: list[str]) -> list[str]:
     the fence (including standalone declaration lines, which are not edges); pass 2
     resolves endpoints through it.
     """
+    quoted: list[str] = []
     statements = [
-        _to_sentinels(_PIPE_LABEL_RE.sub(" ", line).rstrip(";"))
+        _to_sentinels(_PIPE_LABEL_RE.sub(" ", _mask_quoted(line, quoted)).rstrip(";"))
         for line in lines
         if _first_word(line) not in _FLOW_SKIP_KEYWORDS
     ]
 
     labels: dict[str, str] = {}
     for stmt in statements:
-        for expr in _endpoints(stmt):
+        for expr in _endpoints(stmt, quoted):
             m = _SHAPE_RE.match(expr.strip().strip(";"))
             if m is None:
                 continue
@@ -231,16 +243,44 @@ def _flowchart_nodes(lines: list[str]) -> list[str]:
     for stmt in statements:
         if _SENTINEL not in stmt:
             continue  # a bare node declaration is not an edge
-        for expr in _endpoints(stmt):
+        for expr in _endpoints(stmt, quoted):
             name = _node_name(expr, labels)
             if name:
                 out.append(name)
     return out
 
 
-def _endpoints(stmt: str) -> list[str]:
-    """The node expressions in a normalized statement (`A & B --> C` fans out to 3)."""
-    return [expr for side in stmt.split(_SENTINEL) for expr in side.split("&")]
+def _endpoints(stmt: str, quoted: list[str]) -> list[str]:
+    """The node expressions in a normalized statement (`A & B --> C` fans out to 3).
+
+    Quoted spans masked by :func:`_mask_quoted` are restored here — after the split, so
+    grammar inside a label was never splittable, and before the caller reads the label,
+    so the name it gets is the one the author wrote.
+    """
+    return [
+        _unmask_quoted(expr, quoted) for side in stmt.split(_SENTINEL) for expr in side.split("&")
+    ]
+
+
+def _mask_quoted(line: str, quoted: list[str]) -> str:
+    """Replace each double-quoted span with a connector-free placeholder.
+
+    Spans are appended to ``quoted`` and referenced by index, so one list serves a whole
+    fence and :func:`_unmask_quoted` can restore an expression without knowing its line.
+    """
+
+    def sub(m: re.Match[str]) -> str:
+        quoted.append(m.group())
+        return f"{_MASK}{len(quoted) - 1}{_MASK}"
+
+    return _QUOTED_RE.sub(sub, line)
+
+
+def _unmask_quoted(expr: str, quoted: list[str]) -> str:
+    """Inverse of :func:`_mask_quoted` (a no-op on expressions that carried no quotes)."""
+    if _MASK not in expr:
+        return expr
+    return re.sub(rf"{_MASK}(\d+){_MASK}", lambda m: quoted[int(m.group(1))], expr)
 
 
 def _to_sentinels(stmt: str) -> str:

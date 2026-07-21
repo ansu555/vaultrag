@@ -50,7 +50,7 @@ next reconcile, instead of looking done while it isn't (CLAUDE.md §5/§6).
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -70,6 +70,7 @@ from vaultrag.indexer.scan import (
     ScannedFile,
     exclusion_reason,
     is_binary_source,
+    is_image_source,
     load_ignore_spec,
     scan_vault,
 )
@@ -77,6 +78,7 @@ from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.models import Document, document_id
 from vaultrag.parsing import PARSER_VERSION
 from vaultrag.parsing.excalidraw import is_excalidraw_source, parse_excalidraw
+from vaultrag.parsing.image import ImageParser, NoTextFound
 from vaultrag.parsing.markdown import parse_document
 from vaultrag.parsing.pdf import PdfError, PdfParser
 from vaultrag.store.base import JobKind, JobState, MetaStore
@@ -104,6 +106,10 @@ class IngestContext:
     # None = no PDF support installed (the base install). PDFs are then skipped
     # cleanly rather than failing, so a vault of notes+PDFs still indexes its notes.
     pdf_parser: PdfParser | None = None
+    # None = no OCR engine installed, or `ocr_enabled` is off. Images are then skipped
+    # the same way (P2 Stage 6). Kept separate from `pdf_parser` because the two are
+    # independently available: RapidOCR can be present without Docling and vice versa.
+    image_parser: ImageParser | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +131,7 @@ class SkipReason(StrEnum):
     secret = "secret"  # scan_for_secrets found key material in the content
     gone = "gone"  # the file is missing or unreadable on disk
     no_parser = "no_parser"  # format is indexable but its converter isn't installed
+    no_text = "no_text"  # converted cleanly and holds nothing to index (an image with no writing)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +180,7 @@ def reindex_vault(
     embedder: Embedder,
     force: bool = False,
     pdf_parser: PdfParser | None = None,
+    image_parser: ImageParser | None = None,
 ) -> ReindexStats:
     """Boot-reconcile the index against a vault. Safe to re-run at any time.
 
@@ -201,6 +209,7 @@ def reindex_vault(
         vector_store=vector_store,
         embedder=embedder,
         pdf_parser=pdf_parser,
+        image_parser=image_parser,
     )
 
     # Sampled before any work: both answers are about the index as it was *found*.
@@ -337,13 +346,17 @@ def ingest_path(
     if prior is not None and prior.hash == content_hash:
         return IngestOutcome(path, IngestStatus.unchanged)
 
-    if binary and ctx.pdf_parser is None:
+    if binary and _parser_for(ctx, path) is None:
         return _evict(ctx, path, SkipReason.no_parser)
 
     try:
         n = _ingest_file(ctx, path=path, data=data, content_hash=content_hash, mtime=mtime)
     except SecretBlocked:
         return _evict(ctx, path, SkipReason.secret)
+    except NoTextFound:
+        # OCR found nothing. Evicting rather than skipping matters: an image that used
+        # to carry text and was edited to remove it must leave the index too.
+        return _evict(ctx, path, SkipReason.no_text)
     return IngestOutcome(path, IngestStatus.indexed, chunks=n)
 
 
@@ -390,9 +403,12 @@ def _parse_source(
 
     Everything downstream (chunk → embed → upsert) is format-agnostic by design
     (arch §5), so a new source type is a new branch here and nothing else. Today:
-    markdown, Excalidraw scenes (P2 Stage 5), PDFs via Docling (P2 Stage 4).
+    markdown, Excalidraw scenes (P2 Stage 5), PDFs via Docling (P2 Stage 4), and images
+    via OCR (P2 Stage 6).
 
-    Raises :class:`~vaultrag.parsing.pdf.PdfError` if conversion fails and
+    Raises :class:`~vaultrag.parsing.pdf.PdfError` /
+    :class:`~vaultrag.parsing.image.OcrError` if conversion fails,
+    :class:`~vaultrag.parsing.image.NoTextFound` if an image holds no text, and
     :class:`SecretBlocked` if the converted text carries key material — the content
     gate the walk could not apply to bytes.
     """
@@ -409,15 +425,32 @@ def _parse_source(
             mtime=mtime,
         )
 
-    if ctx.pdf_parser is None:  # guarded by callers; defensive, never the normal path
-        raise PdfError(f"no PDF parser available for {path!r} (install vaultrag[pdf])")
+    parser = _parser_for(ctx, path)
+    if parser is None:  # guarded by callers; defensive, never the normal path
+        raise PdfError(f"no parser available for {path!r} (install vaultrag[pdf])")
 
-    document = ctx.pdf_parser.parse(path=path, data=data, content_hash=content_hash, mtime=mtime)
+    document = parser.parse(path=path, data=data, content_hash=content_hash, mtime=mtime)
+    # The secret gate every binary source shares: the walk scans text files' content,
+    # but a PDF's or an image's bytes are not text, so the gate necessarily runs here on
+    # the *converted* output. Without it Stage 4/6 would open a hole in CLAUDE.md §6 —
+    # a screenshot of a `.env` is exactly as leaky as the file.
     rule = scan_for_secrets("\n\n".join(block.text for block in document.blocks))
     if rule is not None:
         log.warning("ingest.secret_blocked", path=path, rule=rule)
         raise SecretBlocked(path)
     return document
+
+
+def _parser_for(ctx: IngestContext, path: str) -> PdfParser | ImageParser | None:
+    """The converter a binary source needs, or ``None`` when it is not installed.
+
+    Format-aware on purpose: PDF and OCR support are installed independently, so
+    "is a parser available" has to mean "for *this* format" — a vault with Docling but
+    no OCR engine must index its PDFs and skip its images, not the reverse.
+    """
+    if is_image_source(path):
+        return ctx.image_parser
+    return ctx.pdf_parser
 
 
 def _ingest_file(
@@ -592,13 +625,19 @@ def _drop_unparseable(ctx: IngestContext, diff: ScanDiff) -> tuple[ScanDiff, int
     vault would otherwise become a dead job, and a base install indexing a vault that
     happens to contain PDFs would report a wall of failures for working as designed.
     A skip is honest; a failure is not (CLAUDE.md §4 — the base install stays light).
-    """
-    if ctx.pdf_parser is not None:
-        return diff, 0
 
-    creates = [f for f in diff.creates if not is_binary_source(f.path)]
-    updates = [f for f in diff.updates if not is_binary_source(f.path)]
-    renames = [r for r in diff.renames if not is_binary_source(r.new_path)]
+    The test is **per format**, not "any parser is loaded": Docling and an OCR engine
+    install independently, so an install with PDFs working and OCR missing must still
+    drop its images here. Testing them together would let every image become a dead job
+    the moment the `pdf` extra happened to be present.
+    """
+
+    def has_parser(path: str) -> bool:
+        return not is_binary_source(path) or _parser_for(ctx, path) is not None
+
+    creates = [f for f in diff.creates if has_parser(f.path)]
+    updates = [f for f in diff.updates if has_parser(f.path)]
+    renames = [r for r in diff.renames if has_parser(r.new_path)]
     skipped = (
         len(diff.creates)
         - len(creates)
@@ -608,11 +647,26 @@ def _drop_unparseable(ctx: IngestContext, diff: ScanDiff) -> tuple[ScanDiff, int
         - len(renames)
     )
     if skipped:
-        log.info("reindex.format_skipped", project=ctx.project_id, count=skipped, extra="pdf")
+        missing = sorted(
+            {"pdf" if not is_image_source(p) else "ocr" for p in _dropped_paths(diff, has_parser)}
+        )
+        log.info(
+            "reindex.format_skipped",
+            project=ctx.project_id,
+            count=skipped,
+            extra=",".join(missing),
+        )
     return (
         replace(diff, creates=creates, updates=updates, renames=renames),
         skipped,
     )
+
+
+def _dropped_paths(diff: ScanDiff, has_parser: Callable[[str], bool]) -> list[str]:
+    """The paths :func:`_drop_unparseable` removed — used only to name the missing extra."""
+    paths = [f.path for f in diff.creates] + [f.path for f in diff.updates]
+    paths += [r.new_path for r in diff.renames]
+    return [p for p in paths if not has_parser(p)]
 
 
 class _Withheld:
@@ -630,15 +684,17 @@ def _process_scanned(ctx: IngestContext, f: ScannedFile) -> _JobResult:
     """Run one create/update ingest job.
 
     Returns chunks written, ``None`` on failure, or :data:`_WITHHELD` when the file
-    converted fine but must not be indexed (its text tripped the secret guard). The
-    third case is a *success* for job purposes — retrying it would block again — so the
-    job is marked done, not dead.
+    converted fine but must not be indexed — its text tripped the secret guard, or it is
+    an image OCR found no text in. Both are a *success* for job purposes: retrying would
+    reach the same conclusion, so the job is marked done, not dead. Treating either as a
+    failure would make an ordinary vault (a blank screenshot, a photo) report a wall of
+    errors for behaving as designed — the rule Stage 4 set for a missing extra.
     """
     job_id = ctx.store.enqueue_job(ctx.project_id, JobKind.ingest, f.path, f.hash)
     ctx.store.set_job_state(job_id, JobState.running)
     try:
         n = _read_and_ingest(ctx, f.path, f.hash)
-    except SecretBlocked:
+    except (SecretBlocked, NoTextFound):
         _delete_file(ctx, f.path)
         ctx.store.set_job_state(job_id, JobState.done)
         return _WITHHELD
@@ -657,7 +713,7 @@ def _process_rename(ctx: IngestContext, r: Rename) -> _JobResult:
     try:
         _delete_file(ctx, r.old_path)
         n = _read_and_ingest(ctx, r.new_path, r.hash)
-    except SecretBlocked:
+    except (SecretBlocked, NoTextFound):
         _delete_file(ctx, r.new_path)
         ctx.store.set_job_state(job_id, JobState.done)
         return _WITHHELD
