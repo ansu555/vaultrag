@@ -68,6 +68,7 @@ from vaultrag.indexer.scan import (
     Rename,
     ScanDiff,
     ScannedFile,
+    escapes_vault,
     exclusion_reason,
     is_binary_source,
     is_image_source,
@@ -128,6 +129,7 @@ class SkipReason(StrEnum):
     """Why :func:`ingest_path` did not index a path (attached to removed/skipped)."""
 
     excluded = "excluded"  # exclusion_reason fired (secret filename / ragignore / unsupported)
+    escapes_vault = "escapes_vault"  # resolves outside the vault root (symlink / traversal)
     secret = "secret"  # scan_for_secrets found key material in the content
     gone = "gone"  # the file is missing or unreadable on disk
     no_parser = "no_parser"  # format is indexable but its converter isn't installed
@@ -302,6 +304,8 @@ def ingest_path(
 
     * gated (secret filename / ``.ragignore`` / unsupported / pruned) → evict any prior
       entry; ``removed`` if one existed, else ``skipped`` (``reason=excluded``);
+    * resolves outside the vault (symlink / traversal) → evict; ``removed`` / ``skipped``
+      (``reason=escapes_vault``);
     * missing/unreadable on disk → evict; ``removed`` / ``skipped`` (``reason=gone``);
     * content trips the secret guard → evict; ``removed`` / ``skipped``
       (``reason=secret``);
@@ -321,6 +325,13 @@ def ingest_path(
 
     if exclusion_reason(path, ignore=spec) is not None:
         return _evict(ctx, path, SkipReason.excluded)
+
+    # The scan's containment gate, applied to the single-file route too: a watcher event
+    # or a write-back reindex must not be able to pull in a symlink target the full walk
+    # now refuses, or reindex and watch would disagree about the same vault.
+    if escapes_vault(ctx.vault_path, path):
+        log.warning("ingest.escapes_vault", path=path)
+        return _evict(ctx, path, SkipReason.escapes_vault)
 
     abs_path = ctx.vault_path / path
     try:

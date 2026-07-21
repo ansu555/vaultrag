@@ -268,6 +268,25 @@ def test_ragignore_excludes_a_path(
     assert store.get_document(PROJECT, "private/note.md") is None
 
 
+def test_symlink_out_of_the_vault_is_refused_and_evicted(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, tmp_path: Path
+) -> None:
+    """The single-file route enforces the walk's containment gate, so a watcher event or a
+    write-back reindex can't index a symlink target ``reindex`` now refuses."""
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "private-diary.md").write_text(NOTE, encoding="utf-8")
+    (vault / "notes").mkdir(parents=True, exist_ok=True)
+    (vault / "notes" / "leak.md").symlink_to(outside / "private-diary.md")
+    ctx = make_ctx(vault, store, vector_store, FakeEmbedder())
+
+    outcome = ingest_path(ctx, "notes/leak.md")
+    assert outcome.status is IngestStatus.skipped
+    assert outcome.reason is SkipReason.escapes_vault
+    assert store.get_document(PROJECT, "notes/leak.md") is None
+    assert vector_store.count(PROJECT) == 0
+
+
 def test_unsupported_suffix_is_excluded(
     vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
 ) -> None:
