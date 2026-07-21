@@ -23,6 +23,20 @@ log = structlog.get_logger(__name__)
 # the generic `frontmatter` passthrough dict so a value never lives in two places.
 _TYPED_KEYS = frozenset({"title", "tags", "aliases", "created", "modified"})
 
+# U+FEFF, the byte-order mark. `read_text(encoding="utf-8")` does NOT strip it (only
+# "utf-8-sig" does), so a BOM'd note arrives with an invisible character glued to the front
+# of line 1 — and the frontmatter delimiter test is `lines[0].strip() != "---"`, which a
+# leading BOM defeats. The whole `---` block then parses as prose: every tag is lost (so a
+# server-side `filters.tags` silently stops matching the note) and the title becomes raw YAML
+# in every citation. BOMs are routine on Windows-authored notes, so this is not exotic input.
+_BOM = "﻿"
+
+
+def strip_bom(text: str) -> str:
+    """Drop a leading BOM. Safe for line anchors: it removes a character from line 1, never
+    a line, so every ``line_start``/``line_end`` computed downstream is unchanged."""
+    return text[1:] if text.startswith(_BOM) else text
+
 
 def split_frontmatter(path: str, raw_text: str) -> tuple[dict[str, Any], str]:
     """Split ``raw_text`` into ``(frontmatter dict, body)``. Never raises.
@@ -39,6 +53,7 @@ def split_frontmatter(path: str, raw_text: str) -> tuple[dict[str, Any], str]:
     ``raw_text`` at :func:`frontmatter_line_offset`, so body line *k* is file line
     ``offset + k`` by construction; python-frontmatter still parses the YAML itself.
     """
+    raw_text = strip_bom(raw_text)
     try:
         post = fm.loads(raw_text)
     except yaml.YAMLError as exc:
@@ -59,7 +74,7 @@ def frontmatter_line_offset(raw_text: str) -> int:
     ``open()``. An unterminated block is treated as "no frontmatter" (offset 0),
     matching how ``split_frontmatter`` degrades on malformed input.
     """
-    lines = raw_text.splitlines()
+    lines = strip_bom(raw_text).splitlines()
     if not lines or lines[0].strip() != "---":
         return 0
     for i in range(1, len(lines)):

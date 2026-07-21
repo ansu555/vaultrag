@@ -51,6 +51,28 @@ body
     assert m.frontmatter == {"custom_key": 42}
 
 
+def test_utf8_bom_does_not_break_frontmatter() -> None:
+    """A BOM'd note must parse identically to the same note without one.
+
+    ``read_text(encoding="utf-8")`` does not strip U+FEFF (only ``utf-8-sig`` does), so the
+    delimiter test ``lines[0].strip() != "---"`` failed and the whole YAML block was parsed
+    as prose: every tag lost (server-side ``filters.tags`` then silently stops matching the
+    note) and the title became raw YAML in every citation. Routine on Windows-authored notes.
+    """
+    note = "---\ntitle: Real Title\ntags: [alpha, beta]\n---\n\n# Heading One\n\nbody\n"
+    plain = parse_document(path="n.md", raw_text=note)
+    bommed = parse_document(path="n.md", raw_text="﻿" + note)
+
+    assert bommed.metadata.title == plain.metadata.title == "Real Title"
+    assert bommed.metadata.tags == plain.metadata.tags == ["alpha", "beta"]
+    assert "﻿" not in _blob(bommed)
+    # Stripping a BOM removes a character from line 1, never a line — so every citation
+    # anchor must be byte-identical to the un-BOM'd parse.
+    assert [(b.line_start, b.line_end) for b in bommed.blocks] == [
+        (b.line_start, b.line_end) for b in plain.blocks
+    ]
+
+
 def test_frontmatter_tags_as_comma_string() -> None:
     doc = parse_document(path="n.md", raw_text="---\ntags: a, b/c\n---\nbody\n")
     assert {"a", "b", "b/c"} <= set(doc.metadata.tags)
