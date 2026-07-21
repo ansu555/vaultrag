@@ -32,6 +32,7 @@ from typing import Any, Protocol, runtime_checkable
 from vaultrag.config import RerankMode, Settings
 from vaultrag.index.base import ScoredChunk
 from vaultrag.logging import get_logger
+from vaultrag.metrics import record_rerank_decision
 
 log = get_logger(__name__)
 
@@ -218,8 +219,13 @@ def rerank_candidates(
 
     if not should_rerank(candidates, params):
         log.debug("rerank.skip_dominant", top1=candidates[0].score, top2=candidates[1].score)
+        record_rerank_decision(ran=False)
         return candidates[:keep]
 
+    # Counted only past the two early returns above, so the denominator is "queries the
+    # stage was actually offered" — with the stage off (`reranker is None`) there is no
+    # decision to make, and folding those in would report `auto` as skipping ~100%.
+    record_rerank_decision(ran=True)
     subset = candidates[: params.top_n]
     # Everything the cross-encoder never looked at. It keeps fusion order and sits *below*
     # every reranked survivor: `top_n` bounds what the model reads, not what search may

@@ -46,8 +46,9 @@ from watchdog.events import (
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
-from vaultrag.indexer.pipeline import IngestContext, IngestOutcome, ingest_path
+from vaultrag.indexer.pipeline import IngestContext, IngestOutcome, IngestStatus, ingest_path
 from vaultrag.indexer.scan import iter_indexable_suffixes, load_ignore_spec
+from vaultrag.metrics import record_ingest, record_ingest_lag, record_job_dead, set_queue_depth
 from vaultrag.store.base import JobKind, JobState
 
 log = structlog.get_logger(__name__)
@@ -104,6 +105,13 @@ class VaultWatcher:
         # Debounce state: path -> monotonic deadline it becomes eligible to dispatch.
         self._pending: dict[str, float] = {}
         self._inflight: set[str] = set()
+        # path -> monotonic time of the *first* event of the current dirty episode, for
+        # `ingest_lag_seconds` (P2 Stage 7). First and not last on purpose: `_mark_dirty`
+        # re-arms on every event of a save storm, so timing from the last one would
+        # exclude the storm — and the debounce that follows it — from a metric whose whole
+        # job is to answer "how long after I saved was it searchable?". Survives the move
+        # into `_inflight` and is popped by `process_path`, which is what closes the span.
+        self._first_dirty: dict[str, float] = {}
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._stopping = threading.Event()
@@ -173,8 +181,20 @@ class VaultWatcher:
     def _mark_dirty(self, rel_path: str) -> None:
         """Record a change to one vault-relative path; (re)arm its debounce window."""
         with self._cond:
-            self._pending[rel_path] = self._clock() + self._debounce
+            now = self._clock()
+            self._pending[rel_path] = now + self._debounce
+            self._first_dirty.setdefault(rel_path, now)  # setdefault: keep the *first*
+            self._publish_depth()
             self._cond.notify_all()
+
+    def _publish_depth(self) -> None:
+        """Publish pending + in-flight as ``vaultrag_jobs_queue_depth`` (call under the lock).
+
+        Held under the same lock as the two sets it sums so a scrape can never catch a
+        depth that never existed (a path counted in neither, mid-handoff from one to the
+        other, would read as a transient dip to an alert).
+        """
+        set_queue_depth(len(self._pending) + len(self._inflight))
 
     def _to_rel(self, abs_path: str) -> str | None:
         """Map an absolute watchdog path to a vault-relative POSIX path, or None if outside."""
@@ -262,6 +282,9 @@ class VaultWatcher:
             for p in ready:
                 del self._pending[p]
                 self._inflight.add(p)
+            # `_first_dirty[p]` is deliberately left in place — the lag span is still open
+            # until `process_path` closes it; dispatch is the middle of it, not the end.
+            self._publish_depth()
             return ready
 
     def _wait_timeout(self) -> float:
@@ -279,6 +302,7 @@ class VaultWatcher:
     def _on_done(self, path: str, _future: Future[IngestOutcome | None]) -> None:
         with self._cond:
             self._inflight.discard(path)
+            self._publish_depth()
             self._cond.notify_all()
 
     # --- the worker -----------------------------------------------------------
@@ -307,6 +331,8 @@ class VaultWatcher:
                     self._sleep(self._retry_backoff * (2**attempt))
                 continue
             self._ctx.store.set_job_state(job_id, JobState.done)
+            record_ingest(str(outcome.status))
+            self._observe_lag(path, outcome)
             log.info(
                 "watch.reconciled",
                 path=path,
@@ -316,8 +342,26 @@ class VaultWatcher:
             return outcome
 
         self._ctx.store.set_job_state(job_id, JobState.dead, error=last_error)
+        self._first_dirty.pop(path, None)  # span abandoned; a dead job has no lag to report
+        record_job_dead()
         log.error("watch.ingest_dead", path=path, attempts=self._max_attempts, error=last_error)
         return None
+
+    def _observe_lag(self, path: str, outcome: IngestOutcome) -> None:
+        """Close this path's fs-event → searchable span into ``ingest_lag_seconds``.
+
+        Only ``indexed``/``removed`` are observed: those are the outcomes where the index
+        actually changed, which is what the SLO is about. An ``unchanged`` reconcile (a
+        touch, or a save that edited nothing) was already searchable, so recording its
+        near-zero span would flatter the p95 with a case nobody is waiting on. A path with
+        no recorded span — ``process_path`` called directly by a test or by ``flush`` after
+        the entry was consumed — is skipped rather than timed from now, which would report
+        a fabricated ~0.
+        """
+        started = self._first_dirty.pop(path, None)
+        if started is None or outcome.status not in (IngestStatus.indexed, IngestStatus.removed):
+            return
+        record_ingest_lag(max(0.0, self._clock() - started), source="watch")
 
     # --- draining / test hooks ------------------------------------------------
     def flush(self) -> None:
@@ -330,6 +374,7 @@ class VaultWatcher:
             pending = [p for p in self._pending if p not in self._inflight]
             for p in pending:
                 del self._pending[p]
+            self._publish_depth()
         for p in pending:
             self.process_path(p)
 

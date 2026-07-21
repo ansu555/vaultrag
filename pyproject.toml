@@ -21,6 +21,10 @@ dependencies = [
     "numpy>=2.0",
     "onnxruntime>=1.20",
     "pathspec>=1.1.1",
+    # The /metrics exporter (P2 Stage 7). Pure Python, zero transitive dependencies —
+    # unlike Docling it costs nothing to put in the base install, so observability is
+    # always available rather than an extra someone forgets to enable before an incident.
+    "prometheus-client>=0.21",
     "pydantic-settings>=2.5",
     "python-frontmatter>=1.3.0",
     "pyyaml>=6.0.3",

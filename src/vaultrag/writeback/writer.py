@@ -35,13 +35,14 @@ cap correct). Write-back is not a hot path, so serializing it is the simple, saf
 
 from __future__ import annotations
 
+import functools
 import re
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Concatenate, Literal
 
 import structlog
 import yaml
@@ -52,6 +53,7 @@ from vaultrag.index.base import VectorStoreError
 from vaultrag.indexer.pipeline import IngestContext, IngestStatus, ingest_path
 from vaultrag.indexer.scan import exclusion_reason, load_ignore_spec
 from vaultrag.indexer.secret_guard import scan_for_secrets
+from vaultrag.metrics import record_ingest_lag, record_write, record_write_refused
 from vaultrag.models import BlockType, WriteResult
 from vaultrag.parsing import heading_section, parse_document
 from vaultrag.parsing.frontmatter import split_frontmatter
@@ -70,6 +72,48 @@ _MAX_SLUG = 120  # bound a generated filename length
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _Action = Literal["created", "appended", "patched"]
+
+
+def _observed[**P](
+    method: Callable[Concatenate[NoteWriter, P], WriteResult],
+) -> Callable[Concatenate[NoteWriter, P], WriteResult]:
+    """Count a write tool's outcome into the P2 Stage 7 metrics (accepted vs refused).
+
+    Wrapping the three **public** methods, rather than instrumenting each gate, is what
+    makes the refusal counter honest: ``WriteRefused`` is raised from a dozen places
+    across the methods, ``_contain`` and ``_commit_write``, and a new gate added later is
+    counted here for free instead of being silently unobserved. ``WriteConflict`` is
+    deliberately *not* counted as a refusal — a ``base_hash`` mismatch is the optimistic
+    lock working as designed on a note that changed, not a guardrail stopping an agent.
+
+    It is also where ``ingest_lag_seconds{source="writeback"}`` is measured. Write-back is
+    the *other* route a note becomes searchable and the watcher cannot see it: the write
+    ingests synchronously here, so by the time the fs event arrives the file already
+    matches the manifest and the watcher's reconcile is ``unchanged``, which records
+    nothing. Instrumenting only the watcher therefore left the entire memory loop —
+    agent writes a note, agent retrieves it — unmeasured. The span runs from method entry
+    (the agent asked) to return (it is retrievable), and is skipped when
+    ``indexed`` is False, since a note that reached disk but not the index is not yet
+    searchable and timing it would report a latency that bought nothing.
+    """
+
+    # `self` is positional-only (`/`) so the wrapper's signature stays assignable to
+    # `Concatenate[NoteWriter, P]` — without it `functools.wraps` types the bound method's
+    # first parameter as *named* `self`, which no Concatenate prefix matches.
+    @functools.wraps(method)
+    def wrapper(self: NoteWriter, /, *args: P.args, **kwargs: P.kwargs) -> WriteResult:
+        started = time.perf_counter()
+        try:
+            result = method(self, *args, **kwargs)
+        except WriteRefused as exc:
+            record_write_refused(str(exc.reason))
+            raise
+        record_write(result.action)
+        if result.indexed:
+            record_ingest_lag(time.perf_counter() - started, source="writeback")
+        return result
+
+    return wrapper
 
 
 def slugify(title: str) -> str:
@@ -116,6 +160,7 @@ class NoteWriter:
         self._writes: deque[float] = deque()  # accepted-write timestamps for the rate window
 
     # --- public tools ---------------------------------------------------------
+    @_observed
     def write_note(
         self,
         *,
@@ -155,6 +200,7 @@ class NoteWriter:
             rel, self._render_new_note(title, content, tags), action="created"
         )
 
+    @_observed
     def append_section(self, *, path: str, heading: str, content: str) -> WriteResult:
         """Append ``content`` at the end of ``heading``'s section in an existing note.
 
@@ -186,6 +232,7 @@ class NoteWriter:
         _start, end, _block = span
         return self._commit_write(rel, _append_to_section(current, end, content), action="appended")
 
+    @_observed
     def patch_frontmatter(
         self, *, path: str, updates: Mapping[str, Any], base_hash: str
     ) -> WriteResult:

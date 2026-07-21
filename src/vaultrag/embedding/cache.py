@@ -24,6 +24,7 @@ from vaultrag.embedding.base import (
     deserialize_vector,
     serialize_vector,
 )
+from vaultrag.metrics import record_embed_cache
 from vaultrag.models import Chunk
 from vaultrag.store.base import MetaStore
 
@@ -54,6 +55,10 @@ def embed_chunks(
     result: dict[str, Vector] = {h: deserialize_vector(b) for h, b in cached.items()}
 
     missing = [h for h in by_hash if h not in result]
+    # Counted in *deduplicated* hashes, matching what the model is actually asked for —
+    # counting raw chunks would credit the cache for the by-hash dedupe above and report a
+    # hit ratio the cache did not earn. This is the ratio that predicts reindex cost.
+    record_embed_cache(hits=len(result), misses=len(missing))
     if missing:
         fresh = embedder.embed([by_hash[h] for h in missing])
         for chunk_hash, vector in zip(missing, fresh, strict=True):

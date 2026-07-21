@@ -9,6 +9,9 @@ Subcommands:
   :func:`~vaultrag.mcp.build_mcp_server`).
 * ``eval``    — score retrieval against a golden set; the CI gate (P2 Stage 1).
 
+The long-running roles (``watch``, ``mcp``) take ``--metrics`` to expose the standalone
+Prometheus endpoint (P2 Stage 7: :mod:`vaultrag.metrics`).
+
 Later phases add ``serve`` (HTTP). See ``../Rag/projects/vaultrag/p0-step-plan.md``.
 """
 
@@ -59,6 +62,7 @@ from vaultrag.indexer.pipeline import IngestContext, reindex_vault
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
 from vaultrag.mcp import build_mcp_server
+from vaultrag.metrics import set_build_info, start_metrics_server
 from vaultrag.parsing.image import load_image_parser
 from vaultrag.parsing.pdf import load_pdf_parser
 from vaultrag.retrieval import graph_params_for, load_reranker, rerank_params_for
@@ -90,6 +94,24 @@ def _root(
     ),
 ) -> None:
     """VaultRAG CLI."""
+
+
+def _start_metrics(settings: Settings, *, requested: bool) -> bool:
+    """Bring up the standalone ``/metrics`` exporter if asked; report whether it bound.
+
+    ``--metrics`` ORs with ``VAULTRAG_METRICS_ENABLED`` so the flag can turn it on for one
+    run without editing the environment, and the env var can turn it on for a long-lived
+    deployment without editing a command line.
+
+    Only the **long-running** roles (``watch``, ``mcp``) call this. ``reindex`` finishes in
+    seconds, so an exporter there would almost never be scraped before the process exited
+    — its work still lands in the counters, it just has no window in which to be read.
+    Metrics recording itself is unconditional, so nothing is lost by not exporting here.
+    """
+    if not (requested or settings.metrics_enabled):
+        return False
+    set_build_info(__version__)
+    return start_metrics_server(settings.metrics_port, settings.metrics_addr)
 
 
 @app.command()
@@ -192,6 +214,14 @@ def watch(
     vault: Annotated[
         Path | None, typer.Option("--vault", help="Path to the vault to watch.")
     ] = None,
+    metrics: Annotated[
+        bool,
+        typer.Option(
+            "--metrics",
+            help="Serve Prometheus metrics on VAULTRAG_METRICS_PORT (default 9464). "
+            "Also settable with VAULTRAG_METRICS_ENABLED.",
+        ),
+    ] = False,
 ) -> None:
     """Live-watch a vault: reconcile once, then (re)index each edit as it happens.
 
@@ -208,6 +238,11 @@ def watch(
     if not vault_path.is_dir():
         typer.echo(f"watch failed: vault path is not a directory: {vault_path}", err=True)
         raise typer.Exit(code=1)
+
+    # Started before the boot reconcile so that reconcile's embed-cache counters land in a
+    # scrapeable registry — it is the largest batch of work this process will ever do.
+    if _start_metrics(settings, requested=metrics):
+        typer.echo(f"metrics: http://{settings.metrics_addr}:{settings.metrics_port}/metrics")
 
     store: SQLiteMetaStore | None = None
     vector_store: QdrantVectorStore | None = None
@@ -286,6 +321,15 @@ def mcp(
             "VAULTRAG_WRITEBACK_ENABLED.",
         ),
     ] = True,
+    metrics: Annotated[
+        bool,
+        typer.Option(
+            "--metrics",
+            help="Serve Prometheus metrics on VAULTRAG_METRICS_PORT (default 9464). "
+            "Off by default: each agent session is its own process, so N sessions would "
+            "contend for one port (a clash warns and continues).",
+        ),
+    ] = False,
 ) -> None:
     """Serve the MCP tools (search/open, and write_note/… unless --no-write) over stdio.
 
@@ -302,6 +346,10 @@ def mcp(
     if not vault_path.is_dir():
         typer.echo(f"mcp failed: vault path is not a directory: {vault_path}", err=True)
         raise typer.Exit(code=1)
+
+    # No typer.echo here, unlike `watch`: stdout is the JSON-RPC channel and a stray line
+    # corrupts the stream. The bind is announced by structlog on stderr instead.
+    _start_metrics(settings, requested=metrics)
 
     # By default search reads only Qdrant and open reads only the vault, and neither client
     # connects at construction time, so a read-only server comes up instantly (a down

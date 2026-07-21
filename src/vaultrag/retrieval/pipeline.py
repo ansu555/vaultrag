@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, VectorStore
+from vaultrag.metrics import record_search, time_stage
 from vaultrag.models import SearchResult, Snippet
 from vaultrag.retrieval.cite import cite
 from vaultrag.retrieval.graph import GraphExpandParams, GraphStore, graph_expand
@@ -85,6 +86,9 @@ def search(
     """
     stripped = query.strip()
     if not stripped:
+        # Deliberately not counted in `vaultrag_searches_total`: a blank query never
+        # reaches the index, so scoring it as an empty *result* would blame retrieval for
+        # a caller bug and drift the empty-result ratio the metric exists to watch.
         return SearchResult(query=query, project_id=project_id)
 
     rerank_params = rerank if rerank is not None else RerankParams()
@@ -95,43 +99,60 @@ def search(
     # rerank-off and a top_n sweep would measure truncation instead of rerank depth.
     fetch_limit = max(rerank_params.top_n, k) if reranker is not None else k
 
-    dense_vector = embedder.embed_query(stripped)
-    sparse_vector = sparse.embed_query(stripped)
+    # Each stage is timed into `vaultrag_search_latency_seconds{stage=…}` (P2 Stage 7).
+    # The labels are the same stage names this module's docstring uses, so a Grafana panel
+    # and the architecture doc talk about the same things. `total` wraps the lot, and is
+    # not the sum of the parts — it also carries the un-timed glue between them.
+    with time_stage("total"):
+        with time_stage("embed"):
+            dense_vector = embedder.embed_query(stripped)
+            sparse_vector = sparse.embed_query(stripped)
 
-    hits = vector_store.query(
-        project_id=project_id,
-        dense=dense_vector,
-        sparse=sparse_vector,
-        limit=fetch_limit,
-        prefetch_limit=prefetch_limit,
-        filters=filters,
-    )
-    hits = rerank_candidates(stripped, hits, reranker, keep=k, params=rerank_params)
+        with time_stage("fetch"):
+            hits = vector_store.query(
+                project_id=project_id,
+                dense=dense_vector,
+                sparse=sparse_vector,
+                limit=fetch_limit,
+                prefetch_limit=prefetch_limit,
+                filters=filters,
+            )
+        with time_stage("rerank"):
+            hits = rerank_candidates(stripped, hits, reranker, keep=k, params=rerank_params)
 
-    if parent_resolver is not None:
-        # Cap the swap at the smaller of the ~2k parent cap and the response budget: a
-        # section that can't fit the budget should fall back to the child, not evict it.
-        cap = min(parent_max_tokens, budget_tokens)
-        snippets = parent_swap(hits, parent_resolver, _to_snippet, cap_tokens=cap)
-    else:
-        snippets = [_to_snippet(hit) for hit in hits]
+        with time_stage("parents"):
+            if parent_resolver is not None:
+                # Cap the swap at the smaller of the ~2k parent cap and the response
+                # budget: a section that can't fit the budget should fall back to the
+                # child, not evict it.
+                cap = min(parent_max_tokens, budget_tokens)
+                snippets = parent_swap(hits, parent_resolver, _to_snippet, cap_tokens=cap)
+            else:
+                snippets = [_to_snippet(hit) for hit in hits]
 
-    # Stage 6: link-graph authority reorder + neighbour pointers. Runs on the post-swap
-    # snippets (so it ranks whole sections when stage 5 produced them) and *before* packing,
-    # because reordering decides which prefix the greedy packer keeps. `related` is returned
-    # alongside — never merged into `snippets` — so pointers cost no budget and can't be
-    # mistaken for retrieved results (that mistake would silently inflate any recall metric).
-    snippets, related = graph_expand(
-        snippets,
-        project_id=project_id,
-        store=graph_store,
-        params=graph if graph is not None else GraphExpandParams(),
-        vault_name=vault_name,
-    )
-    # Stage 8: attach the obsidian:// citation URI (no-op when vault_name is unset). Done
-    # before packing so the kept snippets carry it; the URI isn't text, so it costs no budget.
-    snippets = cite(snippets, vault_name=vault_name)
-    packed, total_tokens, truncated = pack_budget(snippets, budget_tokens)
+        # Stage 6: link-graph authority reorder + neighbour pointers. Runs on the post-swap
+        # snippets (so it ranks whole sections when stage 5 produced them) and *before*
+        # packing, because reordering decides which prefix the greedy packer keeps.
+        # `related` is returned alongside — never merged into `snippets` — so pointers cost
+        # no budget and can't be mistaken for retrieved results (that mistake would
+        # silently inflate any recall metric).
+        with time_stage("graph"):
+            snippets, related = graph_expand(
+                snippets,
+                project_id=project_id,
+                store=graph_store,
+                params=graph if graph is not None else GraphExpandParams(),
+                vault_name=vault_name,
+            )
+        # Stage 8: attach the obsidian:// citation URI (no-op when vault_name is unset).
+        # Done before packing so the kept snippets carry it; the URI isn't text, so it
+        # costs no budget.
+        with time_stage("cite"):
+            snippets = cite(snippets, vault_name=vault_name)
+        with time_stage("pack"):
+            packed, total_tokens, truncated = pack_budget(snippets, budget_tokens)
+
+    record_search(empty=not packed)
     return SearchResult(
         query=query,
         project_id=project_id,

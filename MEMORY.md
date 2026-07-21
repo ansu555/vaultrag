@@ -8,8 +8,43 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P2 IN PROGRESS — Stages 1 + 2 + 3 + 4 + 5 + 6 DONE, and the index-drift bug is
-  FIXED. Next: Stage 7 (Prometheus `/metrics`, standalone exporter) — the last P2 stage.**
+- **Phase:** **P2 COMPLETE — all 7 stages DONE (1+2+3+4+5+6+7), and the index-drift bug is
+  FIXED. Next: P3** (multi-project keys + tenancy hardening, compression/budget packer,
+  query-log mining, optional `answer` mode, compose profiles) — `CLAUDE.md` §4.
+- **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
+  `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
+  module imports `prometheus_client` — interfaces over vendors) + instrumentation in
+  `retrieval/pipeline.py` (per-stage latency), `retrieval/rerank.py`, `embedding/cache.py`,
+  `writeback/writer.py`, `indexer/watch.py`, and `--metrics` on `watch`/`mcp`. **Decision 5
+  settled as recommended: standalone exporter**, and `prometheus-client` went in the **base**
+  install (1 package, **zero transitive deps** — the opposite call from Docling's 101, made the
+  same way: measure first). **The design calls that mattered:** (1) **ratios ship as their
+  components** — `embed_cache_hit_ratio` → `..._lookups_total{result}`, `empty_result_ratio` →
+  `searches_total`+`searches_empty_total`, `rerank_skipped_total` →
+  `rerank_decisions_total{decision}` — because an in-process ratio is a **lifetime average** that
+  cannot be windowed, so a real regression goes invisible inside it after a week of uptime;
+  components are strictly *more* information (PromQL recovers the average). Proposed as a
+  supersede in `../Rag/agent-inbox/prometheus-ratios-ship-as-components.md`. (2) **explicit
+  decade buckets (0.1 ms → 60 s)**, since stages span five orders of magnitude (graph 0.39 ms,
+  reranked query ~25 s) and the library defaults (5 ms–10 s) yield **no p50 or p95 at either
+  end** — the two numbers the note asks for; a test pins the range. (3) **no path/query/title/
+  project label anywhere** (cardinality *and* privacy — `/metrics` is unauthenticated), enforced
+  by an allowlist test so a new high-cardinality label fails by default. (4) **the exporter never
+  kills what it observes** — a port clash warns and returns False. (5) recording is always on;
+  the flag gates only the HTTP server. **THE BUG THE LIVE RUN FOUND (fixtures could not):
+  `ingest_lag_seconds` was permanently zero for every agent write.** Write-back ingests
+  **synchronously**, so its fs event arrives after the file already matches the manifest and the
+  watcher reconciles `unchanged` → records nothing. The whole memory loop was unmeasured and the
+  plan's own criterion ("writing a note moves `ingest_lag_seconds`") was silently unmet while
+  every layer looked correct — Stage 4's `Snippet.page` failure mode exactly. Fixed with
+  `source="watch"|"writeback"`, which is also the honest shape: **measured live watch 2.21 s vs
+  write-back 0.058 s**, a 38x gap that one shared histogram would have averaged into a p95
+  describing neither. **Verified live** (real Qdrant + Ollama + real MCP stdio, scraped from
+  outside the process): all 9 series present, a search timed **all 8 stages**, `write_ops_total`
+  + `write_refused_total{secret}` both moved (CLAUDE.md §6's guardrail is now *observable*, not
+  just enforced), an **external** edit moved `ingest_lag{watch}` and was searchable right after,
+  queue depth returned to idle. **628 tests** (+30), ruff, mypy (57). Gate unmoved
+  1.000/0.892/0.920.
 - **Stage 6 (OCR / image text) DONE 2026-07-21, and Stages 1-5 were re-verified first.** New
   `parsing/image.py`: `OcrEngine` protocol with **RapidOCR primary** (it ships inside the Docling
   stack Stage 4 already installs, so the `pdf` extra buys OCR for free — no new dependency) and a
@@ -348,6 +383,67 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-21 — Stages 1-6 verified, then P2 Stage 7: Prometheus `/metrics` — **P2 COMPLETE**
+- **Did:** Anik: *"if 1-6 stage are fully ready then go for the next"*. Verified stages 1-6 (598
+  tests, ruff, mypy 56, gate 1.000/0.892/0.920, plus a live reindex of `../Rag` — clean, no drift,
+  no stale parser), then built and verified Stage 7 of `../Rag/projects/vaultrag/p2-step-plan.md`.
+  **That closes P2.**
+- **The bug worth remembering, and fixtures could not have found it.** `ingest_lag_seconds` was
+  built on the watcher, because the design note frames it as "fs event → searchable". Write-back
+  ingests **synchronously**, so its fs event arrives *after* the file already matches the manifest
+  and the watcher's reconcile is `unchanged` — which records nothing, correctly. Net effect: every
+  agent write left the lag histogram at **zero**, the entire memory loop was unmeasured, and the
+  plan's own acceptance criterion ("writing a note moves `ingest_lag_seconds`") was unmet while
+  unit tests, lint, mypy and the gate were all green. **This is the same failure mode as Stage 4's
+  `Snippet.page`:** the number reached one layer and stopped, and every intermediate layer looked
+  right. Fixed with a `source="watch"|"writeback"` label — which turned out to be the honest shape
+  anyway: measured live, **watch 2.21 s vs write-back 0.058 s**, so one shared histogram would have
+  produced a p95 describing neither route.
+- **The naming deviation I'd re-derive: ratios ship as components.** The design note names
+  `embed_cache_hit_ratio` / `empty_result_ratio` / `rerank_skipped_total`. A ratio computed
+  in-process is a **lifetime average** — it cannot be windowed, so after a week of uptime a real
+  regression is invisible inside it, and a bare skip counter cannot express a skip *rate* at all.
+  Shipped as counter pairs/labelled counters; PromQL recovers the average, so the components are
+  strictly more information. Filed as a supersede in
+  `../Rag/agent-inbox/prometheus-ratios-ship-as-components.md` rather than drifting silently.
+- **Buckets were a real decision, not boilerplate.** Stages here span five orders of magnitude
+  (graph expand 0.39 ms; a reranked query ~25 s). `prometheus_client`'s defaults (5 ms–10 s) put
+  every graph observation in the first bucket and every reranked one in `+Inf` — a histogram that
+  exists and answers nothing. Explicit decade ladder 0.1 ms → 60 s, with a test pinning the range
+  against those measured numbers so a later edit can't quietly narrow it.
+- **`prometheus-client` is a base dependency, not an extra** — 1 package, zero transitive deps.
+  Deliberately the opposite call from Stage 4's Docling (101 packages → extra), reached the same
+  way: resolve it and look, don't assume. Observability that ships by default is there *before*
+  the incident.
+- **Two false alarms I chased down rather than assumed** (both turned out to be my test artifacts,
+  and both were worth confirming): `embed_cache_lookups` read 0/0 after a live write — the note
+  had chunked to **0 chunks** because a stale manifest entry from an earlier run made the ingest
+  `unchanged`, so there genuinely was no cache lookup; and the watcher reconciling a write-back
+  file as `unchanged` is expected, documented behaviour, not a double-ingest bug.
+- **Files:** `metrics.py` (new), `config.py` (`metrics_enabled`/`metrics_port`/`metrics_addr`),
+  `retrieval/pipeline.py` (per-stage `time_stage` + `record_search`), `retrieval/rerank.py`
+  (decision counter), `embedding/cache.py` (hit/miss, counted in *deduplicated* hashes),
+  `writeback/writer.py` (`_observed` decorator over the 3 public tools — one funnel for accepted,
+  refused *and* write-back lag), `indexer/watch.py` (`_first_dirty` span, queue-depth gauge, dead
+  jobs, ingest status), `cli.py` (`--metrics` on `watch`/`mcp`, `_start_metrics`),
+  `pyproject.toml`. Tests: `tests/test_metrics.py` (new, 30). **Vault:** `p2-step-plan.md` Log +
+  Decision 5 settled; new `agent-inbox/prometheus-ratios-ship-as-components.md`.
+- **Green: 628 tests, ruff, ruff format, mypy (57). Gate unmoved: 1.000 / 0.892 / 0.920.**
+- **Next / handoff:** **P3** (`CLAUDE.md` §4) — multi-project keys + tenancy hardening,
+  compression/budget packer, query-log mining, optional `answer` mode, compose profiles. There is
+  **no P3 step plan in the vault yet**; write one the way P0/P1/P2 had, before coding. Things to
+  know: (a) **`serve`/FastAPI still does not exist** — when it lands, mount
+  `vaultrag.metrics.registry()` at `/metrics`; the standalone exporter stays as the second
+  front-end onto the same registry, no rework; (b) a **`project` label on metrics is deliberately
+  absent** and becomes meaningful exactly when P3's multi-project tenancy lands — that is the time
+  to add it, and the allowlist test in `test_metrics.py` will need it too; (c) `state/vaultrag.db`
+  **is still tracked in git** and still needs `git rm --cached state/vaultrag.db` from Anik —
+  `.gitignore` is fixed but does not apply to already-tracked files (now 4 sessions running);
+  (d) the **MCP server still does not check drift at startup**, unchanged since Stage 4 — with
+  `/metrics` now available, a drift *gauge* is the natural way to close it; (e) CI installs no
+  extras, so Docling/OCR tests skip there — `uv sync --extra pdf` locally before claiming those
+  paths green; (f) `PARSER_VERSION` stays at **4** — Stage 7 observes, it does not parse.
 
 ### 2026-07-21 — Stages 1-5 re-verified (3 bugs found + fixed), then P2 Stage 6: OCR / image text
 - **Did:** Anik: *"check and test upto stage 5 in p2 if everything is working perfectly with no

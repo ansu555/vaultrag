@@ -325,6 +325,29 @@ class Settings(BaseSettings):
         description="Root log level for structlog output.",
     )
 
+    # --- metrics (Prometheus exporter; P2 Stage 7) -----------------------------
+    # Standalone `/metrics` (p2-step-plan Decision 5) — there is no FastAPI `serve` role
+    # yet, so prometheus_client serves its own port; P3's `serve` mounts the same registry.
+    # See ../Rag/projects/vaultrag/monitoring-observability.md and vaultrag/metrics.py.
+    metrics_enabled: bool = Field(
+        default=False,
+        description="Serve Prometheus metrics on metrics_port. Off by default: `vaultrag "
+        "mcp` runs as a stdio subprocess of an agent, and N concurrent sessions each "
+        "binding a port is a surprise plus a conflict. Metrics are *recorded* either way "
+        "— this flag only opens the scrape endpoint (`--metrics` turns it on per-run).",
+    )
+    metrics_port: int = Field(
+        default=9464,
+        description="Port for the standalone /metrics endpoint. Change it to run a second "
+        "exporting process on one box (a bind clash warns and continues, never fails).",
+    )
+    metrics_addr: str = Field(
+        default="127.0.0.1",
+        description="Bind address for /metrics. Localhost by default — the endpoint is "
+        "unauthenticated, and local-first means it should not reach the network unless "
+        "asked. Set 0.0.0.0 to let a Prometheus in another container scrape it.",
+    )
+
     @model_validator(mode="after")
     def _reject_retired_rerank_env(self) -> Settings:
         """Fail loudly if the retired ``VAULTRAG_RERANK_ENABLED`` is still set.
