@@ -11,12 +11,21 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 - **Phase:** **P2 COMPLETE — all 7 stages DONE (1+2+3+4+5+6+7), and the index-drift bug is
   FIXED. Next: P3** (multi-project keys + tenancy hardening, compression/budget packer,
   query-log mining, optional `answer` mode, compose profiles) — `CLAUDE.md` §4.
-- **Open before P3 (from the 2026-07-21 audit, see the latest session-log entry):** bugs **3**
-  (UTF-8 BOM breaks frontmatter parsing → all tags lost) and **4** (`write_note` never writes the
-  H1 its schema promises → `append_section` can't target agent-created notes) are **unfixed**;
-  bugs 1 (symlink escape) and 2 (writes could destroy a PDF) are **fixed and merged** (PR #10), as
-  is `.github/workflows/checks.yml` + branch protection (PR #11). **CI is now genuinely
-  merge-blocking** — 4 required checks on a protected `main`, admin bypass retained.
+- **The 2026-07-21 audit is CLOSED — all 4 bugs fixed and merged** (PR #10 bugs 1-2, PR #11 CI +
+  branch protection, PR #12 bugs 3-4), and **independently re-verified on 2026-07-21** by
+  re-running the four original attack scenarios against the merged code, not by re-reading the
+  fixes: symlink escape refused by `walk_vault` (`escaped=1`) *and* `ingest_path` while an
+  in-vault symlink stays indexable; a PDF survives the two-call `patch_frontmatter` attack
+  **byte-identical, 0 U+FFFD**, refused `not-markdown` *before* the optimistic lock so the 409 no
+  longer leaks the live hash; a BOM'd note keeps `tags=['alpha','beta']` and its real title with
+  **line anchors unshifted**; `write_note` renders its H1 and `append_section` can now target the
+  note it just created. **645 tests, exit 0.** Branch protection confirmed live via the API:
+  4 required checks, `strict`, 0 approvals, `enforce_admins=false`.
+- **Still open from that audit (item 5, low, never assigned):** **zero-chunk ghost docs.**
+  Reproduced live — `empty.md` and a frontmatter-only note each create a `documents` row with
+  **0 chunks** while P2 Stage 6 deliberately treats a textless *image* as a skip/evict for the
+  stated reason that a zero-block row is unretrievable. The two paths still disagree; pick one
+  rule and apply it to both.
 - **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
   `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
   module imports `prometheus_client` — interfaces over vendors) + instrumentation in
