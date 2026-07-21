@@ -421,6 +421,15 @@ class NoteWriter:
 
     # --- rendering ------------------------------------------------------------
     def _render_new_note(self, title: str, content: str, tags: Sequence[str] | None) -> str:
+        """Frontmatter + an H1 + the body.
+
+        The H1 is not decoration. The MCP schema tells the model ``title`` "becomes the
+        H1/frontmatter title", and writing frontmatter alone made that false — with no heading
+        in the file, ``append_section`` could never target a note VaultRAG itself had created
+        ("heading not found; headings here: (none)"), so the documented *create a note, then
+        grow it* memory loop was broken for exactly the notes agents write. It also gives
+        retrieved snippets a section anchor instead of ``anchor=None``.
+        """
         created = datetime.fromtimestamp(self._now(), tz=UTC).date().isoformat()
         meta: dict[str, Any] = {
             "title": title,
@@ -433,12 +442,29 @@ class NoteWriter:
             if cleaned:
                 meta["tags"] = cleaned
         body = content.strip("\n")
-        return f"{_render_frontmatter(meta)}\n{body}\n"
+        # An agent that already opened its content with a top-level heading gets that one
+        # honored rather than a duplicate stacked above it — two H1s would split the note into
+        # two sections and make `append_section(heading=title)` ambiguous.
+        if _starts_with_h1(body):
+            return f"{_render_frontmatter(meta)}\n{body}\n"
+        return f"{_render_frontmatter(meta)}\n# {title}\n\n{body}\n"
 
 
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+def _starts_with_h1(body: str) -> bool:
+    """True when the body's first non-blank line is already a top-level ``# `` heading.
+
+    Deliberately only ``#`` and not ``##``: a note opening at ``##`` has no H1, so one is
+    still added. ``#hashtag`` is not a heading — markdown requires the space.
+    """
+    for line in body.splitlines():
+        if line.strip():
+            return line.lstrip().startswith("# ")
+    return False
+
+
 def _decode_or_refuse(rel: str, data: bytes) -> str:
     """Decode an edit target's bytes as UTF-8, refusing rather than mangling it.
 

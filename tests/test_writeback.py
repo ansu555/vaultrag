@@ -299,6 +299,61 @@ def test_write_refuses_path_traversal(
 
 
 # ---------------------------------------------------------------------------
+# The create-then-grow memory loop — write_note must emit the H1 it promises
+# ---------------------------------------------------------------------------
+def test_write_note_writes_the_h1_its_schema_promises(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
+) -> None:
+    """The MCP schema says ``title`` "becomes the H1/frontmatter title"; it wrote only
+    frontmatter, so the file had no heading at all."""
+    writer = make_writer(vault, store, vector_store, git_enabled=False)
+    result = writer.write_note(title="Gamma Findings", content="First observation.\n")
+    written = (vault / result.path).read_text(encoding="utf-8")
+    assert "# Gamma Findings" in written
+    assert "title: Gamma Findings" in written  # frontmatter title still there too
+
+
+def test_append_section_can_target_an_agent_created_note(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
+) -> None:
+    """The documented memory loop, end to end. Without an H1 this failed with
+    "heading not found; headings here: (none)" — broken for exactly the notes agents make."""
+    writer = make_writer(vault, store, vector_store, git_enabled=False)
+    created = writer.write_note(title="Gamma Findings", content="First observation.\n")
+
+    appended = writer.append_section(
+        path=created.path, heading="Gamma Findings", content="Second observation."
+    )
+    assert appended.action == "appended"
+    written = (vault / appended.path).read_text(encoding="utf-8")
+    assert "First observation." in written
+    assert "Second observation." in written
+
+
+def test_write_note_does_not_stack_a_duplicate_h1(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
+) -> None:
+    """Content that already opens with an H1 keeps its own — two H1s would split the note
+    and make `append_section(heading=title)` ambiguous."""
+    writer = make_writer(vault, store, vector_store, git_enabled=False)
+    result = writer.write_note(title="Gamma Findings", content="# Gamma Findings\n\nBody.\n")
+    written = (vault / result.path).read_text(encoding="utf-8")
+    assert written.count("# Gamma Findings") == 1
+
+
+def test_write_note_adds_an_h1_when_content_starts_at_h2(
+    vault: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore
+) -> None:
+    """A note opening at `##` has no H1, so one is still added (and `##` is not mistaken
+    for one)."""
+    writer = make_writer(vault, store, vector_store, git_enabled=False)
+    result = writer.write_note(title="Gamma Findings", content="## Detail\n\nBody.\n")
+    written = (vault / result.path).read_text(encoding="utf-8")
+    assert "# Gamma Findings" in written
+    assert "## Detail" in written
+
+
+# ---------------------------------------------------------------------------
 # Markdown-only — writability is not inherited from indexability
 # ---------------------------------------------------------------------------
 # A minimal but genuinely binary PDF: byte 0x80 is invalid UTF-8, so a lossy read

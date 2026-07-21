@@ -14,9 +14,9 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 - **Open before P3 (from the 2026-07-21 audit, see the latest session-log entry):** bugs **3**
   (UTF-8 BOM breaks frontmatter parsing → all tags lost) and **4** (`write_note` never writes the
   H1 its schema promises → `append_section` can't target agent-created notes) are **unfixed**;
-  bugs 1 (symlink escape) and 2 (writes could destroy a PDF) are fixed on `fix/containment-gaps`,
-  which also adds `.github/workflows/checks.yml` (ruff + mypy + pytest, previously advisory).
-  **Still open: `main` has no branch protection**, so no check is actually merge-blocking yet.
+  bugs 1 (symlink escape) and 2 (writes could destroy a PDF) are **fixed and merged** (PR #10), as
+  is `.github/workflows/checks.yml` + branch protection (PR #11). **CI is now genuinely
+  merge-blocking** — 4 required checks on a protected `main`, admin bypass retained.
 - **Stage 7 (Prometheus `/metrics`) DONE 2026-07-21 — the last P2 stage.** New top-level
   `metrics.py` (own `CollectorRegistry`, metric objects behind `record_*` helpers so no other
   module imports `prometheus_client` — interfaces over vendors) + instrumentation in
@@ -390,10 +390,11 @@ Prepend newest first. Template:
 
 ## Session log
 
-### 2026-07-21 (later) — two containment bugs fixed: symlink escape + PDF-destroying write
+### 2026-07-21 (later) — all 4 audit bugs fixed, CI wired, and `main` finally gated
 - **Did:** an audit turned up 4 real bugs the 628-test suite could not see, because each lives in
-  the **gap between two individually-correct components**. Fixed the two serious ones on
-  `fix/containment-gaps` (branched off `main`; one commit + regression tests each).
+  the **gap between two individually-correct components**. **All 4 are now fixed and merged**
+  (PR #10 bugs 1-2, PR #11 CI + branch protection, PR #12 bugs 3-4), each with regression tests
+  confirmed **failing against the pre-fix code** before being accepted. **645 tests.**
 - **Bug 1 (HIGH, security) — the walk escaped the vault.** `os.walk(followlinks=False)` only stops
   the walk *descending* symlinked **directories**; symlinked **files** are still listed, and
   `scan.py` read straight through them. `notes/leak.md -> /outside/private-diary.md` was indexed
@@ -424,15 +425,25 @@ Prepend newest first. Template:
 - **Verified:** each regression test confirmed **failing against the pre-fix code** and passing
   after (not just passing). **639 tests** (+11), ruff, mypy (57). `metrics.py`'s mirrored refusal
   tuple caught the new enum members — that sync test paid for itself.
-- **Next session:** bugs 3 and 4 from the same audit are unfixed — (3) a **UTF-8 BOM** breaks
-  frontmatter parsing (`read_text(encoding="utf-8")` doesn't strip it, so the first `---` never
-  matches: all tags lost → server-side `filters.tags` silently fails, title becomes raw YAML in
-  every citation; routine on Windows-authored notes; fix is stripping a leading `﻿` in
-  `split_frontmatter`, safe because it doesn't shift line numbers), and (4) **`write_note` never
-  writes the H1 its schema promises** (`server.py:575` tells the model "Becomes the H1/frontmatter
-  title"; `_render_new_note` writes frontmatter only) — so `append_section` can **never** target an
-  agent-created note, breaking the documented "create a note, then grow it" memory loop for
-  exactly the notes agents create.
+- **Bugs 3 and 4 also fixed (PR #12) — the audit is now fully closed.**
+  - **(3) UTF-8 BOM destroyed frontmatter parsing.** `read_text(encoding="utf-8")` does **not**
+    strip U+FEFF (only `utf-8-sig` does), so the delimiter test `lines[0].strip() != "---"` failed
+    and the entire YAML block parsed as **prose**: every tag lost (→ server-side `filters.tags`
+    **silently** stops matching that note), title became raw YAML in every citation, frontmatter
+    indexed as body text. Routine on Windows-authored notes. Fixed in **`split_frontmatter` +
+    `frontmatter_line_offset`** — the two entry points — so markdown, excalidraw *and* write-back
+    inherit it without changes. A BOM is one character on line 1, never a line, so **citation
+    anchors are unchanged** — the test asserts that rather than trusting it.
+  - **(4) `write_note` never wrote the H1 its own schema promises.** `server.py` tells the model
+    `title` "Becomes the H1/frontmatter title"; `_render_new_note` wrote frontmatter only, so the
+    file had **no heading** and `append_section` could never target a note VaultRAG had just
+    created ("headings here: (none)") — the documented *create a note, then grow it* memory loop
+    was broken for **exactly the notes agents write**, and their snippets came back `anchor=None`.
+    Now renders `# {title}`, **unless** the content already opens with an H1 (two would split the
+    note and make `append_section(heading=title)` ambiguous); content opening at `##` still gets
+    one. **Checked the vault first** (`write-back-design.md`, `reference-mcp-tools.md`): no
+    decision covers note rendering, so this makes the code match its own stated contract rather
+    than overriding a design call.
 - **Then wired CI (the root cause).** `eval.yml` was the only workflow, so ruff, mypy, and 634
   tests never ran on a PR — `CLAUDE.md` §5's "CI should fail on lint errors" *could not* hold.
   New `.github/workflows/checks.yml`: **`static`** (ruff check + ruff format --check + mypy),
@@ -449,11 +460,30 @@ Prepend newest first. Template:
   same "looked checked, wasn't" shape as the bugs themselves. `test` passes `-rs` so its 5
   legitimate base-install skips stay visible. All three jobs verified locally, with *and* without
   extras (base: 634 passed / 5 skipped; extras: 639 passed / 0 skipped).
-- **STILL OPEN, and it matters: `main` has no branch protection** (`gh api .../protection` → 404).
-  So `checks.yml` and `eval.yml` **run but do not block** — CLAUDE.md calls the eval gate
-  "merge-blocking" and it has never actually been so. Wiring the workflows was necessary but is
-  **not sufficient**; someone must mark these as required checks on `main`. Left for Anik to
-  decide, since requiring PRs changes the direct-push-to-main workflow.
+- **Branch protection is now ON — the gate is real.** `main` had **none** (`gh api .../protection`
+  → 404), so `eval.yml` had *never* actually been merge-blocking despite CLAUDE.md calling it
+  that. Now: 4 required checks (`ruff + mypy`, `pytest`, `pytest (pdf + ocr extras)`, `retrieval
+  quality gate`), `strict` (branch must be current), PR required with **0 approvals** (solo repo —
+  never wait on a reviewer who doesn't exist), **`enforce_admins=false`** deliberately, so Anik
+  keeps an escape hatch rather than being locked out at 2am by a red check. Force-push and
+  deletion of `main` blocked. Undo: `gh api -X DELETE repos/ansu555/vaultrag/branches/main/protection`.
+  Verified against a real run: the 4 context names match the workflows' `name:` fields exactly.
+- **CI caught a real bug on its very first run — `test_cli.py::test_reindex_offers_force`.** It
+  asserted `"--force" in result.output` and had passed on every dev box for the life of the repo.
+  **Rich renders a flag as two styled spans** (`ESC[1;2;36m-ESC[0m ESC[1;2;36m-forceESC[0m`), so
+  the literal substring is *absent* from styled output. A captured local run is uncolored and
+  never hit it; **GitHub Actions sets `FORCE_COLOR`**, and does. Reproduce locally with
+  **`FORCE_COLOR=1 uv run pytest`**. Fixed by making the runner request unstyled output —
+  **`TERM=dumb` is the switch that wins** (Rich's FORCE_COLOR beats NO_COLOR, so NO_COLOR alone
+  does nothing) — plus `test_cli_output_is_unstyled`, a canary pinning the *outcome* not the
+  mechanism, so a future Rich change fails once and legibly. **640 tests.** This is the whole
+  argument for `checks.yml` in one example: a test that never ran in CI was quietly
+  environment-dependent.
+- **All merged (PR #10 fixes, PR #11 CI). Live CI evidence:** base `test` job 635 passed / 5
+  skipped (the legitimate PDF/OCR skips), `formats` job **33 passed / 0 skipped** with the
+  engine-assert printing `docling + OCR present` — i.e. the "silently green" failure mode the
+  guard exists to prevent is confirmed *not* happening. `formats` costs **~1m35s**, cheaper than
+  the +79-package install suggested.
 
 ### 2026-07-21 — Stages 1-6 verified, then P2 Stage 7: Prometheus `/metrics` — **P2 COMPLETE**
 - **Did:** Anik: *"if 1-6 stage are fully ready then go for the next"*. Verified stages 1-6 (598
