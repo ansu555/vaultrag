@@ -78,7 +78,11 @@ def search(
 
     rerank_params = rerank if rerank is not None else RerankParams()
     # Widen the fetch only when we'll actually rerank — no point pulling 50 to keep 10.
-    fetch_limit = rerank_params.top_n if reranker is not None else k
+    # `max` because `top_n` is a *cost* knob (how deep the cross-encoder looks), never a
+    # recall cap: at top_n < k a bare `top_n` here would fetch fewer candidates than the
+    # caller asked to keep, so rerank-on would silently return a shorter list than
+    # rerank-off and a top_n sweep would measure truncation instead of rerank depth.
+    fetch_limit = max(rerank_params.top_n, k) if reranker is not None else k
 
     dense_vector = embedder.embed_query(stripped)
     sparse_vector = sparse.embed_query(stripped)

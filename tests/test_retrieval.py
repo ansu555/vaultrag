@@ -252,6 +252,29 @@ def test_search_with_a_reranker_widens_the_fetch_to_top_n() -> None:
     assert store.calls[0]["limit"] == 40
 
 
+def test_search_never_narrows_the_fetch_below_k_for_a_shallow_top_n() -> None:
+    """A shallow `top_n` must not starve the fetch: the store is still asked for k.
+
+    `top_n` bounds cross-encoder *work*, so at top_n < k the fetch stays at k and the
+    unreviewed remainder backfills. Otherwise turning rerank on would return fewer
+    snippets than turning it off, and a cheap-rerank config would look like a recall
+    regression that is really just truncation.
+    """
+    store = FakeVectorStore(hits=[make_hit(point_id=str(i), text=f"body {i}") for i in range(10)])
+    result = search(
+        "q",
+        project_id=PROJECT,
+        vector_store=store,
+        embedder=QueryEmbedder(FakeEmbedder()),
+        sparse=FakeSparse(),
+        k=10,
+        reranker=FakeReranker(default=0.9),
+        rerank=RerankParams(top_n=3, dominant_ratio=0),
+    )
+    assert store.calls[0]["limit"] == 10
+    assert len(result.snippets) == 10
+
+
 def test_search_reranks_snippets_into_cross_encoder_order() -> None:
     """The snippet the cross-encoder likes best is returned first, over fusion order."""
     hits = [

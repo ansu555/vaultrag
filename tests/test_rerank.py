@@ -149,6 +149,33 @@ def test_top_n_bounds_what_is_sent_to_the_model() -> None:
     assert passages == ["b0", "b1", "b2"]
 
 
+def test_top_n_below_keep_still_returns_keep_results() -> None:
+    """`top_n` is a cost knob, not a recall cap — the unreviewed tail backfills to `keep`.
+
+    Guards the confound that would otherwise make a `rerank_top_n` sweep unreadable: at
+    top_n < k a shallow rerank must cost review *depth*, never results, or every cheap
+    config scores worse for reasons that have nothing to do with the cross-encoder.
+    """
+    cands = [_cand(str(i), 0.5 - i / 100, f"b{i}") for i in range(10)]
+    reranker = FakeReranker({"b2": 0.9}, default=0.1)
+    out = rerank_candidates(
+        "q", cands, reranker, keep=10, params=RerankParams(top_n=3, dominant_ratio=0)
+    )
+    assert len(out) == 10
+    # Reviewed top-3 first (b2 promoted), then the untouched tail in fusion order.
+    assert [c.point_id for c in out] == ["2", "0", "1", "3", "4", "5", "6", "7", "8", "9"]
+
+
+def test_threshold_does_not_drop_the_unreviewed_tail() -> None:
+    """A candidate the model never scored has no score to fail the threshold with."""
+    cands = [_cand(str(i), 0.5 - i / 100, f"b{i}") for i in range(5)]
+    reranker = FakeReranker(default=0.01)  # everything reviewed scores below the floor
+    out = rerank_candidates(
+        "q", cands, reranker, keep=10, params=RerankParams(top_n=2, threshold=0.3, dominant_ratio=0)
+    )
+    assert [c.point_id for c in out] == ["2", "3", "4"]
+
+
 def test_score_count_mismatch_raises() -> None:
     class BrokenReranker:
         model = "broken"

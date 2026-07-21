@@ -194,10 +194,13 @@ def rerank_candidates(
 
     ``reranker is None`` means the stage is disabled entirely — candidates pass through
     (trimmed to ``keep``) with their RRF scores intact. Otherwise the top ``params.top_n``
-    are scored ``query x child text``, re-sorted by score, thresholded, and capped to
-    ``keep``. The known-item fast path (top-1 fusion dominance) returns the fused order
-    without calling the model. A candidate whose payload has no ``text`` still scores
-    (cross-encoders handle empty passages) — it just tends to rank last.
+    are scored ``query x child text``, re-sorted by score and thresholded; any candidates
+    below ``top_n`` follow in fusion order, and the whole list is capped to ``keep``. So
+    lowering ``top_n`` buys latency by reviewing fewer candidates — it never returns fewer
+    results than fusion alone would. The known-item fast path (top-1 fusion dominance)
+    returns the fused order without calling the model. A candidate whose payload has no
+    ``text`` still scores (cross-encoders handle empty passages) — it just tends to rank
+    last.
     """
     if reranker is None or len(candidates) <= 1:
         return candidates[:keep]
@@ -207,6 +210,12 @@ def rerank_candidates(
         return candidates[:keep]
 
     subset = candidates[: params.top_n]
+    # Everything the cross-encoder never looked at. It keeps fusion order and sits *below*
+    # every reranked survivor: `top_n` bounds what the model reads, not what search may
+    # return, so a shallow `top_n` costs review depth rather than results. The tail is
+    # deliberately exempt from `threshold` — an unscored candidate has no score to compare,
+    # and dropping it would be claiming an irrelevance the model never asserted.
+    tail = candidates[params.top_n :]
     scores = reranker.score(query, [_candidate_text(c) for c in subset])
     if len(scores) != len(subset):
         raise RerankError(f"reranker returned {len(scores)} scores for {len(subset)} passages")
@@ -214,7 +223,7 @@ def rerank_candidates(
     # Stable sort: ties (e.g. every NoOp score) keep their fusion order.
     rescored.sort(key=lambda c: c.score, reverse=True)
     kept = [c for c in rescored if c.score >= params.threshold]
-    return kept[:keep]
+    return (kept + list(tail))[:keep]
 
 
 def _candidate_text(candidate: ScoredChunk) -> str:
