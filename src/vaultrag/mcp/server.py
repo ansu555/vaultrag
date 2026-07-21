@@ -81,6 +81,7 @@ from vaultrag.retrieval import (
     DEFAULT_BUDGET_TOKENS,
     DEFAULT_K,
     DEFAULT_PARENT_MAX_TOKENS,
+    CompressParams,
     GraphExpandParams,
     GraphStore,
     Reranker,
@@ -191,6 +192,7 @@ def build_mcp_server(
     parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
     graph_store: GraphStore | None = None,
     graph_params: GraphExpandParams | None = None,
+    compress_params: CompressParams | None = None,
     vault_name: str | None = None,
     writer: NoteWriter | None = None,
 ) -> FastMCP:
@@ -213,6 +215,11 @@ def build_mcp_server(
     read P2 Stage 2's ``links`` table (``retrieval/graph.py``). ``None`` (a deployment with no
     metadata store, or one indexed before Stage 2) simply omits both: search still works, it
     just carries no ``related`` pointers, and no tool advertises a graph that isn't there.
+
+    ``compress_params`` tunes retrieval stage 7 (near-dupe drop, MMR diversity, per-doc cap,
+    trim — ``retrieval/compress.py``); ``None`` uses the shipped defaults. It runs in both
+    modes, but in ``compact`` the pipeline runs unbounded and the previews are re-packed by
+    ``_compact`` afterwards, so the budget still applies to what the agent actually browses.
 
     ``vault_name`` is the Obsidian display name used to build ``obsidian://open`` citation
     URIs (retrieval stage 8); ``None`` omits them. The CLI resolves it from settings, falling
@@ -327,6 +334,7 @@ def build_mcp_server(
                 parent_max_tokens=parent_max_tokens,
                 graph_store=graph_store,
                 graph=graph_params,
+                compress_params=compress_params,
                 vault_name=vault_name,
                 # Compact mode budgets the *previews*, not the full texts: packing full
                 # texts first would silently drop hits the agent asked to browse (k),

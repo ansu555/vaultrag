@@ -261,6 +261,31 @@ class Settings(BaseSettings):
         "meaningful tag vocabulary.",
     )
 
+    # --- compression (retrieval stage 7; P3 Stage 1) --------------------------
+    # The real deterministic compressor replacing P0's greedy packer: near-dupe drop → MMR
+    # diversity → per-doc-capped greedy pack → trim. Free, ~0 ms, no LLM. Similarity is
+    # LEXICAL (token-set Jaccard), not embedding cosine — parent-swap (ON by default) emits
+    # snippets with no stored vector, and MMR needs one metric across all candidates. See
+    # ../Rag/projects/vaultrag/context-compression.md and retrieval/compress.py's module
+    # docstring (P3 Decision 3, with the int8 measurement that ruled it out as the blocker).
+    compress_dupe_threshold: float = Field(
+        default=0.9,
+        description="Token-set Jaccard above which a lower-ranked snippet is dropped as a "
+        "near-duplicate of a higher-ranked one (lexical, not embedding cosine). ≥1 disables "
+        "near-dupe removal. Per-vault: raise it if distinct chunks share boilerplate.",
+    )
+    compress_mmr_lambda: float = Field(
+        default=0.7,
+        description="MMR relevance weight (0-1): higher trusts the incoming rank order, "
+        "lower diversifies harder. 1.0 disables the diversity reorder (pure relevance). The "
+        "top hit is never demoted regardless. Per-vault knob.",
+    )
+    compress_per_doc_cap: int = Field(
+        default=3,
+        description="Most chunks of one document the budget packer keeps, so a single long "
+        "note can't crowd out other documents. 0 disables the cap.",
+    )
+
     # --- live watch (indexer; P1 Stage 4) -------------------------------------
     # watchdog Observer → per-path debounce → worker pool → ingest_path. Owned by
     # serve/indexer and `vaultrag watch`; `vaultrag mcp` runs it only with --watch (a

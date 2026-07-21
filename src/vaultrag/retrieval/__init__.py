@@ -10,6 +10,11 @@ from __future__ import annotations
 
 from vaultrag.index.base import SearchFilters
 from vaultrag.retrieval.cite import cite, obsidian_uri
+from vaultrag.retrieval.compress import (
+    CompressParams,
+    compress,
+    compress_params_for,
+)
 from vaultrag.retrieval.graph import (
     GraphExpandParams,
     GraphStore,
@@ -50,6 +55,7 @@ __all__ = [
     "DEFAULT_PARENT_MAX_TOKENS",
     "DEFAULT_PREFETCH_LIMIT",
     "BgeReranker",
+    "CompressParams",
     "GraphExpandParams",
     "GraphStore",
     "NoOpReranker",
@@ -62,6 +68,8 @@ __all__ = [
     "VaultParentResolver",
     "authority_boost",
     "cite",
+    "compress",
+    "compress_params_for",
     "graph_expand",
     "graph_params_for",
     "load_reranker",

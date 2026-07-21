@@ -47,10 +47,12 @@ from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.index.sparse import Bm25Embedder
 from vaultrag.indexer.pipeline import reindex_vault
 from vaultrag.retrieval import (
+    CompressParams,
     GraphExpandParams,
     GraphStore,
     Reranker,
     RerankParams,
+    compress_params_for,
     graph_params_for,
     load_reranker,
     rerank_params_for,
@@ -83,6 +85,11 @@ class SearchStack:
     # cannot move a path-based metric; a reorder is nothing but a move).
     graph_store: GraphStore | None = None
     graph_params: GraphExpandParams = field(default_factory=GraphExpandParams)
+    # Stage 7. Wired like graph_params: the compressor's near-dupe drop and MMR reorder move
+    # which paths reach the top of the result set, so the gate must score the shipped config
+    # — a diversity step that demotes a correct chunk is exactly the regression it exists to
+    # catch. (The per-doc cap and trim are path- and rank-invisible, but ride along here.)
+    compress_params: CompressParams = field(default_factory=CompressParams)
     k: int = EVAL_K
     budget_tokens: int = EVAL_BUDGET_TOKENS
 
@@ -105,6 +112,7 @@ class SearchStack:
             rerank=self.rerank_params,
             graph_store=self.graph_store,
             graph=self.graph_params,
+            compress_params=self.compress_params,
         )
         seen: set[str] = set()
         ordered: list[str] = []
@@ -285,6 +293,7 @@ def replay_stack(
                 # a committed snapshot that could drift out from under it.
                 graph_store=store if settings.graph_expand_enabled else None,
                 graph_params=graph_params_for(settings),
+                compress_params=compress_params_for(settings),
                 k=settings.default_top_k,
             )
         finally:
@@ -331,6 +340,7 @@ def live_stack(golden: GoldenSet, settings: Settings) -> Iterator[SearchStack]:
             rerank_params=_rerank_params(settings),
             graph_store=store if settings.graph_expand_enabled else None,
             graph_params=graph_params_for(settings),
+            compress_params=compress_params_for(settings),
             k=settings.default_top_k,
         )
     finally:

@@ -12,8 +12,9 @@ This module is the stage sequencer. Stage 0 (scope + filters) and 2-3 (hybrid pr
 fusion, done server-side by the vector store) live here; stages 4 (rerank), 5 (parent
 swap), 6 (graph expand) and 8 (cite) are each their own module and each opt in through a
 parameter being non-``None``, so a caller composes exactly the pipeline it wants. Stage 7
-is still the P0-simple version — greedy budget truncation, no MMR/near-dupe drop (arch
-§13). Stage 1 (query expansion) is default-off by design and unbuilt.
+(compress) is the real deterministic compressor — near-dupe drop, MMR, per-doc cap, trim
+(``retrieval/compress.py``, P3 Stage 1). Stage 1 (query expansion) is default-off by design
+and unbuilt.
 
 Ref: ``../Rag/projects/vaultrag/hybrid-search.md``,
 ``../Rag/projects/vaultrag/retrieval-pipeline.md``, arch §9-§11.
@@ -26,6 +27,7 @@ from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, Vect
 from vaultrag.metrics import record_search, time_stage
 from vaultrag.models import SearchResult, Snippet
 from vaultrag.retrieval.cite import cite
+from vaultrag.retrieval.compress import CompressParams, compress
 from vaultrag.retrieval.graph import GraphExpandParams, GraphStore, graph_expand
 from vaultrag.retrieval.parents import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, parent_swap
 from vaultrag.retrieval.rerank import Reranker, RerankParams, rerank_candidates
@@ -52,6 +54,7 @@ def search(
     parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
     graph_store: GraphStore | None = None,
     graph: GraphExpandParams | None = None,
+    compress_params: CompressParams | None = None,
     vault_name: str | None = None,
 ) -> SearchResult:
     """Run the hybrid read path for one query, scoped to ``project_id``.
@@ -83,6 +86,11 @@ def search(
     When ``vault_name`` is given, stage 8 (cite) stamps each snippet with a working
     ``obsidian://open`` URI into that vault (``retrieval/cite.py``); without it, ``uri``
     stays ``None`` (a caller not serving an Obsidian client, e.g. the eval harness).
+
+    Stage 7 (compress) always runs last: near-dupe drop → MMR diversity reorder → greedy
+    budget pack (per-doc cap) → trim (``retrieval/compress.py``). ``compress_params`` tunes
+    it; ``None`` uses the shipped defaults. Neutral params reduce it to P0's plain greedy
+    pack, which is how an eval overlay isolates the stage.
     """
     stripped = query.strip()
     if not stripped:
@@ -149,8 +157,10 @@ def search(
         # costs no budget.
         with time_stage("cite"):
             snippets = cite(snippets, vault_name=vault_name)
-        with time_stage("pack"):
-            packed, total_tokens, truncated = pack_budget(snippets, budget_tokens)
+        # Stage 7: the real compressor — near-dupe drop, MMR diversity, per-doc-capped
+        # greedy pack, trim. Deterministic and free (retrieval/compress.py, P3 Stage 1).
+        with time_stage("compress"):
+            packed, total_tokens, truncated = compress(snippets, budget_tokens, compress_params)
 
     record_search(empty=not packed)
     return SearchResult(
@@ -203,12 +213,13 @@ def pack_budget(snippets: list[Snippet], budget_tokens: int) -> tuple[list[Snipp
     match beats an empty response, and a search that returns nothing because its single
     best hit didn't fit would look like "no relevant results" when the opposite is true.
     ``truncated`` is True whenever a lower-ranked hit existed but didn't make the cut.
-    Full compression (near-dupe drop, MMR, per-doc cap) is P1 (arch §13); P0 is this
-    "simple truncation" per the plan.
 
-    Public because it is *the* budget-packing rule: the MCP layer re-packs compact-mode
-    previews with it so ``budget_tokens``/``truncated`` mean the same thing in every
-    search mode.
+    The pipeline's stage 7 is now :func:`~vaultrag.retrieval.compress.compress` (near-dupe
+    drop, MMR, per-doc cap, trim — P3 Stage 1). This plain packer stays because the MCP
+    layer re-packs *compact-mode previews* with it: the previews are already the chosen,
+    diversified snippets squashed to one line each, so they need only the budget rule, not
+    a second dedupe/MMR pass — and ``budget_tokens``/``truncated`` keep the same meaning
+    across modes.
     """
     packed: list[Snippet] = []
     total = 0

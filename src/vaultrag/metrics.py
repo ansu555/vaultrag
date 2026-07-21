@@ -63,7 +63,7 @@ DEFAULT_METRICS_ADDR = "127.0.0.1"
 #: end-to-end ``total``. Pre-initialised as label values so every stage appears in a
 #: scrape at zero rather than materialising on first use — a series that only exists
 #: after the stage first runs makes ``rate()`` undefined exactly when you need it.
-SEARCH_STAGES = ("embed", "fetch", "rerank", "parents", "graph", "cite", "pack", "total")
+SEARCH_STAGES = ("embed", "fetch", "rerank", "parents", "graph", "cite", "compress", "total")
 
 #: The two routes by which a change becomes searchable — see :func:`record_ingest_lag`.
 INGEST_SOURCES = ("watch", "writeback")

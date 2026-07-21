@@ -206,7 +206,11 @@ def test_search_accepts_naming_the_served_project(vault: Path) -> None:
 
 def test_search_defaults_flow_from_server_settings(vault: Path) -> None:
     """k/budget defaults are the composition root's (env-driven), not schema constants."""
-    hits = [make_hit(point_id="a", tokens=20), make_hit(point_id="b", score=0.5, tokens=20)]
+    # Distinct docs/text: this asserts the budget, not stage 7's near-dupe/cap on twins.
+    hits = [
+        make_hit(point_id="a", tokens=20, text="alpha body", doc_id="doc-a"),
+        make_hit(point_id="b", score=0.5, tokens=20, text="beta body", doc_id="doc-b"),
+    ]
     server, store, _, _ = build(vault, hits=hits, default_k=3, default_budget_tokens=25)
     result = call(server, "search", {"query": "q"})
     assert store.calls[0]["limit"] == 3
@@ -215,7 +219,10 @@ def test_search_defaults_flow_from_server_settings(vault: Path) -> None:
 
 
 def test_search_explicit_k_and_budget_override_defaults(vault: Path) -> None:
-    hits = [make_hit(point_id="a", tokens=20), make_hit(point_id="b", score=0.5, tokens=20)]
+    hits = [
+        make_hit(point_id="a", tokens=20, text="alpha body", doc_id="doc-a"),
+        make_hit(point_id="b", score=0.5, tokens=20, text="beta body", doc_id="doc-b"),
+    ]
     server, store, _, _ = build(vault, hits=hits, default_k=3, default_budget_tokens=25)
     result = call(server, "search", {"query": "q", "k": 7, "budget_tokens": 100})
     assert store.calls[0]["limit"] == 7
@@ -276,7 +283,15 @@ def test_search_compact_mode_budgets_the_previews_not_the_full_texts(vault: Path
     first would drop them before compaction and hand back one preview for a k=10 browse.
     """
     hits = [
-        make_hit(point_id=f"p{i}", score=1.0 - i / 10, text="Short line.\n\nrest", tokens=500)
+        # Same first line (the preview) so the token math below holds, but distinct bodies +
+        # docs so stage 7 doesn't collapse these as near-dupes before compaction sees them.
+        make_hit(
+            point_id=f"p{i}",
+            score=1.0 - i / 10,
+            text=f"Short line.\n\nrest body number {i}",
+            doc_id=f"doc-{i}",
+            tokens=500,
+        )
         for i in range(5)
     ]
     server, _, _, _ = build(vault, hits=hits, default_budget_tokens=50)
@@ -292,7 +307,12 @@ def test_search_compact_mode_still_honors_the_budget(vault: Path) -> None:
     Previews are capped at _COMPACT_LINE_CHARS (160 → ~40 tokens each), so a 100-token
     budget fits two of them and drops the rest.
     """
-    hits = [make_hit(point_id=f"p{i}", score=1.0 - i / 10, text="x" * 400) for i in range(5)]
+    # Distinct trailing token per hit (past the 160-char preview cut) so the previews stay
+    # identical for the budget math while the full texts aren't near-dupes stage 7 collapses.
+    hits = [
+        make_hit(point_id=f"p{i}", score=1.0 - i / 10, text="x" * 400 + f" {i}", doc_id=f"doc-{i}")
+        for i in range(5)
+    ]
     server, _, _, _ = build(vault, hits=hits, default_budget_tokens=100)
     result = call(server, "search", {"query": "q", "mode": "compact"})
     assert [s["chunk_id"] for s in result["snippets"]] == ["p0", "p1"]

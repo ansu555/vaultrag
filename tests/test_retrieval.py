@@ -162,9 +162,11 @@ def test_empty_query_returns_empty_result_without_embedding() -> None:
 # Budget packing — P0's "simple truncation" (arch §13, plan Step 9)
 # ---------------------------------------------------------------------------
 def test_no_truncation_when_everything_fits_the_budget() -> None:
+    # Distinct doc + text so this exercises the packer alone, not stage 7's near-dupe drop
+    # or per-doc cap (which fire on identical/same-doc hits — see test_compress.py).
     hits = [
-        make_hit(point_id="a", score=0.9, tokens=100),
-        make_hit(point_id="b", score=0.5, tokens=100),
+        make_hit(point_id="a", score=0.9, tokens=100, text="alpha body one", doc_id="doc-a"),
+        make_hit(point_id="b", score=0.5, tokens=100, text="beta body two", doc_id="doc-b"),
     ]
     result = search(
         "q",
@@ -181,9 +183,9 @@ def test_no_truncation_when_everything_fits_the_budget() -> None:
 
 def test_budget_packing_drops_lower_ranked_hits_and_flags_truncated() -> None:
     hits = [
-        make_hit(point_id="a", score=0.9, tokens=800),
-        make_hit(point_id="b", score=0.7, tokens=800),
-        make_hit(point_id="c", score=0.5, tokens=800),
+        make_hit(point_id="a", score=0.9, tokens=800, text="alpha body one", doc_id="doc-a"),
+        make_hit(point_id="b", score=0.7, tokens=800, text="beta body two", doc_id="doc-b"),
+        make_hit(point_id="c", score=0.5, tokens=800, text="gamma body three", doc_id="doc-c"),
     ]
     result = search(
         "q",
@@ -202,8 +204,8 @@ def test_budget_packing_always_keeps_the_top_hit_even_if_oversized() -> None:
     """An oversized best match beats an empty response — never return zero snippets just
     because the single top-ranked hit alone exceeds budget_tokens."""
     hits = [
-        make_hit(point_id="a", score=0.9, tokens=5000),
-        make_hit(point_id="b", score=0.1, tokens=10),
+        make_hit(point_id="a", score=0.9, tokens=5000, text="alpha oversized body", doc_id="doc-a"),
+        make_hit(point_id="b", score=0.1, tokens=10, text="beta tiny body", doc_id="doc-b"),
     ]
     result = search(
         "q",
@@ -260,7 +262,10 @@ def test_search_never_narrows_the_fetch_below_k_for_a_shallow_top_n() -> None:
     snippets than turning it off, and a cheap-rerank config would look like a recall
     regression that is really just truncation.
     """
-    store = FakeVectorStore(hits=[make_hit(point_id=str(i), text=f"body {i}") for i in range(10)])
+    store = FakeVectorStore(
+        # Distinct docs so stage 7's per-doc cap (3/doc) doesn't cut the count this asserts.
+        hits=[make_hit(point_id=str(i), text=f"body {i}", doc_id=f"doc-{i}") for i in range(10)]
+    )
     result = search(
         "q",
         project_id=PROJECT,

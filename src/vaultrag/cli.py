@@ -65,7 +65,12 @@ from vaultrag.mcp import build_mcp_server
 from vaultrag.metrics import set_build_info, start_metrics_server
 from vaultrag.parsing.image import load_image_parser
 from vaultrag.parsing.pdf import load_pdf_parser
-from vaultrag.retrieval import graph_params_for, load_reranker, rerank_params_for
+from vaultrag.retrieval import (
+    compress_params_for,
+    graph_params_for,
+    load_reranker,
+    rerank_params_for,
+)
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
 
@@ -434,6 +439,7 @@ def mcp(
                 # can be non-None here purely for write-back/--watch, hence the second term.
                 graph_store=store if settings.graph_expand_enabled else None,
                 graph_params=graph_params_for(settings),
+                compress_params=compress_params_for(settings),
                 vault_name=resolved_vault_name,
                 writer=writer,
             )
