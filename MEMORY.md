@@ -8,8 +8,10 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P3 IN PROGRESS — Stages 1 and 2 both DONE (2026-07-22). Next: Stage 3
-(query_log + mining CLI).** P2 is COMPLETE (all 7 stages + the 4-bug audit). Plan at
+- **Phase:** **P3 IN PROGRESS — Stages 1 and 2 both DONE (2026-07-22); Stage 3 NOT started
+(Anik ended the session at Stage 2, and Stage 3's DDL is blocked on Decision 2 — see the session
+log).** P2 is COMPLETE (all 7 stages + the 4-bug audit). Stage 2 sits committed on branch
+**`feat/p3-stage2-multiproject` (`fed33cd`), unpushed, no PR.** Plan at
 `../Rag/projects/vaultrag/p3-step-plan.md`.
 - **P3 STAGE 2 (multi-project registry) COMPLETE 2026-07-22 — one process now serves N
 projects.** The foundation (registry CRUD + settings resolution + `vaultrag project add|list|
@@ -295,12 +297,25 @@ starting state: only `vaultrag-design` registered, 61 docs / 213 points.
 `indexer/watch.py`, `writeback/writer.py` (metric call sites); tests:
 `test_multiproject.py` (new), `test_mcp.py`, `test_metrics.py`, `test_store.py`, `test_index.py`,
 `test_cli.py`; vault: `agent-inbox/overview-tool-shape.md` (new).
-- **Next / handoff:** **Stage 3 (`query_log`)** — but read Decision 2 first: it **blocks the
-DDL**, because the reference schema stores `q_hash` and simultaneously calls the table the
-golden-set mining source, and a hash cannot become a query. That needs a superseding
-`agent-inbox/` note before code. Two Stage-1/2 notes are still awaiting Anik's ruling
+- **Next / handoff:** **Stage 3 (`query_log`) is NOT started — Anik ended the session at Stage 2.**
+Stage 2 is committed on branch `feat/p3-stage2-multiproject` (`fed33cd`), **not pushed and no PR
+opened** (CLAUDE.md: push only when asked) — that is the first thing to do next session if Anik
+wants it on `main` like Stages 1 and the Stage-2 foundation.
+**Decision 2 was put to Anik this session and deliberately left unanswered — do not treat that as
+"no", and do not start Stage 3 without it.** It **blocks the DDL**: `reference-database-schema.md`
+stores `q_hash` and simultaneously calls the table the golden-set mining source, and a hash cannot
+become a query. It matters more than the usual open decision because **`query_log` is the only
+table in the system that is *not* rebuildable from the vault** — every other row is a derived
+cache where "DR = reindex" applies, so a wrong schema here is the one that is not cheap to undo.
+The three options as put: (a) opt-in `query_text` column, default on for local/stdio and off for
+multi-tenant HTTP — the plan's recommendation, and a superseding `agent-inbox/` note since it
+overrides a *reference*; (b) always store the text, no knob (local-first tool, no branch); (c)
+`q_hash` only and **correct the reference note's mining claim instead**, which shrinks Stage 3 to
+telemetry Prometheus largely already provides. `rate_result` (build vs skip, on the P2 Stage 6
+"left off *and unbuilt*" precedent) was raised alongside and is likewise unanswered.
+Two Stage-1/2 vault notes also still await a ruling
 (`compression-similarity-is-lexical-not-vector.md`, `overview-tool-shape.md`); neither blocks
-Stage 3.
+anything.
 
 ### 2026-07-22 (later) — P3 Stage 1: the real stage-7 compressor
 
