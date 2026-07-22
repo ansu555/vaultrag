@@ -1,96 +1,122 @@
-"""Authentication for the HTTP transport — P3 Stage 4's half of Decision 4.
+"""Authentication + authorization for the HTTP transport — P3 Stage 5's enforcement point.
 
-``../Rag/reference/reference-security-model.md``: *"MCP stdio inherits local-user trust;
-the HTTP transport always requires a key even on localhost."* Splitting `serve` (Stage 4)
-from the real auth model (Stage 5) naively would mean shipping an unauthenticated port for
-one PR, so this module is the **cheapest auth that satisfies the rule**: one bootstrap key
-from the environment, required on every route but ``/healthz``, no scopes, no argon2, no
-buckets.
+Stage 4 built this module around the cheapest auth that satisfied
+``../Rag/reference/reference-security-model.md``'s *"the HTTP transport always requires a
+key even on localhost"*: one shared secret, compared with :func:`secrets.compare_digest`,
+wired into every route via :data:`RequiresKey` on the router as a whole. That wiring is
+untouched here — the point of building it that way round was that Stage 5 only had to
+replace what :func:`require_key` *does*, not where it sits.
 
-What Stage 5 grows here — hashed at rest, per-project scopes crossed with read/write/admin,
-per-key token buckets, ``vaultrag key add|list|revoke`` — replaces the *body* of
-:func:`require_key` while leaving its position untouched. That is the point of doing it
-this way round: the enforcement point exists, wired into every route, from the first
-commit, so Stage 5 is a change to one function rather than a change to every route.
+What changed is the body, and the shape grew a second dependency alongside it:
 
-What this deliberately is **not**: a substitute for the network posture. The default bind
-is loopback and remote access goes through Tailscale/WireGuard — a single shared bearer
-token is a gate, not a security boundary, and calling it one would be the mistake.
+* :func:`require_key` — **authentication**. Delegates to
+  :class:`~vaultrag.auth.KeyAuthenticator`, which looks a presented key up by its (public)
+  id, verifies its (secret) half against the stored argon2 hash, and enforces its
+  token-bucket rate limit. Still router-wide, so a new route is authenticated by default.
+* :func:`require_scope` — **authorization**, new this stage. A key that authenticates is
+  not automatically allowed everywhere: each route declares the level it needs
+  (:data:`RequiresRead`/:data:`RequiresWrite`/:data:`RequiresAdmin`), and this dependency
+  checks the authenticated key's scopes against the ``{project}`` path parameter the same
+  route handler will use — reading the *same* value, so there is no path by which the
+  check and the operation could disagree about which project is in play. A route with no
+  ``{project}`` segment (``/v1/projects``) is checked against "holds this level on *any*
+  served project", since there is no specific tenant to name yet. A ``{project}`` that
+  names no project this process serves at all is let through *un*refused here on purpose:
+  a scope table has nothing truthful to say about a project it was never offered a chance
+  to grant access to, so the request reaches :meth:`~vaultrag.service.VaultRAGService.select`
+  and gets the same ``UnknownProject`` 404 MCP gives for the identical typo — a 403 would
+  have turned "no such project" into "you can't see this project", a less honest answer.
+
+Three failure modes now render as three status codes, each with its own handler below:
+:class:`~vaultrag.auth.Unauthorized` (401, not this key),
+:class:`~vaultrag.auth.InsufficientScope` (403, this key but not for this) and
+:class:`~vaultrag.auth.RateLimited` (429, this key but not right now).
 """
 
 from __future__ import annotations
 
-import secrets
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, Request
 
 from vaultrag.api.errors import problem
+from vaultrag.auth import (
+    AuthenticatedKey,
+    InsufficientScope,
+    KeyAuthenticator,
+    RateLimited,
+    Scope,
+    Unauthorized,
+    scope_at_least,
+)
 from vaultrag.logging import get_logger
 
 log = get_logger(__name__)
 
-#: Bytes of entropy in a minted bootstrap key. 32 bytes → 43 url-safe characters, which is
-#: past any brute-force concern for a loopback-bound port and still one copy-paste.
-_KEY_BYTES = 32
+
+def _authenticator(request: Request) -> KeyAuthenticator:
+    auth: KeyAuthenticator = request.app.state.api_keys
+    return auth
 
 
-class Unauthorized(Exception):
-    """Raised by :func:`require_key` when a request carries no usable bearer key.
-
-    A dedicated exception rather than an ``HTTPException`` so the 401 renders through the
-    same ``problem+json`` handler as everything else — including the ``WWW-Authenticate``
-    header, which RFC 9110 requires on a 401 and which a bare JSON body would omit.
-    """
-
-    def __init__(self, detail: str) -> None:
-        super().__init__(detail)
-        self.detail = detail
-
-
-def mint_key() -> str:
-    """Generate an ephemeral bootstrap key.
-
-    Called when ``VAULTRAG_API_KEY`` is unset. The alternative — refusing to start — would
-    make the first ``vaultrag serve`` fail for a reason that has nothing to do with what
-    the operator was trying to do, and the alternative to *that* (starting keyless) is the
-    one thing the security model forbids. So: always a key, printed once, and a log line
-    saying how to make it stable across restarts.
-    """
-    return secrets.token_urlsafe(_KEY_BYTES)
-
-
-def require_key(request: Request) -> None:
-    """Reject any request that does not present the server's bearer key.
-
-    Constant-time comparison via :func:`secrets.compare_digest`: an ordinary ``==`` on a
-    secret leaks its prefix through timing, and while that is a stretch against a loopback
-    port, the fix costs one function call and this is the code Stage 5 will build on.
-    """
-    expected: str = request.app.state.api_key
+def require_key(request: Request) -> AuthenticatedKey:
+    """Authenticate the request's bearer key. Raises :class:`Unauthorized`/
+    :class:`RateLimited`; returns the key's scopes for :func:`require_scope` to check."""
     header = request.headers.get("authorization")
     if not header:
         raise Unauthorized("this endpoint requires `Authorization: Bearer <key>`")
     scheme, _, presented = header.partition(" ")
     if scheme.lower() != "bearer" or not presented:
         raise Unauthorized("authorization must be `Bearer <key>`")
-    if not secrets.compare_digest(presented.strip(), expected):
-        # Never echo the presented key, not even truncated — a rejected credential in a
-        # log is still a credential, and it is often the *right* one for another server.
-        log.warning("api.auth_rejected", path=request.url.path)
-        raise Unauthorized("invalid API key")
+    return _authenticator(request).authenticate(presented.strip())
 
 
 #: The dependency every authenticated router declares. Named so a route reads as a
-#: sentence — ``dependencies=[RequiresKey]`` — and so Stage 5 can swap what it resolves to
-#: (a `Key` object with scopes) without touching the routes that declare it.
+#: sentence — ``dependencies=[RequiresKey]`` — and attached to the whole router in
+#: ``api/app.py`` so a new endpoint is authenticated by default; per-route scope
+#: dependencies (below) layer *authorization* on top, not authentication itself.
 RequiresKey = Depends(require_key)
 
-AuthenticatedRequest = Annotated[Request, RequiresKey]
+CurrentKey = Annotated[AuthenticatedKey, Depends(require_key)]
+
+
+def _require_scope(level: Scope) -> Any:
+    def _check(request: Request, key: CurrentKey) -> AuthenticatedKey:
+        project = request.path_params.get("project")
+        if project is None:
+            # No project in the path (`/v1/projects`): there is nothing narrower to name
+            # yet, so the bar is "holds this level somewhere" rather than "holds it here".
+            if not key.has_any(level):
+                raise InsufficientScope(
+                    f"key {key.id!r} does not hold {level.value!r} on any served project"
+                )
+            return key
+        served_ids = {p.project_id for p in request.app.state.service.projects}
+        if project not in served_ids:
+            # Not a project this process serves at all — a scope table has nothing
+            # truthful to say about a project it was never given the chance to grant
+            # access to, so let it through to the service's own tenancy check, which
+            # answers UnknownProject (404) exactly as it does for the same mistake over
+            # MCP. Refusing here first would turn "no such project" into "you can't see
+            # this project", which is a worse and less honest answer to a typo.
+            return key
+        granted = key.scope_for(project)
+        if granted is None or not scope_at_least(granted, level):
+            raise InsufficientScope(
+                f"key {key.id!r} does not hold {level.value!r} on project {project!r}"
+            )
+        return key
+
+    return Depends(_check)
+
+
+RequiresRead = _require_scope(Scope.read)
+RequiresWrite = _require_scope(Scope.write)
+RequiresAdmin = _require_scope(Scope.admin)
 
 
 def install_auth_handler(app: object) -> None:
-    """Register the 401 renderer. Kept beside the check so the two cannot drift apart."""
+    """Register the 401/403/429 renderers. Kept beside the checks so they cannot drift."""
     from fastapi import FastAPI
 
     assert isinstance(app, FastAPI)
@@ -106,4 +132,30 @@ def install_auth_handler(app: object) -> None:
             instance=request.url.path,
         )
         response.headers["WWW-Authenticate"] = 'Bearer realm="vaultrag"'
+        return response
+
+    @app.exception_handler(InsufficientScope)
+    async def _on_insufficient_scope(request: Request, exc: Exception) -> object:
+        assert isinstance(exc, InsufficientScope)
+        # 403, not 401: the caller authenticated fine — re-sending the same header would
+        # not help, which is the RFC 9110 line between the two codes.
+        return problem(
+            status=403,
+            slug="insufficient-scope",
+            title="Insufficient scope",
+            detail=exc.detail,
+            instance=request.url.path,
+        )
+
+    @app.exception_handler(RateLimited)
+    async def _on_rate_limited(request: Request, exc: Exception) -> object:
+        assert isinstance(exc, RateLimited)
+        response = problem(
+            status=429,
+            slug="rate-limited",
+            title="Too many requests",
+            detail=exc.detail,
+            instance=request.url.path,
+        )
+        response.headers["Retry-After"] = str(max(1, round(exc.retry_after)))
         return response

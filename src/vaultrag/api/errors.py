@@ -52,9 +52,11 @@ _MAPPING: tuple[tuple[type[ServiceError], int, str, str], ...] = (
     (UnknownProject, 404, "unknown-project", "Unknown project"),
     (NotFound, 404, "not-found", "Not found"),
     (InvalidRequest, 400, "invalid-request", "Invalid request"),
-    # 403, not 401: the caller is authenticated (Stage 4 has one key), and the request is
-    # understood — a guardrail declines it. Re-authenticating would not help, which is
-    # exactly the distinction RFC 9110 draws between the two codes.
+    # 403, not 401: the caller authenticated fine (a real, unrevoked key), and the request
+    # is understood — a guardrail declines it. Re-authenticating would not help, which is
+    # exactly the distinction RFC 9110 draws between the two codes. Insufficient *scope* is
+    # the same distinction one layer up (auth.InsufficientScope, also 403) — this mapping
+    # only covers refusals the service raises, after a key has already cleared that gate.
     (Refused, 403, "refused", "Refused"),
     (BackendUnavailable, 503, "backend-unavailable", "Backend unavailable"),
 )

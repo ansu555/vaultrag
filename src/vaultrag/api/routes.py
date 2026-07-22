@@ -21,6 +21,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Body, Path, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from vaultrag.api.deps import CurrentKey, RequiresAdmin, RequiresRead, RequiresWrite
 from vaultrag.api.errors import problem
 from vaultrag.models import (
     OpenResult,
@@ -188,17 +189,26 @@ router = APIRouter()
     response_model=list[ProjectSummary],
     summary="List the projects this server serves",
     tags=["discovery"],
+    dependencies=[RequiresRead],
 )
-def list_projects(request: Request) -> list[ProjectSummary]:
-    """The REST twin of the ``list_projects`` MCP tool — how a client learns `{project}`."""
-    return _service(request).list_projects()
+def list_projects(request: Request, key: CurrentKey) -> list[ProjectSummary]:
+    """The REST twin of the ``list_projects`` MCP tool — how a client learns `{project}`.
+
+    Filtered to the calling key's own scopes, unlike the MCP tool (which has no keys to
+    filter by — stdio inherits local-user trust and sees everything this process serves).
+    Listing every served project regardless of the key's scope would leak the existence
+    and writability of tenants the key cannot otherwise reach — the same "narrow, never
+    widen" rule CLAUDE.md §6 states for a search filter, applied to discovery.
+    """
+    return [p for p in _service(request).list_projects() if p.id in key.scopes]
 
 
 @router.post(
     "/v1/projects",
     status_code=status.HTTP_501_NOT_IMPLEMENTED,
-    summary="Register a new vault (not implemented in P3 Stage 4)",
+    summary="Register a new vault (not implemented)",
     tags=["admin"],
+    dependencies=[RequiresAdmin],
 )
 def register_project(request: Request) -> Response:
     """The one endpoint in the reference table that is deliberately deferred.
@@ -207,11 +217,12 @@ def register_project(request: Request) -> Response:
     the registry row that every process reads at startup. What this route would add is
     *hot-adding a tenant to a live process*: constructing an embedder, a writer and an
     ingest context inside a request, then mutating the served set that
-    :meth:`~vaultrag.service.VaultRAGService.select` enforces against. That is a resource
-    lifecycle question (who closes the embedder if the request fails? what happens to an
-    in-flight search when the set changes?) and an authorization question (admin scope —
-    P3 Stage 5), and answering either one badly in this stage would put a mutation path
-    next to the tenancy boundary.
+    :meth:`~vaultrag.service.VaultRAGService.select` enforces against. P3 Stage 5 answers
+    the *authorization* half — this route is gated on admin scope like the rest of
+    ``admin``, and the check runs before this handler is reached — but the resource
+    lifecycle question is untouched: who closes the embedder if the request fails, what
+    happens to an in-flight search when the served set changes underneath it. Answering
+    that badly would put a mutation path next to the tenancy boundary this endpoint sits on.
 
     So it answers honestly with 501 and names the command that does the job, rather than
     404-ing as though the reference table were wrong.
@@ -223,7 +234,8 @@ def register_project(request: Request) -> Response:
         detail=(
             "registering a project over HTTP is not implemented — run "
             "`vaultrag project add <id> --vault <path>` and restart the server. Hot-adding "
-            "a tenant to a running process needs the admin scope model (P3 Stage 5)."
+            "a tenant to a running process is a resource-lifecycle question the admin "
+            "scope this route already requires does not by itself answer."
         ),
         instance=request.url.path,
     )
@@ -235,6 +247,7 @@ def register_project(request: Request) -> Response:
     response_model=SearchResult,
     summary="Hybrid search → ranked, cited snippets",
     tags=["retrieval"],
+    dependencies=[RequiresRead],
 )
 def search(request: Request, project: ProjectPath, body: SearchRequest) -> SearchResult:
     """Identical in every respect to the MCP ``search`` tool — same method, same defaults.
@@ -258,6 +271,7 @@ def search(request: Request, project: ProjectPath, body: SearchRequest) -> Searc
     response_model=OpenResult,
     summary="Read an exact slice of one note from the vault",
     tags=["retrieval"],
+    dependencies=[RequiresRead],
 )
 def open_doc(
     request: Request,
@@ -297,6 +311,7 @@ def open_doc(
     response_model=RelatedResult,
     summary="A note's graph neighbourhood — links, backlinks, tag-siblings",
     tags=["retrieval"],
+    dependencies=[RequiresRead],
 )
 def related(
     request: Request,
@@ -314,6 +329,7 @@ def related(
     response_model=OverviewResult,
     summary="A project's shape: counted folders, top tags, note count",
     tags=["retrieval"],
+    dependencies=[RequiresRead],
 )
 def overview(request: Request, project: ProjectPath) -> OverviewResult:
     """A map, never a file listing — bounded by constants, so the cost is flat in vault size."""
@@ -327,6 +343,7 @@ def overview(request: Request, project: ProjectPath) -> OverviewResult:
     status_code=status.HTTP_201_CREATED,
     summary="Create a note (git-committed, reindexed)",
     tags=["write-back"],
+    dependencies=[RequiresWrite],
 )
 def create_note(request: Request, project: ProjectPath, body: WriteNoteRequest) -> WriteResult:
     """201 with the note's hash — which is the `base_hash` for a later PATCH.
@@ -350,6 +367,7 @@ def create_note(request: Request, project: ProjectPath, body: WriteNoteRequest) 
     response_model=WriteResult,
     summary="Edit an existing note (append a section, or patch frontmatter)",
     tags=["write-back"],
+    dependencies=[RequiresWrite],
 )
 def edit_note(request: Request, project: ProjectPath, body: PatchNotesRequest) -> WriteResult:
     """One verb, two operations, discriminated by `op` — see :data:`PatchNotesRequest`."""
@@ -377,6 +395,7 @@ def edit_note(request: Request, project: ProjectPath, body: PatchNotesRequest) -
         202: {"model": ReindexAccepted, "description": "Full reindex started."},
         409: {"description": "A full reindex of this project is already running."},
     },
+    dependencies=[RequiresAdmin],
 )
 def reindex(
     request: Request,

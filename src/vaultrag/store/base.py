@@ -63,6 +63,28 @@ class ProjectRow:
 
 
 @dataclass(frozen=True, slots=True)
+class ApiKeyRow:
+    """One row of ``api_keys`` (P3 Stage 5).
+
+    ``key_hash`` is the argon2 digest, never the raw key — nothing that reads this row
+    (``vaultrag key list``, the authenticator) can recover the presented secret from it,
+    which is what "no plaintext key anywhere" means in practice. ``scopes`` maps a served
+    project id to the highest level this key holds on it (``read``/``write``/``admin``,
+    each implying the ones below it); a project absent from the mapping is unreachable by
+    this key, full stop — the same "narrow, never widen" rule CLAUDE.md §6 states for
+    filters, now stated for keys.
+    """
+
+    id: str
+    name: str | None
+    key_hash: str
+    scopes: dict[str, str]
+    rate_limit: int
+    created_ts: int
+    last_used: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class DocumentRow:
     id: str
     project_id: str
@@ -237,6 +259,40 @@ class MetaStore(Protocol):
         and deletes its ``jobs``; leaves every other project and the shared ``embed_cache``
         untouched.
         """
+
+    # --- api keys (P3 Stage 5) -------------------------------------------------
+    # No FK to `projects`, the same call as `query_log`: `scopes` names projects inside a
+    # JSON blob rather than one row per (key, project), so a key can span tenants and a
+    # deleted project simply becomes an unreachable scope entry rather than a dangling
+    # reference — `select()`/the scope check already refuse a project this process does
+    # not serve, so a stale entry is inert, not a hole.
+    def create_api_key(
+        self,
+        *,
+        key_id: str,
+        name: str | None,
+        key_hash: str,
+        scopes: Mapping[str, str],
+        rate_limit: int,
+    ) -> None:
+        """Insert one key row. ``key_hash`` only — the raw secret never reaches storage."""
+
+    def get_api_key(self, key_id: str) -> ApiKeyRow | None:
+        """Look up one key by its (non-secret) id — the authenticator's hot path."""
+
+    def list_api_keys(self) -> list[ApiKeyRow]:
+        """Every key, newest first — ``vaultrag key list``."""
+
+    def delete_api_key(self, key_id: str) -> bool:
+        """Revoke (delete) a key; return whether it existed.
+
+        A hard delete, not a status flag: the next request re-queries this table, so
+        revocation is immediate by construction, and there is nothing left to grep for
+        the hash of a key that should no longer exist.
+        """
+
+    def touch_api_key(self, key_id: str, *, used_ts: int) -> None:
+        """Stamp ``last_used`` after a successful auth — best-effort observability."""
 
     # --- documents (the scan manifest) ---------------------------------------
     def upsert_document(

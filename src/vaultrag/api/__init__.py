@@ -9,15 +9,17 @@ See ``../Rag/reference/reference-rest-api.md`` for the endpoint table and
 from __future__ import annotations
 
 from vaultrag.api.app import create_app
-from vaultrag.api.deps import Unauthorized, mint_key, require_key
+from vaultrag.api.deps import require_key
 from vaultrag.api.errors import PROBLEM_MEDIA_TYPE, install_error_handlers, problem
+from vaultrag.auth import InsufficientScope, RateLimited, Unauthorized
 
 __all__ = [
     "PROBLEM_MEDIA_TYPE",
+    "InsufficientScope",
+    "RateLimited",
     "Unauthorized",
     "create_app",
     "install_error_handlers",
-    "mint_key",
     "problem",
     "require_key",
 ]

@@ -158,6 +158,7 @@ class _Metrics:
     write_ops: Counter
     write_refused: Counter
     index_drift: Gauge
+    key_requests: Counter
 
 
 def _build() -> _Metrics:
@@ -267,6 +268,14 @@ def _build() -> _Metrics:
         ["project"],
         registry=registry,
     )
+    key_requests = Counter(
+        "vaultrag_key_requests_total",
+        "Authenticated HTTP requests per API key (P3 Stage 5) — the id, never the key "
+        "itself. Counted once auth + rate-limit both pass, so it is a volume series, not "
+        "an attempted-auth one (a wrong secret never gets an id to attribute to).",
+        ["key_id"],
+        registry=registry,
+    )
 
     return _Metrics(
         registry=registry,
@@ -283,6 +292,7 @@ def _build() -> _Metrics:
         write_ops=write_ops,
         write_refused=write_refused,
         index_drift=index_drift,
+        key_requests=key_requests,
     )
 
 
@@ -416,6 +426,16 @@ def record_write(action: str, *, project: str) -> None:
 def record_write_refused(reason: str) -> None:
     """Count one write stopped by a guardrail (CLAUDE.md §6's write-safety rules)."""
     _M.write_refused.labels(reason=reason).inc()
+
+
+def record_key_request(*, key_id: str) -> None:
+    """Count one HTTP request served under one API key (P3 Stage 5).
+
+    ``key_id`` is bounded by the ``api_keys`` table, which only an operator writes to
+    (``vaultrag key add``) — the same cardinality argument that let ``project`` onto the
+    allowlist in P3 Stage 2, not user input.
+    """
+    _M.key_requests.labels(key_id=key_id).inc()
 
 
 @contextmanager
