@@ -22,6 +22,8 @@ Ref: ``../Rag/projects/vaultrag/hybrid-search.md``,
 
 from __future__ import annotations
 
+import time
+
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseEmbedder, VectorStore
 from vaultrag.metrics import record_search, time_stage
@@ -30,6 +32,7 @@ from vaultrag.retrieval.cite import cite
 from vaultrag.retrieval.compress import CompressParams, compress
 from vaultrag.retrieval.graph import GraphExpandParams, GraphStore, graph_expand
 from vaultrag.retrieval.parents import DEFAULT_PARENT_MAX_TOKENS, ParentResolver, parent_swap
+from vaultrag.retrieval.querylog import QueryLogParams, QueryLogSink, record_query
 from vaultrag.retrieval.rerank import Reranker, RerankParams, rerank_candidates
 
 DEFAULT_K = 10
@@ -56,6 +59,8 @@ def search(
     graph: GraphExpandParams | None = None,
     compress_params: CompressParams | None = None,
     vault_name: str | None = None,
+    query_log_sink: QueryLogSink | None = None,
+    query_log: QueryLogParams | None = None,
 ) -> SearchResult:
     """Run the hybrid read path for one query, scoped to ``project_id``.
 
@@ -91,6 +96,11 @@ def search(
     budget pack (per-doc cap) → trim (``retrieval/compress.py``). ``compress_params`` tunes
     it; ``None`` uses the shipped defaults. Neutral params reduce it to P0's plain greedy
     pack, which is how an eval overlay isolates the stage.
+
+    When ``query_log_sink`` is given, one row is written per served query *here* rather
+    than in the calling transport (P3 Stage 3, ``retrieval/querylog.py``) — MCP today and
+    REST in Stage 4 record the same shape through the same code. It happens outside the
+    timed region, after the result is final, and can never fail the search.
     """
     stripped = query.strip()
     if not stripped:
@@ -107,6 +117,7 @@ def search(
     # rerank-off and a top_n sweep would measure truncation instead of rerank depth.
     fetch_limit = max(rerank_params.top_n, k) if reranker is not None else k
 
+    started = time.perf_counter()
     # Each stage is timed into `vaultrag_search_latency_seconds{stage=…}` (P2 Stage 7).
     # The labels are the same stage names this module's docstring uses, so a Grafana panel
     # and the architecture doc talk about the same things. `total` wraps the lot, and is
@@ -162,7 +173,27 @@ def search(
         with time_stage("compress"):
             packed, total_tokens, truncated = compress(snippets, budget_tokens, compress_params)
 
+    elapsed_ms = (time.perf_counter() - started) * 1000
     record_search(empty=not packed, project=project_id)
+    # Outside the `total` timer on purpose: the log observes retrieval, so its own cost
+    # must not be charged to the thing it measures. A blank query never reaches here —
+    # it short-circuits above — and is deliberately not a logged query for the same
+    # reason it is not a counted search: it is a caller bug, not a retrieval miss.
+    record_query(
+        query_log_sink,
+        query_log,
+        query=stripped,
+        project_id=project_id,
+        k=k,
+        latency_ms=elapsed_ms,
+        n_results=len(packed),
+        budget_used=total_tokens,
+        # The best score in the response, not `packed[0]`'s: stage 7's MMR reorders for
+        # diversity, so the first snippet is not necessarily the highest-scoring one. This
+        # is the field that makes the log minable — result *count* does not distinguish a
+        # query the vault answers from one it has never heard of (see the `query_log` DDL).
+        top_score=max((s.score for s in packed), default=None),
+    )
     return SearchResult(
         query=query,
         project_id=project_id,

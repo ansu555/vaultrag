@@ -39,6 +39,13 @@ if TYPE_CHECKING:
 # dimensionality is safe: every project's vectors are compared only against its own, the
 # ``project_id`` filter being an unconditional ``must``. A model at a different width needs
 # the note's documented scale path — promotion to its own collection — not a settings key.
+#
+# The ``query_log_*`` retention knobs (P3 Stage 3) are reserved for the ``state_dir`` reason
+# rather than the ``embed_dims`` one: the log is one shared table pruned by the one shared
+# store, which is opened from the *base* settings, so a per-project value would be accepted,
+# stored, and then never consulted — precisely the silent misconfig this list exists to
+# prevent. ``query_log_enabled`` and ``query_log_text`` stay overridable, because those are
+# read per search from the project's own resolved settings and genuinely differ per tenant.
 _RESERVED_SETTINGS: frozenset[str] = frozenset(
     {
         "project_id",
@@ -47,6 +54,8 @@ _RESERVED_SETTINGS: frozenset[str] = frozenset(
         "qdrant_url",
         "qdrant_collection",
         "embed_dims",
+        "query_log_retention_days",
+        "query_log_max_rows",
     }
 )
 
@@ -173,6 +182,8 @@ class ProjectRegistry:
                 f"per-project settings override unknown or reserved keys: {sorted(bad)}. "
                 f"vault_path is set from the registry row; state_dir/qdrant_* are shared "
                 f"across tenants and cannot be per-project; embed_dims is fixed by the "
-                f"shared collection (embed_model itself is overridable at the same width)."
+                f"shared collection (embed_model itself is overridable at the same width); "
+                f"query_log retention is a property of the one shared log table "
+                f"(query_log_enabled/query_log_text are per-project)."
             )
         return dict(settings)

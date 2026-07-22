@@ -13,9 +13,11 @@ from typer.testing import CliRunner
 from vaultrag import __version__
 from vaultrag.cli import app
 from vaultrag.embedding.ollama import OllamaEmbedder
+from vaultrag.eval import load_candidates
 from vaultrag.index.base import VectorStoreError
 from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.indexer.watch import VaultWatcher
+from vaultrag.retrieval import q_hash
 from vaultrag.store.sqlite import SQLiteMetaStore
 
 # Every assertion below matches help/error *text*, so the output must be unstyled. Rich
@@ -640,3 +642,101 @@ class _FailingVectors:
 
     def close(self) -> None:
         pass
+
+
+# ---------------------------------------------------------------------------
+# `vaultrag queries` — the mining CLI (P3 Stage 3)
+# ---------------------------------------------------------------------------
+def _log(state_dir: Path, project_id: str, query: str, *, hits: int, text: bool = True) -> None:
+    """Write one query row directly, as a served search would."""
+    store = SQLiteMetaStore(state_dir / "vaultrag.db")
+    store.log_query(
+        project_id=project_id,
+        q_hash=q_hash(query),
+        query_text=query if text else None,
+        mode="snippets",
+        k=10,
+        latency_ms=12,
+        n_results=hits,
+        budget_used=200,
+    )
+    store.close()
+
+
+def test_queries_reports_nothing_when_no_index_was_ever_built(tmp_path: Path) -> None:
+    """Same rule the graph reader keeps: report on a db, never conjure one to report on."""
+    result = runner.invoke(app, ["queries"], env={"VAULTRAG_STATE_DIR": str(tmp_path / "state")})
+    assert result.exit_code == 1
+    assert "no query log yet" in result.output
+    assert not (tmp_path / "state" / "vaultrag.db").exists()
+
+
+def test_queries_zero_hit_report_names_only_the_unanswered(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _log(state, "solo", "answered fine", hits=6)
+    _log(state, "solo", "how do I rotate the signing key", hits=0)
+    result = runner.invoke(
+        app,
+        ["queries", "--project", "solo", "--report", "zero-hit"],
+        env={"VAULTRAG_STATE_DIR": str(state)},
+    )
+    assert result.exit_code == 0, result.output
+    assert "how do I rotate the signing key" in result.output
+    assert "answered fine" not in result.output
+
+
+def test_queries_requires_project_when_several_are_registered(tmp_path: Path) -> None:
+    """The MCP tools' rule, at the CLI: with several tenants there is no defensible default."""
+    state = tmp_path / "state"
+    state.mkdir()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _register(state, alpha=tmp_path / "a", beta=tmp_path / "b")
+    result = runner.invoke(app, ["queries"], env={"VAULTRAG_STATE_DIR": str(state)})
+    assert result.exit_code != 0
+    assert "alpha" in result.output and "beta" in result.output
+
+
+def test_queries_export_writes_loadable_candidates(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _log(state, "solo", "unanswerable thing", hits=0)
+    out = tmp_path / "candidates.json"
+    result = runner.invoke(
+        app,
+        ["queries", "--project", "solo", "--export", str(out)],
+        env={"VAULTRAG_STATE_DIR": str(state)},
+    )
+    assert result.exit_code == 0, result.output
+    assert [c.query for c in load_candidates(out).cases] == ["unanswerable thing"]
+
+
+def test_queries_export_refuses_when_no_text_was_stored(tmp_path: Path) -> None:
+    """The Decision-2 consequence, said out loud instead of writing an empty file."""
+    state = tmp_path / "state"
+    state.mkdir()
+    _log(state, "solo", "unanswerable thing", hits=0, text=False)
+    out = tmp_path / "candidates.json"
+    result = runner.invoke(
+        app,
+        ["queries", "--project", "solo", "--export", str(out)],
+        env={"VAULTRAG_STATE_DIR": str(state)},
+    )
+    assert result.exit_code == 1
+    assert "VAULTRAG_QUERY_LOG_TEXT" in result.output
+    assert not out.exists()
+
+
+def test_queries_prune_applies_the_retention_caps(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    for i in range(5):
+        _log(state, "solo", f"q{i}", hits=1)
+    result = runner.invoke(
+        app,
+        ["queries", "--project", "solo", "--prune"],
+        env={"VAULTRAG_STATE_DIR": str(state), "VAULTRAG_QUERY_LOG_MAX_ROWS": "1"},
+    )
+    assert result.exit_code == 0, result.output
+    assert "pruned" in result.output

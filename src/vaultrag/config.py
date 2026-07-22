@@ -286,6 +286,42 @@ class Settings(BaseSettings):
         "note can't crowd out other documents. 0 disables the cap.",
     )
 
+    # --- query log (P3 Stage 3) -----------------------------------------------
+    # One row per served search, written by the core retrieval pipeline so MCP and
+    # (Stage 4) REST record the same shape. Its job is the offline eval loop: zero-hit
+    # queries become golden-set candidates (`vaultrag queries --export`), which is what
+    # ../Rag/projects/vaultrag/evaluation-framework.md asks the table for.
+    #
+    # `query_log_text` is P3 Decision 2, ratified 2026-07-22
+    # (../Rag/agent-inbox/query-log-stores-text-opt-in.md, superseding
+    # reference-database-schema.md's q_hash-only row). Default ON: a hash cannot become a
+    # golden-set query, and the SQLite file sits beside the vault under one trust
+    # boundary. A shared multi-tenant HTTP deployment sets it false and keeps the hashes.
+    # It does NOT relax CLAUDE.md §5 — raw query text never enters the log stream or the
+    # metrics under either setting, and a test pins that.
+    query_log_enabled: bool = Field(
+        default=True,
+        description="Record one row per search in the `query_log` table. Off skips the "
+        "write entirely (no row, no text, no hash). Recording is per-project overridable.",
+    )
+    query_log_text: bool = Field(
+        default=True,
+        description="Store the raw query text alongside the hash. On by default for "
+        "local/stdio deployments — without it the mining loop cannot name a query, so "
+        "zero-hit rows can never become golden-set cases. Set false for shared "
+        "multi-tenant HTTP; the row is still written, hash-only.",
+    )
+    query_log_retention_days: int = Field(
+        default=90,
+        description="Drop query rows older than this many days, pruned as the log is "
+        "written. 0 disables the age cap.",
+    )
+    query_log_max_rows: int = Field(
+        default=200_000,
+        description="Hard ceiling on stored query rows; the oldest are dropped past it. "
+        "Guards against a burst that the age cap would not catch. 0 disables the row cap.",
+    )
+
     # --- live watch (indexer; P1 Stage 4) -------------------------------------
     # watchdog Observer → per-path debounce → worker pool → ingest_path. Owned by
     # serve/indexer and `vaultrag watch`; `vaultrag mcp` runs it only with --watch (a

@@ -4,7 +4,8 @@ Zero-ops, single-file, single-writer — the right default for a single-user box
 (``../Rag/decisions/metadata-store-sqlite-to-postgres.md``). The DDL is written to
 carry forward to Postgres 16 unchanged (``reference-database-schema.md``). Tables:
 ``projects, documents, chunks, tags, jobs, embed_cache`` (P0) + ``links, doc_keys``
-(P2 Stage 2 — the wikilink graph); ``api_keys, query_log`` remain deferred to P3.
+(P2 Stage 2 — the wikilink graph) + ``query_log`` (P3 Stage 3); ``api_keys`` remains
+deferred to P3 Stage 5.
 
 Identity is content-addressed (``vaultrag.models``): a document is
 ``document_id(project, path)`` and a chunk is ``chunk_point_id(project, path, ix)``,
@@ -34,6 +35,8 @@ from vaultrag.store.base import (
     LinkRow,
     NeighborDoc,
     ProjectRow,
+    QueryStat,
+    QueryStatOrder,
     SiblingDoc,
 )
 from vaultrag.store.links import DocKeyKind, doc_keys_for, link_edges, resolve_key
@@ -45,6 +48,23 @@ _JOB_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "vaultrag://jobs")
 # so replacing a document's links rewrites the same ids rather than churning the table.
 _LINK_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "vaultrag://links")
 _SEP = "\x1f"
+
+# How many query rows are appended between retention sweeps (P3 Stage 3). See log_query.
+_PRUNE_EVERY = 100
+
+# ORDER BY clause per report. Slowest ranks on the *average* rather than the worst run:
+# one cold-start outlier should not permanently crown a query that is otherwise fast.
+_QUERY_STAT_ORDER = {
+    QueryStatOrder.frequent: "n DESC, last_ts DESC",
+    QueryStatOrder.slowest: "avg_latency DESC, n DESC",
+    QueryStatOrder.recent: "last_ts DESC",
+    # Worst-served first. `NULLS LAST` because a query with no recorded score is unknown,
+    # not bad, and ranking the unknown as worst would fill the report with rows predating
+    # the column. Threshold-free by design: "the 20 worst" needs no cutoff, and a cutoff
+    # would have to be per-vault (fusion scores are RRF, cross-encoder sigmoid, or
+    # constant depending on which stages ran — the same scale-free lesson as `graph_boost`).
+    QueryStatOrder.worst: "avg_top_score IS NULL, avg_top_score ASC, n DESC",
+}
 
 # Same DDL runs on SQLite now and Postgres 16 later (reference-database-schema.md).
 _SCHEMA = """
@@ -145,6 +165,47 @@ CREATE TABLE IF NOT EXISTS index_state (
     parser_version INTEGER NOT NULL
 );
 
+-- One row per served search (P3 Stage 3). Written by the core retrieval pipeline, so MCP
+-- and (Stage 4) REST record the same shape through the same code.
+--
+-- `query_text` is the P3 Decision 2 column and is NULLable on purpose: it holds the raw
+-- query when `query_log_text` is on (the default — the file lives beside the vault, under
+-- one trust boundary) and NULL when a shared deployment turns it off. Without it the
+-- table cannot do the job `reference-database-schema.md` assigns it in the very next
+-- paragraph, because a hash cannot become a golden-set query. See
+-- ../Rag/agent-inbox/query-log-stores-text-opt-in.md.
+--
+-- `top_score` is the second departure from that reference row, and it is here because
+-- dogfooding proved the table useless without it. The row as specified can only express
+-- "how many results", and **a hybrid retriever essentially always returns some** — RRF
+-- ranks *something* first no matter what was asked. Measured on the live design vault:
+-- "how do I rotate the stripe webhook signing secret" against a vault that has never heard
+-- of Stripe returns **8 hits**, exactly like a question the vault answers well, so the
+-- zero-hit report the mining loop is built on never fires. The best score in the response
+-- does separate them (answerable ~0.57-1.21, unanswerable ~0.50-0.61, the latter clustered
+-- just above the RRF floor). NULLable because a caller may not supply it, and because a
+-- zero-result response has no best score to record.
+--
+-- **No FK to `projects`, deliberately.** A search can run against an id that was never
+-- registered (`vaultrag mcp --project X --vault Y`, the P0 shorthand), and a FK would make
+-- logging fail exactly where the log is most interesting. `delete_project` therefore
+-- clears these rows explicitly — the Stage-2 lesson: a cascade that only covers the rows
+-- with FKs on them is not a cascade.
+CREATE TABLE IF NOT EXISTS query_log (
+    ts          INTEGER NOT NULL,
+    project_id  TEXT NOT NULL,
+    q_hash      TEXT NOT NULL,
+    query_text  TEXT,
+    mode        TEXT NOT NULL DEFAULT 'snippets',
+    k           INTEGER NOT NULL DEFAULT 0,
+    latency_ms  INTEGER NOT NULL DEFAULT 0,
+    n_results   INTEGER NOT NULL DEFAULT 0,
+    budget_used INTEGER NOT NULL DEFAULT 0,
+    top_score   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_query_log_ts ON query_log(project_id, ts);
+CREATE INDEX IF NOT EXISTS idx_query_log_hash ON query_log(project_id, q_hash);
+
 CREATE TABLE IF NOT EXISTS embed_cache (
     model      TEXT NOT NULL,
     dims       INTEGER NOT NULL,
@@ -195,8 +256,22 @@ def _linked_doc(row: sqlite3.Row) -> LinkedDoc:
 class SQLiteMetaStore:
     """A :class:`~vaultrag.store.base.MetaStore` backed by one WAL SQLite file."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        query_log_retention_days: int = 0,
+        query_log_max_rows: int = 0,
+    ) -> None:
         self.db_path = db_path
+        # Retention lives on the store, not at the call site, because pruning happens
+        # inside `log_query` — the writer is the only thing that knows a row was added,
+        # and a retention policy nobody remembers to invoke is not a policy. 0 disables.
+        self._query_log_retention_days = query_log_retention_days
+        self._query_log_max_rows = query_log_max_rows
+        # Starts at the sweep threshold so the first write of a process prunes: a box
+        # idle for months should be tidied by its next query, not its hundredth.
+        self._writes_since_prune = _PRUNE_EVERY
         db_path.parent.mkdir(parents=True, exist_ok=True)
         # Deferred-transaction isolation (the default) so ``with self._conn:`` frames
         # our multi-statement writes atomically; check_same_thread off for the future
@@ -212,11 +287,40 @@ class SQLiteMetaStore:
     @classmethod
     def from_settings(cls, settings: Settings) -> SQLiteMetaStore:
         """Open the store at ``settings.db_path`` (inside the derived state dir)."""
-        return cls(settings.db_path)
+        return cls(
+            settings.db_path,
+            query_log_retention_days=settings.query_log_retention_days,
+            query_log_max_rows=settings.query_log_max_rows,
+        )
 
     # --- schema / lifecycle ---------------------------------------------------
     def init_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
+        self._add_missing_columns()
+
+    def _add_missing_columns(self) -> None:
+        """Add columns that a table created by an earlier build is missing.
+
+        There is no general migration machinery here, and deliberately so: every other
+        table is a **derived cache**, so schema drift is repaired by deleting the state dir
+        and reindexing (CLAUDE.md §6, "DR = reindex"). ``query_log`` is the one table that
+        rule does not cover — nothing can rebuild a record of what people asked — so it is
+        the one table where an unmigrated column would mean *data loss* rather than a
+        rebuild. ``CREATE TABLE IF NOT EXISTS`` is silent about columns, and the failure
+        lands in ``record_query``'s deliberately-total except, so without this a mid-P3
+        upgrade would simply stop logging with one warning line.
+
+        Idempotent and additive only: existing rows get NULL, which every reader already
+        treats as "not recorded" rather than as a zero.
+        """
+        additions = {("query_log", "top_score"): "REAL"}
+        for (table, column), decl in additions.items():
+            existing = {
+                row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if existing and column not in existing:
+                with self._conn:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -276,13 +380,20 @@ class SQLiteMetaStore:
         """Remove a project and every derived row it owns. Returns whether it existed.
 
         The ``projects`` delete cascades ``documents`` (→ chunks/tags/doc_keys, and NULLs
-        inbound links) and ``index_state`` via their FK actions; ``jobs`` carries a bare
-        ``project_id`` with no FK, so it is deleted explicitly. ``embed_cache`` is content-
-        keyed and shared across tenants, so it is deliberately left intact. One tenant's
-        removal cannot touch another's rows — the isolation the Stage-2 verify checks.
+        inbound links) and ``index_state`` via their FK actions; ``jobs`` and ``query_log``
+        carry a bare ``project_id`` with no FK, so they are deleted explicitly.
+        ``embed_cache`` is content-keyed and shared across tenants, so it is deliberately
+        left intact. One tenant's removal cannot touch another's rows — the isolation the
+        Stage-2 verify checks.
+
+        ``query_log`` in particular **must** go: with ``query_log_text`` on it holds this
+        tenant's raw queries, and re-registering the id would hand them to whoever gets it
+        next. Same class of bug as the Stage-2 vector orphan — a table without a FK is
+        invisible to a cascade unless someone names it.
         """
         with self._conn:
             self._conn.execute("DELETE FROM jobs WHERE project_id = ?", (project_id,))
+            self._conn.execute("DELETE FROM query_log WHERE project_id = ?", (project_id,))
             cur = self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
         return cur.rowcount > 0
 
@@ -800,6 +911,167 @@ class SQLiteMetaStore:
             error=row["error"],
             ts=int(row["ts"]),
         )
+
+    # --- query log (P3 Stage 3) -----------------------------------------------
+    def log_query(
+        self,
+        *,
+        project_id: str,
+        q_hash: str,
+        query_text: str | None,
+        mode: str,
+        k: int,
+        latency_ms: int,
+        n_results: int,
+        budget_used: int,
+        top_score: float | None = None,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO query_log
+                    (ts, project_id, q_hash, query_text, mode, k, latency_ms,
+                     n_results, budget_used, top_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _now(),
+                    project_id,
+                    q_hash,
+                    query_text,
+                    mode,
+                    k,
+                    latency_ms,
+                    n_results,
+                    budget_used,
+                    top_score,
+                ),
+            )
+        self._writes_since_prune += 1
+        # Amortized, not per-insert. The age sweep alone would be nearly free (indexed,
+        # and matches nothing in the steady state), but the row cap has to find the
+        # cut-off ts by offset, and paying that on the latency path of every search to
+        # delete zero rows is the wrong trade. Every _PRUNE_EVERY-th write — and the
+        # first of each process, so a box that has been idle for months is tidied on the
+        # next query rather than on the hundredth.
+        if self._writes_since_prune >= _PRUNE_EVERY:
+            self._writes_since_prune = 0
+            self.prune_query_log(
+                max_age_days=self._query_log_retention_days,
+                max_rows=self._query_log_max_rows,
+            )
+
+    def query_stats(
+        self,
+        project_id: str,
+        *,
+        order: QueryStatOrder = QueryStatOrder.frequent,
+        limit: int = 20,
+        since_ts: int | None = None,
+        max_results: int | None = None,
+        max_score: float | None = None,
+    ) -> list[QueryStat]:
+        # Rolled up by q_hash: one query asked forty times is one case to fix. The text
+        # comes from the most recent row that has one, so a log whose text column was
+        # turned on partway through still names what it can.
+        where = ["project_id = ?"]
+        args: list[Any] = [project_id]
+        if since_ts is not None:
+            where.append("ts >= ?")
+            args.append(since_ts)
+        # HAVING on the *best* run of a query, not on any single row: the question a
+        # candidate answers is "has this query ever been served well?", so one transient
+        # empty result (Qdrant restarting mid-session) must not nominate a query the index
+        # answers perfectly the rest of the time.
+        having_terms = []
+        if max_results is not None:
+            having_terms.append("MAX(n_results) <= ?")
+            args.append(max_results)
+        if max_score is not None:
+            having_terms.append("MAX(top_score) <= ?")
+            args.append(max_score)
+        having = f"HAVING {' AND '.join(having_terms)}" if having_terms else ""
+        args.append(limit)
+        rows = self._conn.execute(
+            f"""
+            SELECT q_hash,
+                   (SELECT query_text FROM query_log inner_q
+                     WHERE inner_q.project_id = query_log.project_id
+                       AND inner_q.q_hash = query_log.q_hash
+                       AND inner_q.query_text IS NOT NULL
+                     ORDER BY inner_q.ts DESC LIMIT 1) AS query_text,
+                   COUNT(*)         AS n,
+                   AVG(latency_ms)  AS avg_latency,
+                   MAX(latency_ms)  AS max_latency,
+                   AVG(n_results)   AS avg_results,
+                   MAX(n_results)   AS max_results,
+                   AVG(top_score)   AS avg_top_score,
+                   MAX(top_score)   AS best_top_score,
+                   MAX(ts)          AS last_ts
+              FROM query_log
+             WHERE {" AND ".join(where)}
+             GROUP BY q_hash
+             {having}
+             ORDER BY {_QUERY_STAT_ORDER[order]}
+             LIMIT ?
+            """,
+            args,
+        ).fetchall()
+        return [
+            QueryStat(
+                q_hash=row["q_hash"],
+                query_text=row["query_text"],
+                count=int(row["n"]),
+                avg_latency_ms=float(row["avg_latency"] or 0.0),
+                max_latency_ms=int(row["max_latency"] or 0),
+                avg_results=float(row["avg_results"] or 0.0),
+                max_results=int(row["max_results"] or 0),
+                # Left as None rather than coerced to 0.0: "never scored" and "scored
+                # zero" are different facts, and a 0.0 would sort to the top of the
+                # worst-served report and bury the queries that are actually going badly.
+                avg_top_score=(
+                    float(row["avg_top_score"]) if row["avg_top_score"] is not None else None
+                ),
+                best_top_score=(
+                    float(row["best_top_score"]) if row["best_top_score"] is not None else None
+                ),
+                last_ts=int(row["last_ts"]),
+            )
+            for row in rows
+        ]
+
+    def query_log_count(self, project_id: str | None = None) -> int:
+        if project_id is None:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM query_log").fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM query_log WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        return int(row["n"])
+
+    def prune_query_log(self, *, max_age_days: int = 0, max_rows: int = 0) -> int:
+        deleted = 0
+        with self._conn:
+            if max_age_days > 0:
+                cutoff = _now() - max_age_days * 86400
+                cur = self._conn.execute("DELETE FROM query_log WHERE ts < ?", (cutoff,))
+                deleted += cur.rowcount
+            if max_rows > 0:
+                # Portable "keep the newest N": find the ts of the Nth-newest row and
+                # delete everything strictly older. No rowid, no LIMIT-on-DELETE — both
+                # are SQLite-only, and this DDL is meant to reach Postgres unchanged.
+                # Ties at the boundary are kept, so the cap is a ceiling ±(ties), which
+                # is the right precision for a retention knob.
+                boundary = self._conn.execute(
+                    "SELECT ts FROM query_log ORDER BY ts DESC LIMIT 1 OFFSET ?",
+                    (max_rows - 1,),
+                ).fetchone()
+                if boundary is not None:
+                    cur = self._conn.execute(
+                        "DELETE FROM query_log WHERE ts < ?", (int(boundary["ts"]),)
+                    )
+                    deleted += cur.rowcount
+        return deleted
 
     # --- embed cache ----------------------------------------------------------
     def get_cached_vectors(

@@ -31,6 +31,15 @@ class JobState(StrEnum):
     dead = "dead"  # exhausted retries — parked with the error (arch §4)
 
 
+class QueryStatOrder(StrEnum):
+    """How :meth:`MetaStore.query_stats` ranks the queries it returns (P3 Stage 3)."""
+
+    frequent = "frequent"  # most-asked first — what the vault is actually used for
+    slowest = "slowest"  # worst average latency first — where retrieval hurts
+    recent = "recent"  # most-recently asked first — what is being worked on now
+    worst = "worst"  # lowest best-score first — the queries retrieval answers badly
+
+
 class JobKind(StrEnum):
     """What a job asks the indexer to do (``jobs.kind``)."""
 
@@ -149,6 +158,45 @@ class SiblingDoc:
     path: str
     title: str
     shared_tags: int
+
+
+@dataclass(frozen=True, slots=True)
+class QueryStat:
+    """One *distinct query* rolled up across every time it was asked (P3 Stage 3).
+
+    Grouped by ``q_hash``, not by row, because the mining question is "which queries go
+    badly", and one query asked forty times is one case to fix, not forty.
+    ``query_text`` is the most recent non-null text seen for the hash, and is ``None``
+    throughout when the deployment runs with ``query_log_text=false`` — the reports still
+    work, they just cannot name the query.
+    """
+
+    q_hash: str
+    query_text: str | None
+    count: int
+    avg_latency_ms: float
+    max_latency_ms: int
+    avg_results: float
+    max_results: int
+    last_ts: int
+    #: Mean / best "score of the best snippet returned", across this query's runs. ``None``
+    #: when nothing was ever scored. **Only comparable within one vault and one rerank
+    #: mode** — the incoming numbers are RRF sums, cross-encoder sigmoids, or constants
+    #: depending on which stages ran, which is why nothing here applies a global threshold.
+    avg_top_score: float | None = None
+    best_top_score: float | None = None
+
+    @property
+    def zero_hit(self) -> bool:
+        """True when this query has *never* returned a result.
+
+        Rare in practice, and that is a finding rather than a nuance: a hybrid retriever
+        ranks *something* first for any query, so on a real vault this is close to always
+        False (measured — see ``top_score`` in the ``query_log`` DDL). Kept because it is
+        the unambiguous case when it does fire (an empty project, an over-narrow filter);
+        :attr:`avg_top_score` is what actually finds badly-served queries.
+        """
+        return self.max_results == 0
 
 
 @runtime_checkable
@@ -328,6 +376,59 @@ class MetaStore(Protocol):
     ) -> None: ...
 
     def get_job(self, job_id: str) -> JobRow | None: ...
+
+    # --- query log (P3 Stage 3) -----------------------------------------------
+    # One row per served search, written by the *core pipeline* so every transport
+    # records the same shape. Read side is the mining loop: zero-hit queries become
+    # golden-set candidates (`vaultrag queries --export`).
+    def log_query(
+        self,
+        *,
+        project_id: str,
+        q_hash: str,
+        query_text: str | None,
+        mode: str,
+        k: int,
+        latency_ms: int,
+        n_results: int,
+        budget_used: int,
+        top_score: float | None = None,
+    ) -> None:
+        """Append one query row and prune the log to its retention cap.
+
+        ``query_text`` is ``None`` when the deployment stores hashes only
+        (``query_log_text=false``); the row is still written, because the latency and
+        score numbers are useful without it. ``top_score`` is the best snippet score in
+        the response — the field that actually separates a badly-served query from a
+        well-served one, since a hybrid retriever nearly always returns *something*.
+        """
+
+    def query_stats(
+        self,
+        project_id: str,
+        *,
+        order: QueryStatOrder = QueryStatOrder.frequent,
+        limit: int = 20,
+        since_ts: int | None = None,
+        max_results: int | None = None,
+        max_score: float | None = None,
+    ) -> list[QueryStat]:
+        """Distinct queries for one project, rolled up and ranked by ``order``.
+
+        ``max_results`` / ``max_score`` keep only queries whose *best* run stayed at or
+        below that many snippets / that score. Both are filters on the best run, not on
+        the latest one: the mining question is "has this query ever been served well?".
+        """
+
+    def query_log_count(self, project_id: str | None = None) -> int:
+        """How many query rows are stored (for one project, or all of them)."""
+
+    def prune_query_log(self, *, max_age_days: int = 0, max_rows: int = 0) -> int:
+        """Drop rows past the retention caps; return how many were deleted.
+
+        Either cap may be ``0`` to disable it. Retention is part of the feature, not a
+        follow-up: an append-only table on a box nobody watches is a slow disk leak.
+        """
 
     # --- embed cache (keyed (model, dims, chunk_hash)) ------------------------
     def get_cached_vectors(

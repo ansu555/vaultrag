@@ -62,7 +62,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
-from blake3 import blake3
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
@@ -105,9 +104,12 @@ from vaultrag.retrieval import (
     CompressParams,
     GraphExpandParams,
     GraphStore,
+    QueryLogParams,
+    QueryLogSink,
     Reranker,
     RerankParams,
     VaultParentResolver,
+    q_hash,
     related_notes,
 )
 from vaultrag.retrieval import search as retrieval_search
@@ -225,6 +227,11 @@ class ServedProject:
     graph_params: GraphExpandParams = field(default_factory=GraphExpandParams)
     graph_enabled: bool = True
     compress_params: CompressParams | None = None
+    # P3 Stage 3. Per-project because whether a tenant's queries are recorded — and
+    # whether their text is kept — is a tenant policy; the sink they are written to is
+    # shared, like every other project_id-scoped store. ``None`` means this project's
+    # searches are not logged, even on a process that logs its neighbours'.
+    query_log: QueryLogParams | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vault_root", Path(self.vault_root).resolve())
@@ -293,6 +300,7 @@ def build_mcp_server(
     reranker: Reranker | None = None,
     graph_store: GraphStore | None = None,
     meta_store: OverviewStore | None = None,
+    query_log_sink: QueryLogSink | None = None,
 ) -> FastMCP:
     """Assemble the VaultRAG MCP server around already-built dependencies.
 
@@ -323,6 +331,13 @@ def build_mcp_server(
     usually is; the two are separate parameters because they are separate *capabilities*
     (``related`` needs a link graph, ``overview`` needs document/tag aggregates) and a
     deployment can have one without the other.
+
+    ``query_log_sink`` is where P3 Stage 3's per-search rows are written — usually that same
+    SQLite store again, a third parameter for the same "separate capability" reason. Note
+    that the server does not write them: it hands the sink to
+    :func:`~vaultrag.retrieval.search`, which records in the **core pipeline** so Stage 4's
+    REST surface inherits the identical row instead of growing a second, divergent copy.
+    A project whose ``query_log`` is ``None`` is not logged even when a sink exists.
 
     Per-project stages, for reference: ``parent_swap_enabled`` turns on retrieval stage 5,
     where a retrieved child is swapped for its enclosing section reconstructed live from the
@@ -481,6 +496,17 @@ def build_mcp_server(
                 graph=sel.graph_params,
                 compress_params=sel.compress_params,
                 vault_name=sel.vault_name,
+                # P3 Stage 3. The mode label is stamped per call; the storage policy came
+                # from this project's settings at startup. In compact mode the row records
+                # what *retrieval* produced — `_compact` re-packs the previews afterwards,
+                # so `budget_used` is the full-text total, which is the honest number for
+                # "what did this query cost to serve".
+                # A project that opted out gets no sink, rather than a sink plus a null
+                # policy — exactly how `graph_enabled` withholds the graph store above.
+                # One thing decides whether a row is written, so there is no state where
+                # "don't log" and "log with defaults" are told apart by a second argument.
+                query_log_sink=query_log_sink if sel.query_log is not None else None,
+                query_log=sel.query_log.with_mode(mode) if sel.query_log is not None else None,
                 # Compact mode budgets the *previews*, not the full texts: packing full
                 # texts first would silently drop hits the agent asked to browse (k),
                 # so retrieval runs unbounded and _compact re-packs to the real budget.
@@ -495,7 +521,10 @@ def build_mcp_server(
         log.info(
             "mcp.search",  # q_hash, never the raw query, at info level (CLAUDE.md §5)
             project=sel.project_id,
-            q_hash=blake3(query.encode("utf-8")).hexdigest()[:12],
+            # The same hash the query log stores, from the same function — one definition,
+            # so a row in `vaultrag queries` and a line in the log are joinable. The DB may
+            # additionally hold the text (P3 Decision 2); this stream never does.
+            q_hash=q_hash(query),
             mode=mode,
             hits=len(result.snippets),
             related=len(result.related),

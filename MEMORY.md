@@ -8,11 +8,64 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P3 IN PROGRESS — Stages 1 and 2 both DONE (2026-07-22); Stage 3 NOT started
-(Anik ended the session at Stage 2, and Stage 3's DDL is blocked on Decision 2 — see the session
-log).** P2 is COMPLETE (all 7 stages + the 4-bug audit). Stage 2 sits committed on branch
-**`feat/p3-stage2-multiproject` (`fed33cd`), unpushed, no PR.** Plan at
-`../Rag/projects/vaultrag/p3-step-plan.md`.
+- **Phase:** **P3 IN PROGRESS — Stages 1, 2 and 3 all DONE (2026-07-22); Stage 4 (`serve`)
+NOT started.** P2 is COMPLETE (all 7 stages + the 4-bug audit). **Stage 2 is merged to `main`
+(PR #15, `03bce8f`) — Anik merged it mid-session.** Stage 3 sits on branch
+**`feat/p3-stage3-query-log`**. Plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
+- **P3 STAGE 3 (`query_log` + the mining loop) COMPLETE 2026-07-22.** **Green: 789 tests
+(+48), ruff, mypy (60), gate unmoved 1.000/0.892/0.920.** **Decision 2 was settled by Anik:
+option (a)** — nullable `query_text` column, `VAULTRAG_QUERY_LOG_TEXT` default **on** for
+local/stdio, off for shared HTTP; written up as
+`../Rag/agent-inbox/query-log-stores-text-opt-in.md` (supersedes `reference-database-schema.md`).
+**`rate_result`: not built** (Anik's call — no consumer; the P2-Stage-6 "left off *and unbuilt*"
+precedent).
+  - **Recording lives in `retrieval/pipeline.search`, not the MCP layer**, so Stage 4's REST
+  surface inherits the identical row instead of growing a divergent copy —
+  `test_the_mcp_tool_and_the_bare_pipeline_write_the_same_row` is what keeps that true. New
+  `retrieval/querylog.py` (`q_hash`, `QueryLogSink` protocol, `QueryLogParams`,
+  `record_query`, `query_log_params_for`). Recording is outside the `total` stage timer (the
+  log must not be charged to the thing it measures) and **can never fail a search**.
+  - **`vaultrag queries`**: `summary` / `frequent` / `slowest` / `recent` / `worst` /
+  `zero-hit` reports, `--export` to a golden-set-shaped candidate file, `--prune`,
+  `--since-days`, `--max-score`. Retention (90 days / 200k rows) prunes **as the log is
+  written**, amortized every 100 writes + always on a process's first write.
+  - **THE FINDING THAT CHANGED THE STAGE — the plan's zero-hit report is inert, and
+  dogfooding is what proved it.** On the live design vault, *"how do I rotate the stripe
+  webhook signing secret"* returns **8 hits** from a vault that has never heard of Stripe —
+  identical to a well-answered query. A hybrid retriever ranks *something* first for
+  everything; **`n_results` carries no signal at all**, so the mining loop this stage exists
+  for mined nothing. Fixed by adding **`top_score REAL`** to the row (measured separation:
+  answerable 0.57–1.21, unanswerable 0.50–0.61, the latter clustered just above the RRF
+  floor) plus a **threshold-free `--report worst`** that ranks rather than cuts — the bands
+  overlap, and the score scale depends on which stages ran (RRF / cross-encoder sigmoid /
+  constant), the same scale-free lesson as `graph_boost` and rank-based MMR. **This is a
+  SECOND supersession of `reference-database-schema.md`, beyond what Anik ratified, and is
+  flagged as such in the agent-inbox note rather than folded in silently.**
+  - **The loop closed on its first real use and found a live retrieval bug.** `--report
+  worst` ranked *"write-back safety guardrails"* third-worst (0.52) — an answerable
+  question — and it is a genuine miss: `write-back-design.md` comes back **4th**, behind
+  `p1-step-plan.md`, `knowledge-graph-integration.md`, `reference-security-model.md`. That is
+  exactly the golden-set case `evaluation-framework.md` wants and nobody had written.
+  - **`query_log` is the only table that needed a real migration path.** Every other table is
+  a derived cache where drift is repaired by deleting the state dir ("DR = reindex",
+  CLAUDE.md §6); nothing can rebuild a record of what people asked, so a missing column here
+  is *data loss* — and `CREATE TABLE IF NOT EXISTS` is silent about columns.
+  `init_schema` now adds absent `query_log` columns explicitly (additive, idempotent).
+  - **The Stage-2 cascade lesson, applied one table over.** `query_log` has **no FK** to
+  `projects` on purpose (a search can run against an unregistered id — the P0
+  `--project X --vault Y` shorthand — and a FK would make logging fail exactly where it is
+  most interesting), so `delete_project` reaches it only because it *names* it. With the text
+  column on, rows left behind are the departing tenant's raw queries, handed to whoever
+  re-registers the id. Own test.
+  - **The privacy boundary is test-pinned, not just documented.** CLAUDE.md §5 governs the
+  **log stream**; Decision 2 makes the DB the one exception. Tests assert — **parameterized
+  over both settings of the knob** — that the literal query text appears in neither the
+  captured structlog events nor the rendered metrics registry. `mcp/server.py` now uses the
+  same `q_hash()` the rows store, so a log line and a row are joinable.
+  - **`query_log_retention_days`/`query_log_max_rows` are RESERVED per-project**
+  (`projects._RESERVED_SETTINGS`) — one shared table pruned by one shared store opened from
+  *base* settings, so a per-project value would be stored and never consulted.
+  `query_log_enabled`/`query_log_text` stay overridable (genuinely per-tenant).
 - **P3 STAGE 2 (multi-project registry) COMPLETE 2026-07-22 — one process now serves N
 projects.** The foundation (registry CRUD + settings resolution + `vaultrag project add|list|
 rm|show`) landed first and is **merged to main** (PR #14, `5c8b4f2`); this session finished the
@@ -180,24 +233,22 @@ Write path: gated `NoteWriter` → git commit → synchronous `ingest_path`. Swa
 `Embedder`/`Reranker`/`VectorStore`/`MetaStore`/`SparseEmbedder`/`ParentResolver` protocols.
 **Green: `ruff`, `ruff format`, `mypy src` (41 files), `pytest` (315 tests).** Per-module detail
 lives in the code, `MEMORY-p1.md` (P1), and `MEMORY-p0.md` (P0).
-- **What's next: P3 STAGE 3 (`query_log` + the mining loop)** at
-`../Rag/projects/vaultrag/p3-step-plan.md`. Scope: the `query_log` table recorded **in the core
-pipeline, not the MCP layer** (so Stage 4's REST surface inherits it rather than growing a second
-divergent copy), `vaultrag queries` (zero-hit / slowest / most-frequent + export of zero-hit and
-low-score queries as golden-set candidates), retention pruned on write, and optionally
-`rate_result`. **Stage 3 hits Decision 2 on day one and it is still unsettled — it needs Anik or
-a superseding vault note before the table's DDL is written:** `reference-database-schema.md`
-defines the row as `q_hash` (no text) and eleven lines later calls the table the source that turns
-zero-hit queries into golden-set candidates — **a hash cannot become a golden-set query.** The
-recommendation on the table is an opt-in `query_text` column (default on for local/stdio, kill
-switch for multi-tenant HTTP), on the grounds that CLAUDE.md §5's rule governs the **log stream**,
-which stays absolute. Note this now supersedes a *reference* note, so it belongs in
-`agent-inbox/`. Stage 3 also inherits a ready-made `project` label — the query log is per-tenant
-and the metrics for it already are.
-  **Decisions still open for Anik:** (1) `answer` mode build-at-all, (2) `query_log` text column
-  (**blocks Stage 3**), (4) `serve` bootstrap key, (5) Docker base/formats split. Plus two
-  `agent-inbox/` notes awaiting a ruling: `compression-similarity-is-lexical-not-vector.md`
-  (Stage 1) and `overview-tool-shape.md` (Stage 2). **Dogfooding:** the `vaultrag` MCP server has
+- **What's next: P3 STAGE 4 (`serve` — FastAPI `/v1`, the `ROLE` switch, `/metrics` mounted)**
+at `../Rag/projects/vaultrag/p3-step-plan.md`. Scope: the HTTP transport
+`reference-rest-api.md` specifies, as a **thin wrapper over the same core the MCP tools call**
+— the parity test (one query, MCP `search` and `POST /v1/{project}/search` return the same
+payload) is the stage's real acceptance criterion. Also closes the P2 carry-over: a startup
+**drift check** + drift gauge, so neither `serve` nor `mcp` can silently serve an index that
+disagrees with the manifest. Stage 3 already put the query log in the core pipeline, so the REST
+surface inherits per-query rows for free — that was the point of the placement.
+  **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7), (4) `serve`
+  bootstrap key (**Stage 4** — a ratification of the recommended default, not a blocker),
+  (5) Docker base/formats split (Stage 6). Decisions 2 and 3 are **settled**. Three
+  `agent-inbox/` notes await a ruling: `compression-similarity-is-lexical-not-vector.md`
+  (Stage 1), `overview-tool-shape.md` (Stage 2), and
+  `query-log-stores-text-opt-in.md` (Stage 3 — note its **`top_score` section flags a second
+  supersession that went beyond what was ratified**, and is the one part of Stage 3 that most
+  wants a look). **Dogfooding:** the `vaultrag` MCP server has
   been run
   against the live `vaultrag-design` index in prior sessions — use `search`/`open` against
   `../Rag` while building and treat bad retrieval as a real bug report (repo `CLAUDE.md` §1). To
@@ -237,7 +288,76 @@ Prepend newest first. Template:
 
 ## Session log
 
-### 2026-07-22 (latest) — P3 Stage 2 finished: one process serves N projects
+### 2026-07-22 (latest) — P3 Stage 3: the query log, and the measurement that rebuilt it
+
+- **Did:** Anik: *"if stage 2 is fully implemented all the bugs are resolved then move to stage
+3."* Verified Stage 2 first (783→ suite green, gate PASS) and re-checked git rather than trusting
+this log — **Anik had already pushed and merged Stage 2 as PR #15 (`03bce8f`)**, so the handoff's
+"unpushed, no PR" was stale within the hour. Branched `feat/p3-stage3-query-log` off `main`.
+- **Put the blocking decision before writing any DDL, since Stage 3 hits it on line one.**
+Anik chose **(a)**: nullable `query_text`, default on for local/stdio, `query_log_text=false` for
+shared HTTP. Also ruled **`rate_result`: skip**. Written up as
+`../Rag/agent-inbox/query-log-stores-text-opt-in.md`.
+- **The stage's real content turned out not to be the table.** The plan's mining loop is built on
+a **zero-hit report**, and dogfooding showed that report is **inert**: on the live design vault,
+*"how do I rotate the stripe webhook signing secret"* returns **8 hits** from a vault that has
+never heard of Stripe — indistinguishable from a well-answered query. A hybrid retriever ranks
+*something* first for everything, so `n_results` carries **no signal**. Shipping the stage as
+specced would have shipped a dead feature that looked green: 36 passing tests, and a report that
+never fires. **The tests could not have caught this** — they use fakes, where a zero-hit result is
+whatever the fixture says. Only running it against a real index did.
+- **Fixed by measurement, not by guessing.** Probed 6 answerable vs 5 unanswerable queries at the
+shipped default (`rerank_mode=never`, so RRF scores): answerable **0.57–1.21**, unanswerable
+**0.50–0.61**, the latter clustered just above the RRF floor. So `top_score REAL` went into the
+row — but **the bands overlap, so no global threshold ships**: `--report worst` *ranks* by score
+and applies no cutoff ("the 20 worst" needs none), and `--export --max-score X` takes the cutoff
+from the operator. Same scale-free lesson as `graph_boost` and Stage 1's rank-based MMR.
+- **This is a second supersession of a `reference/` note beyond what Anik ratified, and it is
+flagged rather than folded in.** Decision 2 was asked and answered about `query_text`
+specifically. `top_score` is its own change, argued in its own section of the agent-inbox note,
+with the measurement that forced it — because quietly widening a superseding schema change is how
+a reference note stops describing the system.
+- **The loop closed on its first real use and found a live retrieval bug.** `--report worst`
+ranked *"write-back safety guardrails"* third-worst (0.52) — an answerable question — which
+looked like a false positive from the band overlap and is not: `write-back-design.md` comes back
+**4th**, behind `p1-step-plan.md`, `knowledge-graph-integration.md`, `reference-security-model.md`.
+A genuine golden-set case, discovered rather than invented. Left for Anik to accept into a golden
+set (the export deliberately never merges into the gate's frozen set).
+- **Two hazards found while building, both about tables nothing points at.** (1) `query_log` is
+**the only table `reindex` cannot rebuild**, so "delete the state dir" — the standard fix
+everywhere else — is *data loss* here, and `CREATE TABLE IF NOT EXISTS` is silent about a missing
+column. `init_schema` now adds absent `query_log` columns explicitly. (2) `query_log` has **no FK**
+to `projects` (the P0 shorthand serves unregistered ids, and a FK would make logging fail exactly
+where it is most interesting), so `delete_project` reaches it only by naming it — the Stage-2
+orphaned-vector bug's exact shape, one table over, caught this time before shipping.
+- **A design bug the tests caught, in my own first draft.** `record_query` treated `params=None`
+as "log with defaults", while `ServedProject.query_log=None` means "this tenant opted out" — so a
+tenant that opted out was logged anyway. Fixed by making the **sink alone** decide (the transport
+withholds it), exactly how `graph_enabled` withholds the graph store. Two arguments that could
+each mean "off" is how one of them gets forgotten.
+- **Verified:** 789 tests (+48: 42 in the new `tests/test_querylog.py`, 6 CLI), ruff, mypy (60),
+**gate PASS 1.000 / 0.892 / 0.920 (unmoved)**. Live dogfood on `vaultrag-design` end to end:
+10 real queries → rows → `--report worst` → `--export` → `load_candidates`. **The box is back to
+its starting state:** the synthetic dogfood rows were deleted (they were my probes, not Anik's
+usage), only `vaultrag-design` registered, 61 docs.
+- **Files:** `retrieval/querylog.py` (new), `retrieval/{pipeline,__init__}.py`,
+`store/{base,sqlite}.py` (DDL + `log_query`/`query_stats`/`prune_query_log`/`query_log_count` +
+the additive migration + `delete_project` cascade), `config.py` (4 knobs), `projects.py`
+(2 reserved keys), `mcp/server.py` (`ServedProject.query_log`, `query_log_sink`, shared `q_hash`),
+`cli.py` (`queries` command + `mcp` wiring), `eval/{golden,__init__}.py`
+(`write_candidates`/`load_candidates`, `load_golden(require_expected=…)`); tests:
+`test_querylog.py` (new), `test_cli.py`; vault: `agent-inbox/query-log-stores-text-opt-in.md`
+(new), `projects/vaultrag/p3-step-plan.md` (Stage 3 log).
+- **Next / handoff:** **Stage 4 (`serve`)**. Nothing blocks it — Decision 4 (bootstrap key) is a
+ratification of a recommended default, not an open question. Stage 3 is committed on
+`feat/p3-stage3-query-log`, **unpushed, no PR** (CLAUDE.md: push only when asked); Anik merged
+Stage 2 himself mid-session, so check `main` before assuming this is still true. The one thing
+worth Anik's eyes before Stage 4: **the `top_score` section of
+`agent-inbox/query-log-stores-text-opt-in.md`** — it is the part of Stage 3 that went beyond what
+was ratified, and if he'd rather it were reverted, that is cheaper now than after Stage 4's REST
+surface starts writing the same rows.
+
+### 2026-07-22 — P3 Stage 2 finished: one process serves N projects
 
 - **Did:** Anik: *"continue the rest of Stage 2; if 1 and 2 are complete move to the next
 stage."* First re-established ground truth rather than trusting this log — and the log was

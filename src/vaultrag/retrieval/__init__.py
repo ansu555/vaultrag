@@ -37,6 +37,14 @@ from vaultrag.retrieval.pipeline import (
     DEFAULT_PREFETCH_LIMIT,
     search,
 )
+from vaultrag.retrieval.querylog import (
+    Q_HASH_CHARS,
+    QueryLogParams,
+    QueryLogSink,
+    q_hash,
+    query_log_params_for,
+    record_query,
+)
 from vaultrag.retrieval.rerank import (
     BgeReranker,
     NoOpReranker,
@@ -54,6 +62,7 @@ __all__ = [
     "DEFAULT_K",
     "DEFAULT_PARENT_MAX_TOKENS",
     "DEFAULT_PREFETCH_LIMIT",
+    "Q_HASH_CHARS",
     "BgeReranker",
     "CompressParams",
     "GraphExpandParams",
@@ -61,6 +70,8 @@ __all__ = [
     "NoOpReranker",
     "ParentResolver",
     "ParentSection",
+    "QueryLogParams",
+    "QueryLogSink",
     "RerankError",
     "RerankParams",
     "Reranker",
@@ -76,6 +87,9 @@ __all__ = [
     "neighbor_notes",
     "obsidian_uri",
     "parent_swap",
+    "q_hash",
+    "query_log_params_for",
+    "record_query",
     "related_notes",
     "rerank_candidates",
     "rerank_params_for",

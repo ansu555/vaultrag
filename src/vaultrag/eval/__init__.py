@@ -24,10 +24,12 @@ from vaultrag.eval.golden import (
     Case,
     GoldenSet,
     GoldenSetError,
+    load_candidates,
     load_corpus_golden,
     load_design_golden,
     load_golden,
     verify_paths,
+    write_candidates,
 )
 from vaultrag.eval.harness import (
     EVAL_BUDGET_TOKENS,
@@ -94,6 +96,7 @@ __all__ = [
     "format_misses",
     "format_summary",
     "live_stack",
+    "load_candidates",
     "load_corpus_golden",
     "load_design_golden",
     "load_golden",
@@ -107,4 +110,5 @@ __all__ = [
     "run_eval",
     "text_key",
     "verify_paths",
+    "write_candidates",
 ]
