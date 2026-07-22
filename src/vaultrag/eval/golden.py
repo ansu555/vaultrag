@@ -19,6 +19,8 @@ more than one right answer; ``expected_path`` stays the common single-answer spe
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,11 +67,18 @@ class GoldenSet:
         return len(self.cases)
 
 
-def load_golden(path: Path) -> GoldenSet:
+def load_golden(path: Path, *, require_expected: bool = True) -> GoldenSet:
     """Read and validate a golden JSON file.
 
     Raises :class:`GoldenSetError` rather than returning a partial set: a gate that
     silently skips malformed cases scores a smaller, easier set and still reports a pass.
+
+    ``require_expected=False`` reads a **candidate** file — the query-log export (P3
+    Stage 3), whose cases are real queries with the ``expected_paths`` still blank because
+    only a human can say which note *should* have answered a query that returned nothing.
+    Candidates use this same schema on purpose: filling the blanks in place turns the file
+    into a golden set with no reformatting, and until they are filled the strict load
+    refuses it by name rather than scoring an unanswerable case as a miss.
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -90,7 +99,7 @@ def load_golden(path: Path) -> GoldenSet:
         expected = entry.get("expected_paths") or (
             [entry["expected_path"]] if entry.get("expected_path") else []
         )
-        if not expected:
+        if not expected and require_expected:
             raise GoldenSetError(f"case {i} in {path} ({query!r}) has no expected path")
         cases.append(
             Case(
@@ -119,6 +128,45 @@ def load_corpus_golden() -> GoldenSet:
 def load_design_golden() -> GoldenSet:
     """The dogfooding set over the live ``vaultrag-design`` vault."""
     return load_golden(DESIGN_GOLDEN_PATH)
+
+
+def load_candidates(path: Path) -> GoldenSet:
+    """Read a query-log candidate file — a golden set whose expected paths aren't filled yet."""
+    return load_golden(path, require_expected=False)
+
+
+def write_candidates(
+    path: Path,
+    *,
+    project_id: str,
+    candidates: Sequence[tuple[str, str]],
+    description: str = "",
+) -> int:
+    """Write mined queries as a golden-set-shaped candidate file. Returns how many.
+
+    ``candidates`` is ``(query, note)`` pairs — the note records *why* the query was
+    mined (zero-hit, how often, when), because six weeks later "why is this in here?" is
+    the question that decides whether a case is worth writing an answer for.
+
+    The file is deliberately **not** merged into an existing golden set. The gate's set is
+    a frozen instrument (``../Rag/projects/vaultrag/evaluation-framework.md``); appending
+    unreviewed cases to it would move the bar by accident, which is the one thing a gate
+    must never do. Review, fill in ``expected_paths``, then copy them across.
+    """
+    payload = {
+        "name": f"{project_id}-candidates",
+        "project": project_id,
+        "description": description
+        or "Mined from query_log. Fill in expected_paths for each case you want to keep, "
+        "delete the rest, then merge into a golden set by hand.",
+        "generated_ts": int(time.time()),
+        "cases": [
+            {"query": query, "expected_paths": [], "note": note} for query, note in candidates
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return len(payload["cases"])  # type: ignore[arg-type]
 
 
 def verify_paths(golden: GoldenSet) -> list[str]:

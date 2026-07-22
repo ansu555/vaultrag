@@ -7,6 +7,8 @@ Subcommands:
 * ``watch``   — live-watch a vault and reindex each edit (P1 Stage 4).
 * ``mcp``     — serve the MCP tools over stdio (P0 Step 10:
   :func:`~vaultrag.mcp.build_mcp_server`).
+* ``project`` — register/inspect/remove the vaults one process serves (P3 Stage 2).
+* ``queries`` — report on the query log and mine it for golden-set cases (P3 Stage 3).
 * ``eval``    — score retrieval against a golden set; the CI gate (P2 Stage 1).
 
 The long-running roles (``watch``, ``mcp``) take ``--metrics`` to expose the standalone
@@ -20,9 +22,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -57,6 +61,7 @@ from vaultrag.eval import (
     rank_ceiling,
     replay_stack,
     run_eval,
+    write_candidates,
 )
 from vaultrag.index.base import VectorStoreError
 from vaultrag.index.qdrant import QdrantVectorStore
@@ -73,8 +78,10 @@ from vaultrag.retrieval import (
     compress_params_for,
     graph_params_for,
     load_reranker,
+    query_log_params_for,
     rerank_params_for,
 )
+from vaultrag.store.base import QueryStat, QueryStatOrder
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
 
@@ -504,7 +511,14 @@ def mcp(
             any_read_store = base.db_path.is_file() and any(
                 s.graph_expand_enabled for s in served_settings
             )
-            if any_write or watch or any_read_store:
+            # The query log (P3 Stage 3) attaches under the same rule as the graph reader,
+            # and for a sharper reason: a state dir with no database has no index either, so
+            # every search against it is a zero-hit by construction. Conjuring a db to record
+            # that would fill the mining report with rows that say nothing about retrieval.
+            any_query_log = base.db_path.is_file() and any(
+                s.query_log_enabled for s in served_settings
+            )
+            if any_write or watch or any_read_store or any_query_log:
                 store = SQLiteMetaStore.from_settings(base)
 
             # Only the paths that *ingest* need it (write-back, --watch); a read-only
@@ -569,6 +583,9 @@ def mcp(
                         # hence the second term.
                         graph_enabled=settings.graph_expand_enabled,
                         compress_params=compress_params_for(settings),
+                        # Per-project policy; `store is None` means there is nowhere to
+                        # write, so the policy is moot rather than silently ignored.
+                        query_log=(query_log_params_for(settings) if store is not None else None),
                     )
                 )
                 init_project_labels(settings.project_id)
@@ -593,6 +610,9 @@ def mcp(
                 reranker=reranker,
                 graph_store=store if any(p.graph_enabled for p in served) else None,
                 meta_store=store,
+                # Shared, like every other project_id-scoped store; the per-project
+                # decision to record at all rides on ServedProject.query_log.
+                query_log_sink=store if any(p.query_log is not None for p in served) else None,
             )
         # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
         # client that resolves/binds something at construction; sqlite3.Error = an
@@ -777,6 +797,232 @@ def project_rm(
         for closer in (vector_store, store):
             if closer is not None:
                 closer.close()
+
+
+# --- query log / mining (P3 Stage 3) ----------------------------------------
+class QueryReport(StrEnum):
+    """Which cut of the query log ``vaultrag queries`` prints."""
+
+    summary = "summary"  # a little of each — the "what happened lately" default
+    frequent = "frequent"  # most-asked
+    slowest = "slowest"  # worst average latency
+    recent = "recent"  # most-recently asked
+    worst = "worst"  # lowest best-score — the queries retrieval answers badly
+    zero_hit = "zero-hit"  # never returned a result at all (rare; see `queries`' docstring)
+
+
+#: How many rows each section of the `summary` report shows. Small on purpose: summary is
+#: a glance, and every cut is available in full through its own `--report`.
+_SUMMARY_ROWS = 5
+
+
+def _queries_project(project: str | None) -> str:
+    """Which project a query-log command reports on.
+
+    Same rule the MCP tools use, for the same reason: with one project the argument is
+    optional, with several it is required and the error names them. A CLI that quietly
+    picked the alphabetically-first project would report one tenant's numbers under
+    another's name.
+    """
+    if project is not None:
+        return project
+    base = load_settings()
+    with _registry(base) as registry:
+        rows = registry.list() if registry is not None else []
+    if len(rows) == 1:
+        return rows[0].id
+    if len(rows) > 1:
+        raise typer.BadParameter(
+            "--project is required when several projects are registered: "
+            + ", ".join(sorted(r.id for r in rows))
+        )
+    return base.project_id
+
+
+def _format_stat(stat: QueryStat) -> str:
+    """One report line. Falls back to the hash when the text was not stored."""
+    label = stat.query_text if stat.query_text is not None else f"<{stat.q_hash}>"
+    score = f"{stat.avg_top_score:>5.2f}" if stat.avg_top_score is not None else "    -"
+    return (
+        f"{stat.count:>5}x  {stat.avg_latency_ms:>7.0f} ms avg  "
+        f"{stat.avg_results:>4.1f} hits  top {score}  {label}"
+    )
+
+
+def _candidate_note(stat: QueryStat) -> str:
+    """Why this query was mined — the thing that decides, weeks later, if it is worth a case."""
+    if stat.max_results == 0:
+        why = "zero-hit"
+    elif stat.best_top_score is not None:
+        why = f"best score {stat.best_top_score:.2f}"
+    else:
+        why = f"<={stat.max_results} hits"
+    seen = time.strftime("%Y-%m-%d", time.gmtime(stat.last_ts))
+    return f"{why}, asked {stat.count}x, last seen {seen}"
+
+
+def _print_stats(title: str, stats: list[QueryStat]) -> None:
+    typer.echo(f"\n{title}")
+    if not stats:
+        typer.echo("  (none)")
+        return
+    for stat in stats:
+        typer.echo(f"  {_format_stat(stat)}")
+
+
+@app.command()
+def queries(
+    project: Annotated[
+        str | None, typer.Option("--project", help="Project whose query log to report on.")
+    ] = None,
+    report: Annotated[
+        QueryReport,
+        typer.Option("--report", help="Which cut of the log to print."),
+    ] = QueryReport.summary,
+    limit: Annotated[int, typer.Option("--limit", help="Rows per section.")] = 20,
+    since_days: Annotated[
+        int | None,
+        typer.Option("--since-days", help="Only consider queries from the last N days."),
+    ] = None,
+    max_results: Annotated[
+        int | None,
+        typer.Option(
+            "--max-results",
+            help="Keep only queries whose best run returned at most N snippets. Weak on a "
+            "hybrid retriever, which almost always returns something — prefer --max-score.",
+        ),
+    ] = None,
+    max_score: Annotated[
+        float | None,
+        typer.Option(
+            "--max-score",
+            help="Keep only queries whose best snippet ever scored at or below this. The "
+            "useful export selector. Per-vault: read a threshold off `--report worst` "
+            "rather than assuming one, since the scale depends on which stages ran.",
+        ),
+    ] = None,
+    export: Annotated[
+        Path | None,
+        typer.Option(
+            "--export",
+            help="Write the selected queries to a golden-set-shaped candidate file for "
+            "review (expected_paths left blank — only you can say what should have matched).",
+        ),
+    ] = None,
+    prune: Annotated[
+        bool,
+        typer.Option("--prune", help="Apply the retention caps now and report what was dropped."),
+    ] = False,
+) -> None:
+    """Report on the query log and mine it for golden-set candidates (P3 Stage 3).
+
+    The log is written by the core retrieval pipeline, so it covers every search the
+    process served regardless of transport. Its point is the loop back into the eval gate:
+    a query retrieval answers badly is a failure nobody wrote a test for, and ``--export``
+    turns those into cases the harness can score once you fill in what *should* have
+    answered them (``../Rag/projects/vaultrag/evaluation-framework.md``).
+
+    **Start with ``--report worst``, not ``--report zero-hit``.** A hybrid retriever ranks
+    *something* first for any query, so genuinely empty results are rare — measured on the
+    design vault, a question about Stripe webhooks returns eight confident-looking hits from
+    a vault that has never heard of Stripe. What separates those from real answers is the
+    *score* of the best hit, not the count. Read a cutoff off ``worst`` and pass it to
+    ``--export --max-score``; there is deliberately no default threshold, because the score
+    scale depends on which retrieval stages ran (RRF, cross-encoder sigmoid, or constant).
+    """
+    settings = load_settings()
+    project_id = _queries_project(project)
+    since_ts = int(time.time()) - since_days * 86400 if since_days else None
+    # Opened, never created: no db means no index, and a report on an index that was never
+    # built is a blank page with extra steps.
+    if not settings.db_path.is_file():
+        typer.echo(f"no query log yet at {settings.db_path} — nothing has been indexed here")
+        raise typer.Exit(code=1)
+    store = SQLiteMetaStore.from_settings(settings)
+    try:
+        if prune:
+            dropped = store.prune_query_log(
+                max_age_days=settings.query_log_retention_days,
+                max_rows=settings.query_log_max_rows,
+            )
+            typer.echo(
+                f"pruned {dropped} rows (keep {settings.query_log_retention_days}d / "
+                f"{settings.query_log_max_rows} rows)"
+            )
+
+        total = store.query_log_count(project_id)
+        typer.echo(f"{project_id}: {total} logged queries")
+        if total == 0 and not settings.query_log_enabled:
+            typer.echo("query logging is off (VAULTRAG_QUERY_LOG_ENABLED=false)")
+
+        def cut(
+            order: QueryStatOrder,
+            n: int,
+            cap: int | None = None,
+            score_cap: float | None = None,
+        ) -> list[QueryStat]:
+            return store.query_stats(
+                project_id,
+                order=order,
+                limit=n,
+                since_ts=since_ts,
+                max_results=cap,
+                max_score=score_cap,
+            )
+
+        if export is None:
+            if report is QueryReport.summary:
+                _print_stats("most frequent", cut(QueryStatOrder.frequent, _SUMMARY_ROWS))
+                _print_stats("slowest", cut(QueryStatOrder.slowest, _SUMMARY_ROWS))
+                _print_stats("worst-served", cut(QueryStatOrder.worst, _SUMMARY_ROWS))
+            elif report is QueryReport.zero_hit:
+                zero = cut(QueryStatOrder.frequent, limit, 0)
+                _print_stats("zero-hit", zero)
+                if not zero and total:
+                    # Say why it is empty rather than letting it read as "retrieval is
+                    # perfect" — this report is near-inert by construction on hybrid search.
+                    typer.echo(
+                        "\n  hybrid search nearly always returns something, so an empty "
+                        "zero-hit report is normal.\n  Use --report worst to see the "
+                        "queries answered badly."
+                    )
+            else:
+                _print_stats(report.value, cut(QueryStatOrder(report.value), limit))
+            return
+
+        # --- export ---------------------------------------------------------
+        # With no selector this is the zero-hit set, which is correct but usually empty;
+        # --max-score is the one that actually mines a hybrid retriever.
+        cap = max_results if max_results is not None else (None if max_score else 0)
+        stats = cut(QueryStatOrder.worst, limit, cap, max_score)
+        named = [s for s in stats if s.query_text]
+        if stats and not named:
+            typer.echo(
+                f"{len(stats)} queries match, but none has stored text — this deployment "
+                f"runs with VAULTRAG_QUERY_LOG_TEXT=false, and a hash cannot become a "
+                f"golden-set case. Turn it on to mine future queries.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        written = write_candidates(
+            export,
+            project_id=project_id,
+            candidates=[(str(s.query_text), _candidate_note(s)) for s in named],
+        )
+        skipped = len(stats) - len(named)
+        note = f" ({skipped} skipped: no stored text)" if skipped else ""
+        if not written:
+            typer.echo(
+                "no queries matched — with no --max-score this exports only the zero-hit "
+                "set, which hybrid search rarely produces. Try `--report worst` to pick a "
+                "cutoff, then `--export --max-score <cutoff>`."
+            )
+        typer.echo(
+            f"wrote {written} candidates to {export}{note} — fill in expected_paths, then "
+            f"merge the ones worth keeping into a golden set"
+        )
+    finally:
+        store.close()
 
 
 @app.command()
