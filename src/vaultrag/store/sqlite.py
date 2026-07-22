@@ -265,6 +265,28 @@ class SQLiteMetaStore:
         row = self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if row is None:
             return None
+        return self._project_row(row)
+
+    def list_projects(self) -> list[ProjectRow]:
+        rows = self._conn.execute("SELECT * FROM projects ORDER BY id").fetchall()
+        return [self._project_row(r) for r in rows]
+
+    def delete_project(self, project_id: str) -> bool:
+        """Remove a project and every derived row it owns. Returns whether it existed.
+
+        The ``projects`` delete cascades ``documents`` (→ chunks/tags/doc_keys, and NULLs
+        inbound links) and ``index_state`` via their FK actions; ``jobs`` carries a bare
+        ``project_id`` with no FK, so it is deleted explicitly. ``embed_cache`` is content-
+        keyed and shared across tenants, so it is deliberately left intact. One tenant's
+        removal cannot touch another's rows — the isolation the Stage-2 verify checks.
+        """
+        with self._conn:
+            self._conn.execute("DELETE FROM jobs WHERE project_id = ?", (project_id,))
+            cur = self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _project_row(row: sqlite3.Row) -> ProjectRow:
         return ProjectRow(
             id=row["id"],
             name=row["name"],
@@ -334,6 +356,27 @@ class SQLiteMetaStore:
             "SELECT path, hash FROM documents WHERE project_id = ?", (project_id,)
         ).fetchall()
         return {row["path"]: row["hash"] for row in rows}
+
+    def document_count(self, project_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM documents WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        return int(row["n"])
+
+    def top_tags(self, project_id: str, limit: int = 20) -> list[tuple[str, int]]:
+        """The project's most-used tags, most-frequent first — for ``overview``.
+
+        Counts the stored (prefix-expanded) tags: a note tagged ``a/b/c`` contributes to
+        ``a``, ``a/b`` and ``a/b/c``, so the roots that organise a vault surface first.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT tag, COUNT(*) AS n FROM tags WHERE project_id = ?
+            GROUP BY tag ORDER BY n DESC, tag ASC LIMIT ?
+            """,
+            (project_id, limit),
+        ).fetchall()
+        return [(row["tag"], int(row["n"])) for row in rows]
 
     def delete_document(self, project_id: str, path: str) -> None:
         doc_id = document_id(project_id, path)

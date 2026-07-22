@@ -179,6 +179,17 @@ class MetaStore(Protocol):
 
     def get_project(self, project_id: str) -> ProjectRow | None: ...
 
+    def list_projects(self) -> list[ProjectRow]:
+        """Every registered project, ordered by id — the registry read side (P3 Stage 2)."""
+
+    def delete_project(self, project_id: str) -> bool:
+        """Remove a project and all rows it owns; return whether it existed.
+
+        Cascades one tenant's ``documents`` (→ chunks/tags/doc_keys/links) + ``index_state``
+        and deletes its ``jobs``; leaves every other project and the shared ``embed_cache``
+        untouched.
+        """
+
     # --- documents (the scan manifest) ---------------------------------------
     def upsert_document(
         self,
@@ -192,6 +203,12 @@ class MetaStore(Protocol):
 
     def document_manifest(self, project_id: str) -> dict[str, str | None]:
         """``path -> hash`` for every document — the diff source for scan (Step 3)."""
+
+    def document_count(self, project_id: str) -> int:
+        """How many documents this project has indexed — ``overview`` note count."""
+
+    def top_tags(self, project_id: str, limit: int = 20) -> list[tuple[str, int]]:
+        """The project's most-used tags with counts, most-frequent first — ``overview``."""
 
     def delete_document(self, project_id: str, path: str) -> None:
         """Delete a document and cascade its chunks + tags."""

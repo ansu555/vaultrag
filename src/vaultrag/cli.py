@@ -17,6 +17,7 @@ Later phases add ``serve`` (HTTP). See ``../Rag/projects/vaultrag/p0-step-plan.m
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from dataclasses import replace
@@ -65,6 +66,7 @@ from vaultrag.mcp import build_mcp_server
 from vaultrag.metrics import set_build_info, start_metrics_server
 from vaultrag.parsing.image import load_image_parser
 from vaultrag.parsing.pdf import load_pdf_parser
+from vaultrag.projects import ProjectRegistry
 from vaultrag.retrieval import (
     compress_params_for,
     graph_params_for,
@@ -99,6 +101,44 @@ def _root(
     ),
 ) -> None:
     """VaultRAG CLI."""
+
+
+def _resolve_settings(project: str | None, vault: Path | None) -> Settings:
+    """Resolve the :class:`Settings` a command runs under, via the project registry.
+
+    A **registered** ``--project`` supplies its own vault path and any per-project
+    overrides (P3 Stage 2), so ``--vault`` stops being mandatory. An **unregistered**
+    ``--project`` keeps the P0 single-project shorthand (base settings with the id set), and
+    an explicit ``--vault`` always wins — run a registered project against a different tree,
+    or point at a vault before registering it.
+
+    Registry lookup opens a throwaway store on the shared db; if that open fails (unwritable
+    state dir, etc.) it falls back to the shorthand so the *command's* own guarded store-open
+    reports the real error with a message, not a traceback here.
+    """
+    base = load_settings()
+    resolved: Settings | None = None
+    # Only consult the registry if a db already exists: a read-only `mcp --project X --vault Y`
+    # must not conjure an empty state db just to discover the project isn't registered (the
+    # same invariant the graph reader keeps), and with no db there are no registered projects.
+    if project is not None and base.db_path.is_file():
+        try:
+            store = SQLiteMetaStore.from_settings(base)
+            try:
+                if store.get_project(project) is not None:
+                    resolved = ProjectRegistry(store, base).resolve(project)
+            finally:
+                store.close()
+        except (OSError, sqlite3.Error):
+            resolved = None  # let the command's guarded open surface the error
+
+    settings = resolved or base
+    updates: dict[str, object] = {}
+    if project is not None and resolved is None:
+        updates["project_id"] = project  # unregistered shorthand
+    if vault is not None:
+        updates["vault_path"] = vault  # explicit --vault overrides the registry
+    return settings.model_copy(update=updates) if updates else settings
 
 
 def _start_metrics(settings: Settings, *, requested: bool) -> bool:
@@ -142,12 +182,12 @@ def reindex(
     ordinary run cannot detect that and will report the missing documents as
     ``unchanged``. A drift warning is printed after every run.
     """
-    settings = load_settings()
+    settings = _resolve_settings(project, vault)
     configure_logging(settings.log_level)
     log = get_logger("vaultrag.cli")
 
-    project_id = project or settings.project_id
-    vault_path = vault or settings.vault_path
+    project_id = settings.project_id
+    vault_path = settings.vault_path
 
     # Constructed inside the guarded region: opening the SQLite store can itself fail
     # (unwritable VAULTRAG_STATE_DIR, unopenable db file) and must exit 1 with a message,
@@ -234,12 +274,12 @@ def watch(
     then starts the watchdog observer and blocks until Ctrl-C. Owned by the indexer role
     (p1-step-plan Decisions). Requires Qdrant + Ollama, like ``reindex``.
     """
-    settings = load_settings()
+    settings = _resolve_settings(project, vault)
     configure_logging(settings.log_level)
     log = get_logger("vaultrag.cli")
 
-    project_id = project or settings.project_id
-    vault_path = vault or settings.vault_path
+    project_id = settings.project_id
+    vault_path = settings.vault_path
     if not vault_path.is_dir():
         typer.echo(f"watch failed: vault path is not a directory: {vault_path}", err=True)
         raise typer.Exit(code=1)
@@ -342,12 +382,12 @@ def mcp(
     stderr (see ``vaultrag.logging``) and the FastMCP banner is disabled. Register
     with: ``claude mcp add vaultrag -- uv run vaultrag mcp --project X``.
     """
-    settings = load_settings()
+    settings = _resolve_settings(project, vault)
     configure_logging(settings.log_level)
     log = get_logger("vaultrag.cli")
 
-    project_id = project or settings.project_id
-    vault_path = vault or settings.vault_path
+    project_id = settings.project_id
+    vault_path = settings.vault_path
     if not vault_path.is_dir():
         typer.echo(f"mcp failed: vault path is not a directory: {vault_path}", err=True)
         raise typer.Exit(code=1)
@@ -487,6 +527,123 @@ def mcp(
         for closer in (embedder, vector_store, store):
             if closer is not None:
                 closer.close()
+
+
+# --- project registry subcommands (P3 Stage 2) ------------------------------
+project_app = typer.Typer(
+    name="project",
+    help="Manage the project registry: one deployment, many vaults (P3 Stage 2).",
+    no_args_is_help=True,
+)
+app.add_typer(project_app, name="project")
+
+
+def _open_registry() -> tuple[SQLiteMetaStore, ProjectRegistry]:
+    """Open the shared metadata store and a registry over it (caller closes the store)."""
+    base = load_settings()
+    store = SQLiteMetaStore.from_settings(base)
+    store.init_schema()
+    return store, ProjectRegistry(store, base)
+
+
+def _parse_kv(pairs: list[str]) -> dict[str, object]:
+    """Parse ``key=value`` overrides. Each value is JSON if parseable, else a bare string.
+
+    So ``--set default_top_k=25`` stores the int 25 and ``--set embed_model=custom:1b``
+    stores the string — the effective :class:`Settings` still coerces types on resolve, but
+    storing them right keeps ``project show`` honest.
+    """
+    out: dict[str, object] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise typer.BadParameter(f"--set expects key=value, got {pair!r}")
+        key, raw = pair.split("=", 1)
+        try:
+            out[key.strip()] = json.loads(raw)
+        except json.JSONDecodeError:
+            out[key.strip()] = raw
+    return out
+
+
+@project_app.command("add")
+def project_add(
+    project_id: Annotated[str, typer.Argument(help="Unique project/tenant id.")],
+    vault: Annotated[Path, typer.Option("--vault", help="Path to the project's vault.")],
+    name: Annotated[
+        str | None, typer.Option("--name", help="Display name (defaults to the id).")
+    ] = None,
+    set_: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set",
+            help="Per-project settings override, key=value (repeatable). E.g. "
+            "--set default_top_k=25 --set embed_model=custom:1b.",
+        ),
+    ] = None,
+) -> None:
+    """Register (or update) a project. Idempotent — re-adding updates it in place."""
+    store, reg = _open_registry()
+    try:
+        row = reg.add(project_id, vault, name=name, settings=_parse_kv(set_ or []))
+        typer.echo(f"registered {row.id} → {row.vault_path}")
+    except (NotADirectoryError, ValueError) as exc:
+        typer.echo(f"project add failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+
+
+@project_app.command("list")
+def project_list() -> None:
+    """List registered projects with their document counts."""
+    store, reg = _open_registry()
+    try:
+        rows = reg.list()
+        if not rows:
+            typer.echo("no projects registered — add one with `vaultrag project add`")
+            return
+        for row in rows:
+            typer.echo(f"{row.id}\t{store.document_count(row.id)} docs\t{row.vault_path}")
+    finally:
+        store.close()
+
+
+@project_app.command("show")
+def project_show(
+    project_id: Annotated[str, typer.Argument(help="Project id to show.")],
+) -> None:
+    """Show one project's registry row (vault, status, doc count, overrides)."""
+    store, reg = _open_registry()
+    try:
+        row = reg.get(project_id)
+        if row is None:
+            typer.echo(f"no such project: {project_id}", err=True)
+            raise typer.Exit(code=1)
+        typer.echo(f"id:        {row.id}")
+        typer.echo(f"name:      {row.name}")
+        typer.echo(f"vault:     {row.vault_path}")
+        typer.echo(f"status:    {row.status}")
+        typer.echo(f"documents: {store.document_count(row.id)}")
+        if row.settings:
+            typer.echo(f"settings:  {json.dumps(row.settings)}")
+    finally:
+        store.close()
+
+
+@project_app.command("rm")
+def project_rm(
+    project_id: Annotated[str, typer.Argument(help="Project id to remove.")],
+) -> None:
+    """Remove a project and cascade its index rows. The vault on disk is untouched."""
+    store, reg = _open_registry()
+    try:
+        if reg.remove(project_id):
+            typer.echo(f"removed {project_id} (index rows cascaded; vault on disk untouched)")
+        else:
+            typer.echo(f"no such project: {project_id}", err=True)
+            raise typer.Exit(code=1)
+    finally:
+        store.close()
 
 
 @app.command()
