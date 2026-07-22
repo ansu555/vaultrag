@@ -151,11 +151,7 @@ class ProjectRegistry:
         override does nothing. Fail loudly instead.
         """
         valid = set(Settings.model_fields)
-        bad = {
-            k
-            for k in settings
-            if k not in valid or k in _RESERVED_SETTINGS
-        }
+        bad = {k for k in settings if k not in valid or k in _RESERVED_SETTINGS}
         if bad:
             raise ValueError(
                 f"per-project settings override unknown or reserved keys: {sorted(bad)}. "
