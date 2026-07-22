@@ -10,11 +10,18 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 - **Phase:** **P3 IN PROGRESS — Stages 1-5 all DONE (2026-07-23); Stage 6 (Docker image +
 compose profiles) NOT started.** P2 is COMPLETE (all 7 stages + the 4-bug audit).
-**Stages 2 and 3 are both merged to `main` (PR #15 `03bce8f`, PR #16 `c938875`) — Anik
-merged both himself.** Stage 4 is still **unmerged** — Stage 5 branched off it
-(`feat/p3-stage5-api-keys` off `feat/p3-stage4-serve`, neither pushed) because Stage 5's
-code depends on Stage 4's `service.py`/`composition.py`, which are not on `main` yet. Plan
-at `../Rag/projects/vaultrag/p3-step-plan.md`.
+**Stages 2, 3 and 4 are all merged to `main`** (PR #15 `03bce8f`, PR #16 `c938875`, PR #17
+`ece4d4d`) — **Anik merged Stage 4 himself while this session was mid-Stage-5**, the fourth
+time in a row this log went stale within the session that wrote it (check `git`/`gh` before
+believing this file, always). Stage 5 was rebased onto `origin/main` after the fact — it
+started stacked on `feat/p3-stage4-serve`, correctly, since that was the only place its
+dependencies (`service.py`/`composition.py`) existed at the time, and became one clean
+commit on `main` once Stage 4 landed there. Branch **`feat/p3-stage5-api-keys`**, force-pushed
+(Anik's explicit call — see the session log for why a force-push was needed at all: the
+branch had already appeared on `origin` mid-session from a source this session did not
+initiate and could not identify — Cursor's extension hosts were active on this repo at the
+time, which is the leading suspect). No PR opened (push only when asked; opening one was not).
+Plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
 - **P3 STAGE 5 (API keys, scopes, rate limits) COMPLETE 2026-07-23.** **Green: 897 tests
 (+46), ruff, mypy (68 src files), gate unmoved 1.000/0.892/0.920.** New `auth.py` —
 argon2-hashed `id.secret` keys, per-project `read < write < admin` scopes, in-process
@@ -349,10 +356,11 @@ Langfuse, alerts)** at `../Rag/projects/vaultrag/p3-step-plan.md`. Nothing block
 verify is the DR drill run for real (fresh volumes → clone vault → compose up → reindex →
 search) and a measured RSS number against the note's 3-4 GB claim, plus Decision 5
 (base/formats image split) which already has a recommendation, just needs ratifying.
-**Note the branch dependency:** Stage 5 is on `feat/p3-stage5-api-keys`, stacked on the
-still-unmerged `feat/p3-stage4-serve` — if Anik merges Stage 4 before starting Stage 6,
-rebase Stage 5 (or wait for Stage 5's own merge) before branching Stage 6 off `main`, or
-Stage 6 will be missing `service.py`/`composition.py`/`auth.py` entirely.
+**Branch state:** Stage 4 merged to `main` mid-Stage-5 (PR #17); Stage 5
+(`feat/p3-stage5-api-keys`) was rebased onto `origin/main` after the fact and is now one
+clean commit ahead of it, force-pushed, no PR opened yet. Branch Stage 6 off `main` once
+Stage 5 is merged (or off `feat/p3-stage5-api-keys` if it starts before that, the same
+call this session made for Stage 5 itself).
   **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7) and
   (5) Docker base/formats split (Stage 6, recommendation given). Decisions 2, 3 and 4 are
   **settled/implemented**.
@@ -487,11 +495,18 @@ tests: `test_auth.py` (new), `fakes.py` (`FakeKeyStore`), `test_api.py`, `test_c
 - **Next / handoff:** **Stage 6 (Docker image + compose profiles).** Nothing blocks it.
 The one thing worth Anik's eyes before it: **the §5 (403-vs-404) section of
 `agent-inbox/key-scopes-and-rate-limit-design-calls.md`** — it is the sharpest judgment
-call this stage made and the one most likely to be worth a second opinion. Also worth a
-decision, not urgent: Stage 5 is stacked on the still-unmerged `feat/p3-stage4-serve`
-(neither branch pushed) — merging Stage 4 first keeps the history linear; merging Stage 5's
-PR into Stage 4's branch and squash-merging both together also works, but *someone* should
-choose before a third stage stacks on top.
+call this stage made and the one most likely to be worth a second opinion.
+**Mid-session, Anik merged Stage 4 to `main` (PR #17) while Stage 5 was being built on top
+of it** — the fourth time in a row a prior handoff went stale within the hour it was
+written (check `git`/`gh`, not this file, every time). Stage 5 was rebased onto
+`origin/main` and force-pushed (Anik's call, asked for explicitly rather than assumed) once
+Stage 4 landed there — it is now one clean commit ahead of `main`, matching every prior
+stage's shape. **A second, unrelated surprise:** `feat/p3-stage5-api-keys` appeared on
+`origin` mid-session before this session ever ran `git push` — Cursor's extension hosts
+were active on this repo at the time and are the leading suspect, but the mechanism was
+never confirmed. Flagged to Anik rather than silently worked around; worth him checking
+whether some tool on this box auto-publishes branches, since the next stage could hit the
+same thing and it is worth knowing the cause rather than the workaround.
 
 ### 2026-07-22 — P3 Stage 4: `serve`, and the extraction that made parity structural
 
