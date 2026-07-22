@@ -471,9 +471,7 @@ class SQLiteMetaStore:
 
     def touch_api_key(self, key_id: str, *, used_ts: int) -> None:
         with self._conn:
-            self._conn.execute(
-                "UPDATE api_keys SET last_used = ? WHERE id = ?", (used_ts, key_id)
-            )
+            self._conn.execute("UPDATE api_keys SET last_used = ? WHERE id = ?", (used_ts, key_id))
 
     @staticmethod
     def _api_key_row(row: sqlite3.Row) -> ApiKeyRow:

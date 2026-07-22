@@ -679,9 +679,7 @@ def test_no_plaintext_key_appears_in_the_store_or_the_logs(vault: Path) -> None:
 
     rest = TestClient(create_app(service, api_keys=KeyAuthenticator(store)))
     with structlog.testing.capture_logs() as captured:
-        wrong = rest.get(
-            "/v1/projects", headers={"Authorization": f"Bearer {KEY_ID}.wrong-secret"}
-        )
+        wrong = rest.get("/v1/projects", headers={"Authorization": f"Bearer {KEY_ID}.wrong-secret"})
     assert wrong.status_code == 401
     blob = json.dumps(captured)
     assert "wrong-secret" not in blob
