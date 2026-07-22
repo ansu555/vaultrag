@@ -18,6 +18,24 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class Role(StrEnum):
+    """What one container of the single VaultRAG image runs as (``VAULTRAG_ROLE``).
+
+    The deployment ``../Rag/reference/reference-docker-compose.md`` describes is one image
+    started twice: an ``api`` container serving REST + ``/metrics``, and an ``indexer``
+    container running the boot reconcile and the file watcher. They are separate roles
+    rather than one process because they fail, restart and scale for different reasons —
+    an indexer chewing through a 100k-chunk reconcile must not take query serving down
+    with it, and an api container should be restartable without re-reconciling a vault.
+
+    Defined here for the same reason :class:`RerankMode` is: config is a dependency-free
+    leaf, so the enum can be read by the CLI without importing either role's machinery.
+    """
+
+    api = "api"
+    indexer = "indexer"
+
+
 class RerankMode(StrEnum):
     """Whether the cross-encoder runs — the user-facing choice (``VAULTRAG_RERANK_MODE``).
 
@@ -407,6 +425,40 @@ class Settings(BaseSettings):
         description="Bind address for /metrics. Localhost by default — the endpoint is "
         "unauthenticated, and local-first means it should not reach the network unless "
         "asked. Set 0.0.0.0 to let a Prometheus in another container scrape it.",
+    )
+
+    # --- serve (FastAPI /v1 + the ROLE switch; P3 Stage 4) ---------------------
+    # See ../Rag/reference/reference-rest-api.md, reference-security-model.md (bind +
+    # "the HTTP transport always requires a key"), reference-docker-compose.md (ROLE).
+    role: Role = Field(
+        default=Role.api,
+        description="What `vaultrag serve` runs as. 'api' serves REST /v1 + /metrics; "
+        "'indexer' runs the boot reconcile and the file watcher with no HTTP surface. One "
+        "image, two containers — set VAULTRAG_ROLE per container.",
+    )
+    api_host: str = Field(
+        default="127.0.0.1",
+        description="Bind address for `serve`. Loopback by default and deliberately so "
+        "(reference-security-model): remote access goes through Tailscale/WireGuard, not "
+        "an open port. Setting 0.0.0.0 is a decision, so it must be typed out.",
+    )
+    api_port: int = Field(
+        default=8000,
+        description="Port for `serve`.",
+    )
+    api_key: str = Field(
+        default="",
+        description="Bearer key required on every /v1 route and /metrics. Empty means "
+        "`serve` mints an ephemeral one at startup and prints it — the HTTP transport is "
+        "never keyless (reference-security-model), it just doesn't refuse to boot. P3 "
+        "Stage 5 replaces this single key with hashed, scoped, rate-limited keys.",
+    )
+    startup_drift_check: bool = Field(
+        default=True,
+        description="Refuse to start when the manifest and the vector store disagree about "
+        "a served project's chunk count. On by default because the failure it catches is "
+        "silent: a drifted index answers every query plausibly from a fraction of the vault "
+        "(see consistency.py). `--allow-drift` overrides it for one run.",
     )
 
     @model_validator(mode="after")

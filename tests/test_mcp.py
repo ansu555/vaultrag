@@ -36,9 +36,10 @@ from vaultrag.index.base import ScoredChunk, SearchFilters
 from vaultrag.indexer.pipeline import IngestContext
 from vaultrag.indexer.scan import ExclusionReason
 from vaultrag.mcp import ServedProject, build_mcp_server
-from vaultrag.mcp.server import _EXCLUSION_MESSAGES, SearchFiltersParam, _apply_cap
+from vaultrag.mcp.server import SearchFiltersParam
 from vaultrag.models import DocumentMetadata, Link, LinkKind, document_id
 from vaultrag.retrieval import obsidian_uri
+from vaultrag.service import _EXCLUSION_MESSAGES, _apply_cap
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
 

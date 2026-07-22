@@ -132,9 +132,12 @@ def test_labels_are_preinitialised_so_a_scrape_shows_zero_not_nothing() -> None:
 def test_no_metric_carries_a_path_query_or_title_label() -> None:
     """metrics.py rule 2, enforced rather than documented.
 
-    Cardinality (one series per vault file) and privacy (``/metrics`` is unauthenticated;
-    CLAUDE.md §6 keeps query text out of logs) both forbid these. An allowlist rather than
-    a denylist, so a *new* high-cardinality label fails this test by default.
+    Cardinality (one series per vault file) and privacy both forbid these. The privacy half
+    is not softened by P3 Stage 4 putting ``/metrics`` behind a bearer key: the **standalone
+    exporter** (P2 Decision 5) still serves the same registry on a keyless loopback port, so
+    a label added here is exposed by whichever front door is open. CLAUDE.md §6 keeps query
+    text out of logs for the same reason. An allowlist rather than a denylist, so a *new*
+    high-cardinality label fails this test by default.
 
     ``project`` joined the allowlist in P3 Stage 2, when one process began serving several
     projects and the label stopped being a constant. It is bounded by the registry — an

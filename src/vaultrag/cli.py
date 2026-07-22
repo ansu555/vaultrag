@@ -7,14 +7,19 @@ Subcommands:
 * ``watch``   — live-watch a vault and reindex each edit (P1 Stage 4).
 * ``mcp``     — serve the MCP tools over stdio (P0 Step 10:
   :func:`~vaultrag.mcp.build_mcp_server`).
+* ``serve``   — serve REST ``/v1`` + ``/metrics`` over HTTP, or run the indexer role
+  (P3 Stage 4: :mod:`vaultrag.api`, ``VAULTRAG_ROLE``).
 * ``project`` — register/inspect/remove the vaults one process serves (P3 Stage 2).
 * ``queries`` — report on the query log and mine it for golden-set cases (P3 Stage 3).
 * ``eval``    — score retrieval against a golden set; the CI gate (P2 Stage 1).
 
 The long-running roles (``watch``, ``mcp``) take ``--metrics`` to expose the standalone
-Prometheus endpoint (P2 Stage 7: :mod:`vaultrag.metrics`).
+Prometheus endpoint (P2 Stage 7: :mod:`vaultrag.metrics`); ``serve`` mounts the same
+registry on its own port instead.
 
-Later phases add ``serve`` (HTTP). See ``../Rag/projects/vaultrag/p0-step-plan.md``.
+``mcp`` and ``serve`` build their stack through the *same* composition root
+(:func:`~vaultrag.composition.build_stack`) and differ only in which transport they hand
+the finished service to — see that module for why that matters.
 """
 
 from __future__ import annotations
@@ -31,12 +36,13 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from structlog.typing import FilteringBoundLogger
 
 from vaultrag import __version__
-from vaultrag.config import RerankMode, Settings, load_settings
-from vaultrag.consistency import check_drift
+from vaultrag.composition import ServedStack, build_stack, check_startup_drift
+from vaultrag.config import RerankMode, Role, Settings, load_settings
+from vaultrag.consistency import DriftError, check_drift
 from vaultrag.embedding.base import EmbeddingError
-from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.embedding.ollama import OllamaEmbedder
 from vaultrag.eval import (
     VECTOR_FIXTURE_PATH,
@@ -65,25 +71,16 @@ from vaultrag.eval import (
 )
 from vaultrag.index.base import VectorStoreError
 from vaultrag.index.qdrant import QdrantVectorStore
-from vaultrag.index.sparse import Bm25Embedder
 from vaultrag.indexer.pipeline import IngestContext, reindex_vault
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
-from vaultrag.mcp import ServedProject, build_mcp_server
-from vaultrag.metrics import init_project_labels, set_build_info, start_metrics_server
+from vaultrag.mcp import mcp_server_for
+from vaultrag.metrics import set_build_info, start_metrics_server
 from vaultrag.parsing.image import load_image_parser
 from vaultrag.parsing.pdf import load_pdf_parser
 from vaultrag.projects import ProjectRegistry, UnknownProjectError
-from vaultrag.retrieval import (
-    compress_params_for,
-    graph_params_for,
-    load_reranker,
-    query_log_params_for,
-    rerank_params_for,
-)
 from vaultrag.store.base import QueryStat, QueryStatOrder
 from vaultrag.store.sqlite import SQLiteMetaStore
-from vaultrag.writeback import NoteWriter
 
 app = typer.Typer(
     name="vaultrag",
@@ -445,6 +442,14 @@ def mcp(
             "contend for one port (a clash warns and continues).",
         ),
     ] = False,
+    allow_drift: Annotated[
+        bool,
+        typer.Option(
+            "--allow-drift",
+            help="Start even if the manifest and the vector store disagree. The drift is "
+            "still measured and logged — only the refusal is waived.",
+        ),
+    ] = False,
 ) -> None:
     """Serve the MCP tools (search/open, and write_note/… unless --no-write) over stdio.
 
@@ -460,189 +465,226 @@ def mcp(
     configure_logging(base.log_level)
     log = get_logger("vaultrag.cli")
 
-    for settings in served_settings:
-        if not settings.vault_path.is_dir():
-            typer.echo(
-                f"mcp failed: vault path for project {settings.project_id!r} is not a "
-                f"directory: {settings.vault_path}",
-                err=True,
-            )
-            raise typer.Exit(code=1)
+    _require_vault_dirs(served_settings, command="mcp")
 
     # No typer.echo here, unlike `watch`: stdout is the JSON-RPC channel and a stray line
     # corrupts the stream. The bind is announced by structlog on stderr instead.
     _start_metrics(base, requested=metrics)
 
-    # By default search reads only Qdrant and open reads only the vault, and neither client
-    # connects at construction time, so a read-only server comes up instantly (a down
-    # Qdrant/Ollama surfaces as an actionable per-call error). Three features need more: the
-    # write tools (write_note/…) and --watch both drive the single-file pipeline, and graph
-    # expand + `related` read the link graph — all of them want the SQLite store, so it is
-    # opened once and shared (the write/watch paths additionally reuse the raw embedder).
-    #
-    # What is built once vs per project mirrors ServedProject's own split: the vector store,
-    # sparse embedder, reranker and metadata store are already project-scoped on every call,
-    # while a vault root, a writer and an embedder belong to exactly one tenant.
-    vector_store: QdrantVectorStore | None = None
-    store: SQLiteMetaStore | None = None
-    embedders: list[OllamaEmbedder] = []
-    watchers: list[VaultWatcher] = []
+    project_ids = [s.project_id for s in served_settings]
     try:
-        try:
-            vector_store = QdrantVectorStore.from_settings(base)
-            # Built at startup so the (possibly first-run) model download blocks here,
-            # visibly, not mid-query. load_reranker never raises: a fetch/load failure
-            # degrades to a no-op reranker so the server still serves (rerank-off).
-            reranker = load_reranker(
-                mode=base.rerank_mode,
-                repo_id=base.rerank_model,
-                model_file=base.rerank_model_file,
+        with build_stack(served_settings, write=write, watch=watch) as stack:
+            _startup_drift_gate(stack, allow_drift=allow_drift, command="mcp")
+            log.info(
+                "mcp.serve",
+                projects=project_ids,
+                transport="stdio",
+                watching=watch,
+                writing=[p.project_id for p in stack.service.projects if p.writer is not None],
             )
+            server = mcp_server_for(stack.service)
+            try:
+                # blocks until the client detaches
+                server.run(transport="stdio", show_banner=False)
+            except KeyboardInterrupt:
+                log.info("mcp.stopped", projects=project_ids)
+    # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
+    # client that resolves/binds something at construction; sqlite3.Error = an
+    # unopenable write/watch store. Either way the fix is the operator's, so fail with a
+    # readable line rather than a stdio traceback.
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        log.error("mcp.failed", projects=project_ids, error=str(exc))
+        typer.echo(f"mcp failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
-            # One store for every tenant — it is one db with `project_id` on every row
-            # (payload-partitioned tenancy, [[multi-tenant-architecture]]). SQLite serializes
-            # its own writes and is opened check_same_thread=False for exactly this
-            # multi-thread reuse. The write/watch paths *create* it — they own the manifest
-            # and jobs tables. The graph/overview readers only attach to an existing DB and
-            # never conjure one: a read-only server pointed at a state dir with no index
-            # would otherwise leave an empty database behind, and an index that was never
-            # built has no graph to serve anyway.
-            any_write = any(write and s.writeback_enabled for s in served_settings)
-            any_read_store = base.db_path.is_file() and any(
-                s.graph_expand_enabled for s in served_settings
+
+# --- serve (P3 Stage 4) ------------------------------------------------------
+def _require_vault_dirs(served_settings: list[Settings], *, command: str) -> None:
+    """Fail before building anything if a served vault path is not a directory.
+
+    Checked up front because the alternative is a stack that comes up healthy and then
+    refuses every ``open`` for one tenant — a misconfiguration that looks like a bug.
+    """
+    for settings in served_settings:
+        if not settings.vault_path.is_dir():
+            typer.echo(
+                f"{command} failed: vault path for project {settings.project_id!r} is not a "
+                f"directory: {settings.vault_path}",
+                err=True,
             )
-            # The query log (P3 Stage 3) attaches under the same rule as the graph reader,
-            # and for a sharper reason: a state dir with no database has no index either, so
-            # every search against it is a zero-hit by construction. Conjuring a db to record
-            # that would fill the mining report with rows that say nothing about retrieval.
-            any_query_log = base.db_path.is_file() and any(
-                s.query_log_enabled for s in served_settings
-            )
-            if any_write or watch or any_read_store or any_query_log:
-                store = SQLiteMetaStore.from_settings(base)
+            raise typer.Exit(code=1)
 
-            # Only the paths that *ingest* need it (write-back, --watch); a read-only
-            # server never converts anything, so don't pay for the parser it won't use.
-            ingests = any_write or watch
-            pdf_parser = load_pdf_parser() if ingests else None
 
-            served: list[ServedProject] = []
-            for settings in served_settings:
-                vault_root = settings.vault_path.resolve()
-                write_enabled = write and settings.writeback_enabled
-                # Obsidian display name for citation URIs (stage 8) + write-back note links:
-                # configured value, else the vault directory name.
-                vault_name = settings.vault_name or vault_root.name
-                # Per project: the embedding model is a per-project setting
-                # ([[multi-tenant-architecture]]), so each tenant queries through its own.
-                embedder = OllamaEmbedder.from_settings(settings)
-                embedders.append(embedder)
-                image_parser = load_image_parser(enabled=settings.ocr_enabled) if ingests else None
-                # Built only when something will drive it: a read-only server has no store
-                # to put in one, and constructing a half-valid context to discard is how a
-                # None slips into the write path later.
-                ctx: IngestContext | None = None
-                if store is not None and (write_enabled or watch):
-                    ctx = IngestContext(
-                        project_id=settings.project_id,
-                        vault_path=vault_root,
-                        store=store,
-                        vector_store=vector_store,
-                        embedder=embedder,
-                        pdf_parser=pdf_parser,
-                        image_parser=image_parser,
-                    )
-                writer: NoteWriter | None = None
-                if write_enabled:
-                    assert ctx is not None  # any_write opened the store above
-                    writer = NoteWriter(
-                        ctx,
-                        author=settings.writeback_author,
-                        allow_roots=settings.writeback_allow_roots,
-                        max_bytes=settings.writeback_max_bytes,
-                        max_writes_per_minute=settings.writeback_max_writes_per_minute,
-                        git_enabled=settings.writeback_git_enabled,
-                        vault_name=vault_name,
-                    )
-                served.append(
-                    ServedProject(
-                        project_id=settings.project_id,
-                        vault_root=vault_root,
-                        embedder=QueryEmbedder(embedder),
-                        vault_name=vault_name,
-                        writer=writer,
-                        default_k=settings.default_top_k,
-                        default_budget_tokens=settings.budget_tokens,
-                        rerank_params=rerank_params_for(settings),
-                        parent_swap_enabled=settings.parent_swap_enabled,
-                        parent_max_tokens=settings.parent_max_tokens,
-                        graph_params=graph_params_for(settings),
-                        # Stage 6 + the `related` tool: one flag drives both, so there is no
-                        # half-on state where `related` answers from a graph that search
-                        # ignores. `store` can be non-None purely for write-back/--watch,
-                        # hence the second term.
-                        graph_enabled=settings.graph_expand_enabled,
-                        compress_params=compress_params_for(settings),
-                        # Per-project policy; `store is None` means there is nowhere to
-                        # write, so the policy is moot rather than silently ignored.
-                        query_log=(query_log_params_for(settings) if store is not None else None),
-                    )
+def _startup_drift_gate(stack: ServedStack, *, allow_drift: bool, command: str) -> None:
+    """Run the startup drift check and turn a refusal into a readable exit.
+
+    The P2 carry-over: a long-running role must not silently serve an index that disagrees
+    with its manifest (see :func:`~vaultrag.composition.check_startup_drift` for why that
+    is the failure worth a hard stop). ``--allow-drift`` still *measures* and logs it —
+    only the refusal is waived.
+    """
+    enabled = stack.base.startup_drift_check and not allow_drift
+    try:
+        check_startup_drift(stack, enabled=enabled)
+    except DriftError as exc:
+        typer.echo(f"{command} failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def serve(
+    project: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--project",
+            help="Project/tenant to serve; repeat to serve several. Omit to serve every "
+            "registered project.",
+        ),
+    ] = None,
+    vault: Annotated[
+        Path | None, typer.Option("--vault", help="Path to the vault, for a single project.")
+    ] = None,
+    host: Annotated[
+        str | None,
+        typer.Option("--host", help="Bind address (default 127.0.0.1, VAULTRAG_API_HOST)."),
+    ] = None,
+    port: Annotated[
+        int | None, typer.Option("--port", help="Bind port (default 8000, VAULTRAG_API_PORT).")
+    ] = None,
+    role: Annotated[
+        Role | None,
+        typer.Option(
+            "--role",
+            help="'api' serves REST /v1 + /metrics; 'indexer' runs the reconcile + watcher "
+            "with no HTTP surface. Defaults to VAULTRAG_ROLE (api).",
+        ),
+    ] = None,
+    write: Annotated[
+        bool,
+        typer.Option(
+            "--write/--no-write",
+            help="Expose the write-back endpoints (and, with them, reindex). On by default; "
+            "also gated by VAULTRAG_WRITEBACK_ENABLED.",
+        ),
+    ] = True,
+    watch: Annotated[
+        bool | None,
+        typer.Option(
+            "--watch/--no-watch",
+            help="Live-watch the served vault(s). Default follows the role: on for indexer, "
+            "off for api.",
+        ),
+    ] = None,
+    allow_drift: Annotated[
+        bool,
+        typer.Option(
+            "--allow-drift",
+            help="Start even if the manifest and the vector store disagree. The drift is "
+            "still measured and logged — only the refusal is waived.",
+        ),
+    ] = False,
+) -> None:
+    """Serve the REST API over HTTP (role=api), or run the indexer (role=indexer).
+
+    One image, two roles (reference-docker-compose). The api role binds 127.0.0.1 by
+    default and requires 'Authorization: Bearer <key>' on every /v1 route and on /metrics
+    (reference-security-model) — set VAULTRAG_API_KEY, or one is minted and printed at
+    startup. The indexer role runs the boot reconcile and the file watcher, and opens no
+    port beyond the optional standalone metrics exporter.
+    """
+    served_settings = _resolve_served_settings(project, vault)
+    base = served_settings[0]
+    configure_logging(base.log_level)
+    log = get_logger("vaultrag.cli")
+
+    effective_role = role or base.role
+    # The watcher default follows the role rather than being a flat False: an indexer whose
+    # watcher is off is not an indexer, and an api container that quietly watches would
+    # duplicate the indexer's work against the same manifest.
+    watching = watch if watch is not None else (effective_role is Role.indexer)
+
+    _require_vault_dirs(served_settings, command="serve")
+
+    project_ids = [s.project_id for s in served_settings]
+    try:
+        with build_stack(served_settings, write=write, watch=watching) as stack:
+            _startup_drift_gate(stack, allow_drift=allow_drift, command="serve")
+            if effective_role is Role.indexer:
+                _run_indexer_role(stack, log=log, watching=watching)
+            else:
+                _run_api_role(
+                    stack,
+                    log=log,
+                    host=host if host is not None else base.api_host,
+                    port=port if port is not None else base.api_port,
+                    watching=watching,
                 )
-                init_project_labels(settings.project_id)
-                if watch:
-                    # The observer + dispatcher are daemon threads that die with this stdio
-                    # process; stop() in the finally drains them on a clean detach. One
-                    # watcher per served vault — they share the store and the vector store,
-                    # and each owns its own debounce/worker pool.
-                    assert ctx is not None  # `watch` opened the store above
-                    watcher = VaultWatcher(
-                        ctx,
-                        debounce_seconds=settings.watch_debounce_seconds,
-                        workers=settings.watch_workers,
-                    )
-                    watchers.append(watcher)
-                    watcher.start()
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        log.error("serve.failed", projects=project_ids, error=str(exc))
+        typer.echo(f"serve failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
-            server = build_mcp_server(
-                projects=served,
-                vector_store=vector_store,
-                sparse=Bm25Embedder(),
-                reranker=reranker,
-                graph_store=store if any(p.graph_enabled for p in served) else None,
-                meta_store=store,
-                # Shared, like every other project_id-scoped store; the per-project
-                # decision to record at all rides on ServedProject.query_log.
-                query_log_sink=store if any(p.query_log is not None for p in served) else None,
-            )
-        # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
-        # client that resolves/binds something at construction; sqlite3.Error = an
-        # unopenable write/watch store. Either way the fix is the operator's, so fail with a
-        # readable line rather than a stdio traceback.
-        except (ValueError, OSError, sqlite3.Error) as exc:
-            log.error(
-                "mcp.failed",
-                projects=[s.project_id for s in served_settings],
-                error=str(exc),
-            )
-            typer.echo(f"mcp failed: {exc}", err=True)
-            raise typer.Exit(code=1) from exc
-        log.info(
-            "mcp.serve",
-            projects=[s.project_id for s in served_settings],
-            transport="stdio",
-            watching=watch,
-            writing=[p.project_id for p in served if p.writer is not None],
+
+def _run_api_role(
+    stack: ServedStack, *, log: FilteringBoundLogger, host: str, port: int, watching: bool
+) -> None:
+    """Bind uvicorn over the app built around the already-constructed service."""
+    import uvicorn
+
+    from vaultrag.api import create_app
+
+    app_ = create_app(stack.service, api_key=stack.base.api_key or None)
+    if app_.state.key_was_minted:
+        # Printed to stdout, once: `serve` owns its stdout (unlike `mcp`), and a key that
+        # exists only in a log line the operator has to go find is a key they will work
+        # around by disabling auth. Naming the env var makes the next restart stable.
+        typer.echo(f"API key (ephemeral — set VAULTRAG_API_KEY to fix it): {app_.state.api_key}")
+    typer.echo(f"serving http://{host}:{port}  (docs: /docs, health: /healthz)")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        # Not a refusal — an operator behind Tailscale has a real reason — but the security
+        # model's default is loopback, so a wider bind should never be silent.
+        typer.echo(
+            f"warning: bound to {host}, not loopback. The API is protected by one bearer "
+            "key and no TLS; put it behind Tailscale/WireGuard, not the open internet.",
+            err=True,
         )
-        try:
-            server.run(transport="stdio", show_banner=False)  # blocks until client detaches
-        except KeyboardInterrupt:
-            log.info("mcp.stopped", projects=[s.project_id for s in served_settings])
-    finally:
-        for watcher in watchers:
-            watcher.stop()
-        for closer in (*embedders, vector_store, store):
-            if closer is not None:
-                closer.close()
+    log.info(
+        "serve.start",
+        role="api",
+        projects=[p.project_id for p in stack.service.projects],
+        host=host,
+        port=port,
+        watching=watching,
+    )
+    try:
+        uvicorn.run(app_, host=host, port=port, log_config=None)
+    except KeyboardInterrupt:
+        log.info("serve.stopped", role="api")
+
+
+def _run_indexer_role(stack: ServedStack, *, log: FilteringBoundLogger, watching: bool) -> None:
+    """Reconcile every served vault, then block while the watchers run."""
+    if not watching:
+        # A one-shot reconcile with no watcher is `vaultrag reindex`; saying so is more
+        # useful than blocking forever on a process with nothing to do.
+        typer.echo(
+            "serve --role indexer --no-watch has nothing to run after startup; "
+            "use `vaultrag reindex` for a one-shot reconcile.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    log.info(
+        "serve.start",
+        role="indexer",
+        projects=[p.project_id for p in stack.service.projects],
+        watching=True,
+    )
+    typer.echo(f"indexing {len(stack.service.projects)} project(s) (Ctrl-C to stop)…")
+    try:
+        threading.Event().wait()  # block main thread; interruptible by Ctrl-C
+    except KeyboardInterrupt:
+        typer.echo("stopping…")
+        log.info("serve.stopped", role="indexer")
 
 
 # --- project registry subcommands (P3 Stage 2) ------------------------------

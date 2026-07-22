@@ -8,10 +8,64 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P3 IN PROGRESS — Stages 1, 2 and 3 all DONE (2026-07-22); Stage 4 (`serve`)
-NOT started.** P2 is COMPLETE (all 7 stages + the 4-bug audit). **Stage 2 is merged to `main`
-(PR #15, `03bce8f`) — Anik merged it mid-session.** Stage 3 sits on branch
-**`feat/p3-stage3-query-log`**. Plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
+- **Phase:** **P3 IN PROGRESS — Stages 1, 2, 3 and 4 all DONE (2026-07-22); Stage 5 (api
+keys/scopes/rate limits) NOT started.** P2 is COMPLETE (all 7 stages + the 4-bug audit).
+**Stages 2 and 3 are both merged to `main` (PR #15 `03bce8f`, PR #16 `c938875`) — Anik
+merged both himself.** Stage 4 sits on branch **`feat/p3-stage4-serve`**, unpushed. Plan at
+`../Rag/projects/vaultrag/p3-step-plan.md`.
+- **P3 STAGE 4 (`serve` — FastAPI `/v1`, `ROLE` switch, `/metrics` mounted) COMPLETE
+2026-07-22.** **Green: 851 tests (+62), ruff, mypy (67 src files), gate unmoved
+1.000/0.892/0.920.** **Decision 4 implemented as recommended** (single bootstrap key from
+env, required on every route but `/healthz`; Stage 5 grows it in place).
+  - **The stage's real content was a refactor the plan did not name.** "A thin wrapper over
+  the same core" was true of retrieval and false of everything else — parent-resolver
+  wiring, compact mode, the query-log policy, vault containment, `overview`'s caps and
+  write-refusal translation all lived inside the FastMCP tool closures. New
+  **`service.py`** (every operation once + transport-neutral `ServiceError` hierarchy +
+  `ServedProject` + the single tenancy enforcement point) and **`composition.py`**
+  (`Settings` → a live closable stack, so `serve` and `mcp` build **one** stack the same
+  way). `mcp/server.py` keeps only tool schemas + `ToolError` rendering.
+  - **The parity test was VACUOUS on first write; mutation testing is what said so.**
+  Comparing responses alone passed with `filters=None` hard-coded into the REST route,
+  because the fake vector store returns preset hits regardless of filter. Strengthened to
+  assert on the recorded `query()` **kwargs** — what each transport asked the engine for.
+  Three mutations now die: drop `filters` (1 test), drop `heading` (2), remove auth (12).
+  Also verified **cross-process** against the live vault: real `vaultrag serve` vs
+  in-process MCP returned byte-identical payloads through real Qdrant + Ollama.
+  - **Stage 3's placement paid off with ZERO Stage 4 code**, verified live: a REST search
+  wrote a `query_log` row carrying `top_score`, exactly as MCP does. Metrics likewise.
+  - **A real bug the EXISTING tests caught: the naive startup drift check made `vaultrag
+  mcp` require a live Qdrant to launch.** Six CLI tests that point at a dead Qdrant on
+  purpose went red — and they were right. The gate exists because drift is *silent*; a
+  Qdrant that answers nothing is the least silent failure there is, so refusing to boot
+  trades a loud recoverable error for a dead agent session. Now an unreachable store is
+  **unknown, not drifted**: skip, log, leave the gauge unset (publishing 0 would be a lie).
+  New `vaultrag_index_drift_chunks{project}` — a **gauge**, since drift is a state
+  `reindex --force` clears.
+  - **Endpoints:** all of `reference-rest-api.md` except **`POST /v1/projects`**, which is
+  the one deliberately-deferred endpoint (**501**, naming `vaultrag project add`) because
+  hot-adding a tenant to a live process is a resource-lifecycle *and* an admin-scope (Stage
+  5) question, and that mutation must not land next to the tenancy boundary.
+  `POST /v1/{project}/reindex` **is** built: `path` → sync single-file (200), no path →
+  background full reconcile (202), single-flight (409), no ingest context → 403.
+  - **Dependency weight, measured before committing** (as Docling/prometheus-client were):
+  FastAPI is **+1 package / 904 KB** and nothing else — starlette, uvicorn, pydantic, anyio
+  are already fastmcp's deps, so `serve` reuses the ASGI stack MCP-over-http already ships.
+  Base dependency, not an extra.
+  - **Two vault notes written** (status `proposed`):
+  `agent-inbox/serve-transport-design-calls.md` (the 5 under-specified calls + the
+  `/metrics` key contradiction with `reference-security-model`) and
+  `agent-inbox/step-plans-outrank-the-design-notes-they-mention.md` (the dogfood finding
+  below).
+  - **DOGFOOD FINDING that generalizes Stage 3's.** 8 subsystem "how does X work" queries
+  on the live design vault: a `*-step-plan.md` ranks **#1 on 3/8**, and the subsystem's own
+  design note ranks #1 only **1/8**. Stage 3's `write-back-design.md` case was **not an
+  outlier — it was the first sighting of a pattern**: long documents that mention every
+  subsystem outrank the focused note about one. **Not a Stage 4 regression** (gate unmoved,
+  parity byte-identical, all 789 prior tests green; Stage 3 saw it on `main`). **The bigger
+  point: the Meridian gate corpus has no long cross-cutting documents, so this class of
+  failure is invisible to it by construction.** A one-command `--no-graph` A/B is the
+  cheapest next probe.
 - **P3 STAGE 3 (`query_log` + the mining loop) COMPLETE 2026-07-22.** **Green: 789 tests
 (+48), ruff, mypy (60), gate unmoved 1.000/0.892/0.920.** **Decision 2 was settled by Anik:
 option (a)** — nullable `query_text` column, `VAULTRAG_QUERY_LOG_TEXT` default **on** for
@@ -233,22 +287,25 @@ Write path: gated `NoteWriter` → git commit → synchronous `ingest_path`. Swa
 `Embedder`/`Reranker`/`VectorStore`/`MetaStore`/`SparseEmbedder`/`ParentResolver` protocols.
 **Green: `ruff`, `ruff format`, `mypy src` (41 files), `pytest` (315 tests).** Per-module detail
 lives in the code, `MEMORY-p1.md` (P1), and `MEMORY-p0.md` (P0).
-- **What's next: P3 STAGE 4 (`serve` — FastAPI `/v1`, the `ROLE` switch, `/metrics` mounted)**
-at `../Rag/projects/vaultrag/p3-step-plan.md`. Scope: the HTTP transport
-`reference-rest-api.md` specifies, as a **thin wrapper over the same core the MCP tools call**
-— the parity test (one query, MCP `search` and `POST /v1/{project}/search` return the same
-payload) is the stage's real acceptance criterion. Also closes the P2 carry-over: a startup
-**drift check** + drift gauge, so neither `serve` nor `mcp` can silently serve an index that
-disagrees with the manifest. Stage 3 already put the query log in the core pipeline, so the REST
-surface inherits per-query rows for free — that was the point of the placement.
-  **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7), (4) `serve`
-  bootstrap key (**Stage 4** — a ratification of the recommended default, not a blocker),
-  (5) Docker base/formats split (Stage 6). Decisions 2 and 3 are **settled**. Three
-  `agent-inbox/` notes await a ruling: `compression-similarity-is-lexical-not-vector.md`
-  (Stage 1), `overview-tool-shape.md` (Stage 2), and
-  `query-log-stores-text-opt-in.md` (Stage 3 — note its **`top_score` section flags a second
-  supersession that went beyond what was ratified**, and is the one part of Stage 3 that most
-  wants a look). **Dogfooding:** the `vaultrag` MCP server has
+- **What's next: P3 STAGE 5 (API keys, scopes, rate limits — tenancy hardening)**
+at `../Rag/projects/vaultrag/p3-step-plan.md`. Scope: `reference-security-model.md`'s auth
+model on top of Stage 4 — `api_keys` table, **argon2 at rest**, per-project scopes crossed
+with read|write|admin, per-key token buckets, `vaultrag key add|list|revoke`. **The
+enforcement point already exists**: `api/deps.py`'s `require_key` is attached to the router
+as a whole (so a new endpoint is authenticated by default), which means Stage 5 replaces the
+*body* of one function rather than touching every route. Its verify block is the adversarial
+set — a key scoped to A cannot reach B by any route, path param, body filter, or wildcard.
+  **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7) and
+  (5) Docker base/formats split (Stage 6). Decisions 2, 3 and 4 are **settled/implemented**.
+  Five `agent-inbox/` notes await a ruling:
+  `compression-similarity-is-lexical-not-vector.md` (Stage 1), `overview-tool-shape.md`
+  (Stage 2), `query-log-stores-text-opt-in.md` (Stage 3 — its **`top_score` section flags a
+  supersession that went beyond what was ratified**), and two from Stage 4:
+  `serve-transport-design-calls.md` (the `/metrics`-needs-a-key call is the one that
+  reinterprets a `reference/` note, and the `POST /v1/projects` 501 is the one endpoint not
+  built) and `step-plans-outrank-the-design-notes-they-mention.md` (**the one worth reading
+  first — it is a measured retrieval-quality finding, and it says the gate corpus is missing
+  a document shape, not just eight golden cases**). **Dogfooding:** the `vaultrag` MCP server has
   been run
   against the live `vaultrag-design` index in prior sessions — use `search`/`open` against
   `../Rag` while building and treat bad retrieval as a real bug report (repo `CLAUDE.md` §1). To
@@ -288,7 +345,78 @@ Prepend newest first. Template:
 
 ## Session log
 
-### 2026-07-22 (latest) — P3 Stage 3: the query log, and the measurement that rebuilt it
+### 2026-07-22 (latest) — P3 Stage 4: `serve`, and the extraction that made parity structural
+
+- **Did:** Anik: *"if all the bug are resolve then move to next to stage."* Verified first
+rather than trusting this log — and it was stale again: **Anik had already merged Stage 3 as
+PR #16 (`c938875`)**, so the handoff's "unpushed, no PR" was wrong within the hour (third time
+running; check `git` before believing this file). Confirmed green on `main` (789 tests, ruff,
+mypy, gate PASS), branched `feat/p3-stage4-serve`, then built the HTTP transport.
+- **The plan's one-line framing hid the actual work.** "A thin wrapper over the same core the
+MCP tools call" was already true of *retrieval* and false of everything else: parent-resolver
+wiring, compact mode, the query-log policy, vault containment, `overview`'s caps and
+write-refusal translation all lived inside the FastMCP tool closures. A REST layer calling
+`retrieval.search` directly would have re-derived every one — and the parity test would then
+have been a coincidence, not a property. So the operations moved to **`service.py`**, the
+stack construction to **`composition.py`**, and both transports became adapters. **The point
+is structural: there is one thing answering, so the two front doors cannot disagree.**
+- **My parity test was vacuous, and mutation testing is the only reason I know.** Comparing
+responses passed even with `filters=None` hard-coded into the REST route — the fake vector
+store returns its preset hits regardless of the filter, so the payloads matched while the
+filter was being thrown away. Rewritten to assert on the recorded `query()` **kwargs**: what
+each transport asked the *engine* for. Three mutations now die (filters 1, heading 2, auth
+12). This is the Stage-2 lesson again — *a test that passes for the wrong reason is worse
+than none* — and it would have shipped as a green acceptance criterion for a claim it did not
+check.
+- **A real bug, caught by tests I did not write.** The naive startup drift check made
+`vaultrag mcp` require a live Qdrant to launch; six pre-existing CLI tests point at a dead
+Qdrant on purpose and went red. They were right. The gate exists because drift is **silent** —
+and a Qdrant that answers nothing is the least silent failure there is, so refusing to boot
+would trade a loud recoverable error for a dead agent session. An unreachable store is now
+**unknown, not drifted** (skip + log + leave the gauge unset; publishing `0` would be a lie).
+- **Stage 3's placement paid off with zero code**, verified live: a REST search wrote a
+`query_log` row with `top_score`, identical to MCP's. Also verified parity **across
+processes** — a real `vaultrag serve` and an in-process MCP server returned byte-identical
+payloads for one query through real Qdrant + Ollama.
+- **One endpoint deliberately not built.** `POST /v1/projects` answers **501** naming
+`vaultrag project add`. Hot-adding a tenant to a live process is a resource-lifecycle
+question *and* an admin-scope (Stage 5) question, and that mutation does not belong next to
+the tenancy boundary this stage spent its effort consolidating. `reindex` **is** built.
+- **Dogfooding found the thing worth Anik's attention, and it is not about Stage 4.** Stage
+3's `write-back-design.md` miss was recorded as one golden-set case. Stage 4's first live
+parity query did the same for a different subsystem, so I measured it: **8 subsystem queries
+→ a `*-step-plan.md` is #1 on 3/8, and the subsystem's own design note is #1 on 1/8.** It is
+a pattern, not an outlier — long documents that mention every subsystem outrank the focused
+note about one. **Not a Stage 4 regression** (gate unmoved, parity byte-identical, 789 prior
+tests green, and Stage 3 saw it on `main`). The sharper consequence: **the Meridian gate
+corpus contains no long cross-cutting documents, so the gate cannot see this class of failure
+at all.** Two probe expectations of mine were wrong (`embedding-pipeline.md` was right and I
+said `embedding-strategy.md`); re-measured with verified paths before writing it up.
+- **Verified:** 851 tests (+62: 49 `test_api.py`, 8 CLI `serve`, 5 drift gate), ruff, ruff
+format, mypy (67 src files), **gate PASS 1.000 / 0.892 / 0.920 (unmoved)**. Live dogfood on
+`vaultrag-design` end to end: healthz/401/list_projects/overview/search/doc/related/metrics
++ every error shape. **Box back to its starting state:** dogfood query-log rows deleted (19
+— they were my probes), server stopped, only `vaultrag-design` registered, 61 docs, and
+**the design vault was never written to** (I did not exercise write-back against `../Rag`).
+- **Files:** `service.py` (new), `composition.py` (new), `api/{__init__,app,routes,deps,
+errors}.py` (new), `mcp/{server,__init__}.py` (thinned to a transport), `cli.py` (`serve` +
+`ROLE` + `--allow-drift`, `mcp` onto the shared stack), `config.py` (`Role` enum + 5 knobs),
+`metrics.py` (drift gauge), `pyproject.toml` (fastapi + explicit uvicorn); tests:
+`test_api.py` (new), `test_cli.py`, `test_consistency.py`, `test_mcp.py`, `test_metrics.py`;
+vault: `agent-inbox/serve-transport-design-calls.md` (new),
+`agent-inbox/step-plans-outrank-the-design-notes-they-mention.md` (new),
+`projects/vaultrag/p3-step-plan.md` (Stage 4 log).
+- **Next / handoff:** **Stage 5 (API keys, scopes, rate limits).** Nothing blocks it, and the
+enforcement point is already in place — `require_key` is attached to the router as a whole,
+so Stage 5 replaces one function body rather than touching every route. Stage 4 is committed
+on `feat/p3-stage4-serve`, **unpushed, no PR** (CLAUDE.md: push only when asked) — but Anik
+has merged the last two stages himself mid-session, so **check `main` before believing that**.
+The one thing worth his eyes before Stage 5:
+`agent-inbox/step-plans-outrank-the-design-notes-they-mention.md` — it is a measurement, it
+generalizes a finding he has already seen once, and its claim about the *gate corpus* matters
+more than the eight golden cases it hands over.
+
+### 2026-07-22 — P3 Stage 3: the query log, and the measurement that rebuilt it
 
 - **Did:** Anik: *"if stage 2 is fully implemented all the bugs are resolved then move to stage
 3."* Verified Stage 2 first (783→ suite green, gate PASS) and re-checked git rather than trusting
