@@ -150,6 +150,14 @@ class VectorStore(Protocol):
     def delete_by_doc(self, project_id: str, doc_id: str) -> None:
         """Delete every point of one document. Deleting nothing is not an error."""
 
+    def delete_by_project(self, project_id: str) -> None:
+        """Delete every point of one tenant — the vector half of deregistering a project.
+
+        Paired with :meth:`~vaultrag.store.base.MetaStore.delete_project`: the two derived
+        caches are lost independently, so removing a project must clear both or the vectors
+        outlive the documents. Deleting nothing is not an error.
+        """
+
     def query(
         self,
         *,

@@ -13,13 +13,17 @@ Tool surface (``../Rag/reference/reference-mcp-tools.md``, arch §16):
   (``../Rag/decisions/snippets-not-answers-by-default.md``); ``mode="compact"`` returns
   one-line previews for cheap browsing. ``mode="answer"`` is opt-in synthesis and lands
   at P3 per the roadmap (CLAUDE.md §4), so P0 does not advertise it in the schema.
-* ``open(path, heading?, lines?)`` — reads an exact slice of one note **straight from
-  the vault** (the source of truth — always at least as fresh as the index the citation
-  came from), not from Qdrant.
-* ``related(path, hops?, limit?)`` — the note's graph neighbourhood (links, backlinks,
-  tag-siblings) as paths + titles, from P2 Stage 2's ``links`` table. Registered only when
-  a graph store is supplied. Text-free by design: it is how an agent explores outward from
-  a hit without spending context (``retrieval/graph.py``).
+* ``open(path, project?, heading?, lines?)`` — reads an exact slice of one note **straight
+  from the vault** (the source of truth — always at least as fresh as the index the
+  citation came from), not from Qdrant.
+* ``related(path, project?, hops?, limit?)`` — the note's graph neighbourhood (links,
+  backlinks, tag-siblings) as paths + titles, from P2 Stage 2's ``links`` table. Registered
+  only when a graph store is supplied. Text-free by design: it is how an agent explores
+  outward from a hit without spending context (``retrieval/graph.py``).
+* ``list_projects()`` / ``overview(project?)`` — discovery and orientation (P3 Stage 2).
+  ``overview`` returns a project's *shape* — a depth-2 counted folder map and its top tags —
+  never a file listing, and is bounded by constants rather than by vault size
+  (``../Rag/agent-inbox/overview-tool-shape.md``).
 
 Tool descriptions are written *for models* — when to call, arg semantics, budget
 guidance — treated as seriously as retrieval quality
@@ -27,9 +31,14 @@ guidance — treated as seriously as retrieval quality
 
 Security posture:
 
-* **Tenancy** — the server is scoped to exactly one ``project_id`` at construction;
-  the optional ``project`` argument may only *name* that project, never switch it
-  (CLAUDE.md §6: a client can narrow, never widen).
+* **Tenancy** — the server answers for a fixed set of :class:`ServedProject` bundles fixed
+  at construction (P3 Stage 2: one process serves N — ``../Rag/projects/vaultrag/
+  multi-tenant-architecture.md``). The per-call ``project`` argument *selects* among them
+  and can never name one outside the set, so a client narrows and never widens
+  (CLAUDE.md §6). Everything tenant-specific — the vault root ``open`` reads, the writer
+  that accepts edits, the retrieval knobs — is carried on the selected bundle rather than
+  captured once from a process-wide flag, which is what keeps two projects in one process
+  from resolving each other's files.
 * **``open`` enforces the same gates as indexing** — vault containment (a resolved
   path, including through symlinks, must stay under the vault root), the built-in
   secret guard (filename + content), and ``.ragignore``. PDFs are indexable but not
@@ -48,8 +57,10 @@ against fastmcp 3.4 — a sync tool executes off the event-loop thread).
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
 from blake3 import blake3
 from fastmcp import FastMCP
@@ -69,7 +80,17 @@ from vaultrag.indexer.scan import (
 )
 from vaultrag.indexer.secret_guard import scan_for_secrets
 from vaultrag.logging import get_logger
-from vaultrag.models import BlockType, OpenResult, RelatedResult, SearchResult, WriteResult
+from vaultrag.models import (
+    BlockType,
+    FolderCount,
+    OpenResult,
+    OverviewResult,
+    ProjectSummary,
+    RelatedResult,
+    SearchResult,
+    TagCount,
+    WriteResult,
+)
 from vaultrag.parsing import heading_section, parse_document
 from vaultrag.parsing.excalidraw import (
     is_excalidraw_source,
@@ -133,6 +154,93 @@ _EXCLUSION_MESSAGES: dict[ExclusionReason, str] = {
 }
 
 
+# `overview`'s bounds. Depth 2 is the taxonomy of an Obsidian vault (this repo's own design
+# vault folds to 7 entries at depth 2); depth 3 starts listing contents, which is what
+# `search` is for. Both caps make the response flat in vault size — the reasoning and the
+# measurement are in `../Rag/agent-inbox/overview-tool-shape.md`.
+_OVERVIEW_FOLDER_DEPTH = 2
+_OVERVIEW_FOLDER_LIMIT = 50
+_OVERVIEW_TAG_LIMIT = 20
+
+
+@runtime_checkable
+class OverviewStore(Protocol):
+    """The slice of the metadata store ``overview`` reads — three per-project aggregates.
+
+    Structurally satisfied by :class:`~vaultrag.store.sqlite.SQLiteMetaStore`, and declared
+    narrowly for the same reason :class:`~vaultrag.retrieval.graph.GraphStore` is: the tool
+    depends on three read methods rather than the whole ``MetaStore`` write surface, and a
+    test can hand it a stub.
+
+    Note what is *not* here: any vector-store call. ``overview`` is a SQLite-only tool, so
+    it still answers "what is actually in this project?" on a deployment whose Qdrant is
+    down — which is one of the states in which that question is most worth asking.
+    """
+
+    def document_count(self, project_id: str) -> int: ...
+
+    def folder_counts(
+        self, project_id: str, depth: int = 2, limit: int = 50
+    ) -> list[tuple[str, int]]: ...
+
+    def top_tags(self, project_id: str, limit: int = 20) -> list[tuple[str, int]]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ServedProject:
+    """Everything one tenant needs, bundled — the unit ``build_mcp_server`` serves N of.
+
+    This is the whole of P3 Stage 2's "one process serves N projects": the per-call
+    ``project`` argument selects a bundle, and every tenant-specific decision downstream
+    reads it off the bundle instead of off a process-wide flag. The split between what lives
+    here and what is passed to :func:`build_mcp_server` once is not cosmetic:
+
+    * **Per project** — ``vault_root`` (what ``open`` may read), ``writer`` (what may be
+      edited, under whose write root), ``vault_name`` (citation URIs), and the retrieval
+      knobs, because :class:`~vaultrag.projects.ProjectRegistry` resolves a full
+      :class:`~vaultrag.config.Settings` per project and those are the parts of it a served
+      request can differ on. ``embedder`` too: per-project embedding models are
+      ``../Rag/projects/vaultrag/multi-tenant-architecture.md``'s explicit design (at a
+      shared width — see ``projects._RESERVED_SETTINGS``).
+    * **Shared** — the vector store, the sparse embedder, the reranker and the metadata
+      store, all of which are already ``project_id``-scoped on every call (Qdrant's
+      ``_build_filter`` makes it an unconditional ``must``) and would only waste memory
+      duplicated per tenant.
+
+    ``vault_root`` is resolved on construction: containment checks compare against it, and a
+    relative or symlinked root would quietly weaken every one of them.
+    """
+
+    project_id: str
+    vault_root: Path
+    embedder: QueryEmbedder
+    name: str | None = None
+    vault_name: str | None = None
+    writer: NoteWriter | None = None
+    default_k: int = DEFAULT_K
+    default_budget_tokens: int = DEFAULT_BUDGET_TOKENS
+    rerank_params: RerankParams | None = None
+    parent_swap_enabled: bool = False
+    parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS
+    graph_params: GraphExpandParams = field(default_factory=GraphExpandParams)
+    graph_enabled: bool = True
+    compress_params: CompressParams | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "vault_root", Path(self.vault_root).resolve())
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.project_id
+
+
+#: What every tool calls to turn a caller's ``project`` argument into the bundle it is
+#: allowed to use. There is exactly one implementation, closed over the served set inside
+#: :func:`build_mcp_server`, and the helpers below take it rather than the set — so no
+#: second place can grow its own idea of which projects a caller may reach.
+_Select = Callable[[str | None], ServedProject]
+
+
 class SearchFiltersParam(BaseModel):
     """Client-suppliable narrowing filters for ``search`` — the MCP-boundary twin of
     :class:`~vaultrag.index.base.SearchFilters`.
@@ -179,68 +287,104 @@ class SearchFiltersParam(BaseModel):
 
 def build_mcp_server(
     *,
-    project_id: str,
-    vault_path: Path,
+    projects: Sequence[ServedProject],
     vector_store: VectorStore,
-    embedder: QueryEmbedder,
     sparse: SparseEmbedder,
-    default_k: int = DEFAULT_K,
-    default_budget_tokens: int = DEFAULT_BUDGET_TOKENS,
     reranker: Reranker | None = None,
-    rerank_params: RerankParams | None = None,
-    parent_swap_enabled: bool = False,
-    parent_max_tokens: int = DEFAULT_PARENT_MAX_TOKENS,
     graph_store: GraphStore | None = None,
-    graph_params: GraphExpandParams | None = None,
-    compress_params: CompressParams | None = None,
-    vault_name: str | None = None,
-    writer: NoteWriter | None = None,
+    meta_store: OverviewStore | None = None,
 ) -> FastMCP:
     """Assemble the VaultRAG MCP server around already-built dependencies.
 
-    ``default_k``/``default_budget_tokens`` come from :class:`~vaultrag.config.Settings`
-    at the composition root, so the served defaults are env-configurable — the tool
-    schema advertises the *parameters*; the running server owns their defaults.
+    ``projects`` is the set of tenants this process answers for — one
+    :class:`ServedProject` each, carrying that project's vault root, writer, embedder and
+    retrieval knobs (the CLI builds them from
+    :class:`~vaultrag.projects.ProjectRegistry`-resolved settings, so the served defaults
+    are per-project and env-configurable; the tool schema advertises the *parameters*, the
+    running server owns their defaults). With exactly one, omitting a call's ``project``
+    argument means that one and the surface behaves exactly as it did before P3 Stage 2;
+    with several, ``project`` becomes required rather than silently defaulting to whichever
+    happened to be first.
 
-    ``reranker`` (+ ``rerank_params``) is the stage-4 cross-encoder; ``None`` runs the
-    fusion-only P0 path. The CLI builds it from settings and degrades to a no-op reranker
-    if the model can't be loaded, so the server always comes up.
+    The remaining arguments are what every tenant shares, because each is already
+    ``project_id``-scoped per call:
 
-    ``parent_swap_enabled`` turns on retrieval stage 5: a retrieved child is swapped for its
-    enclosing section, reconstructed live from the vault through ``open``'s *own* gated
-    reader — so parent-swap can never surface a file ``open`` would refuse (CLAUDE.md §6).
-    It runs in ``snippets`` mode only; ``compact`` (browse-by-preview) skips the vault reads.
+    ``reranker`` is the stage-4 cross-encoder; ``None`` runs the fusion-only P0 path. The
+    CLI builds it from settings and degrades to a no-op reranker if the model can't be
+    loaded, so the server always comes up.
 
     ``graph_store`` turns on retrieval stage 6 **and** registers the ``related`` tool — both
     read P2 Stage 2's ``links`` table (``retrieval/graph.py``). ``None`` (a deployment with no
     metadata store, or one indexed before Stage 2) simply omits both: search still works, it
     just carries no ``related`` pointers, and no tool advertises a graph that isn't there.
 
-    ``compress_params`` tunes retrieval stage 7 (near-dupe drop, MMR diversity, per-doc cap,
-    trim — ``retrieval/compress.py``); ``None`` uses the shipped defaults. It runs in both
-    modes, but in ``compact`` the pipeline runs unbounded and the previews are re-packed by
-    ``_compact`` afterwards, so the budget still applies to what the agent actually browses.
+    ``meta_store`` registers ``overview`` on the same principle — no store, no tool, rather
+    than a tool that answers zero for everything. It is the same SQLite store ``graph_store``
+    usually is; the two are separate parameters because they are separate *capabilities*
+    (``related`` needs a link graph, ``overview`` needs document/tag aggregates) and a
+    deployment can have one without the other.
 
-    ``vault_name`` is the Obsidian display name used to build ``obsidian://open`` citation
-    URIs (retrieval stage 8); ``None`` omits them. The CLI resolves it from settings, falling
-    back to the vault directory name so a served snippet is always one click from Obsidian.
-
-    ``writer`` turns on the P1 Stage 5 write tools (``write_note`` / ``append_section`` /
-    ``patch_frontmatter``): with a :class:`~vaultrag.writeback.NoteWriter`, an agent can
-    record what it learns and retrieve it the same session (the memory loop). ``None`` keeps
-    the server read-only — a deployment that shouldn't accept writes simply passes nothing.
+    Per-project stages, for reference: ``parent_swap_enabled`` turns on retrieval stage 5,
+    where a retrieved child is swapped for its enclosing section reconstructed live from the
+    vault through ``open``'s *own* gated reader — so parent-swap can never surface a file
+    ``open`` would refuse (CLAUDE.md §6); it runs in ``snippets`` mode only. ``compress_params``
+    tunes stage 7 (``retrieval/compress.py``), and ``vault_name`` stamps ``obsidian://open``
+    citation URIs (stage 8). A project's ``writer`` turns on the P1 Stage 5 write tools for
+    *that* project: with one, an agent can record what it learns and retrieve it the same
+    session (the memory loop); without, that project is served read-only.
     """
-    vault_root = vault_path.resolve()
+    if not projects:
+        raise ValueError("build_mcp_server needs at least one ServedProject to serve")
+    by_id: dict[str, ServedProject] = {}
+    for served in projects:
+        if served.project_id in by_id:
+            raise ValueError(f"duplicate project in served set: {served.project_id!r}")
+        by_id[served.project_id] = served
+    # The lone project is the implicit default; with several there is no defensible default,
+    # so `project` becomes mandatory. Guessing here would mean a forgotten argument silently
+    # queries the wrong vault — the one failure mode multi-tenancy must not have.
+    solo = projects[0] if len(projects) == 1 else None
+    served_ids = ", ".join(sorted(by_id))
 
+    def _select(project: str | None) -> ServedProject:
+        """Resolve a call's ``project`` argument to the bundle it may use, or refuse.
+
+        The single enforcement point for CLAUDE.md §6's "a client can narrow, never widen":
+        every tool routes through it, and nothing downstream takes a project id from the
+        caller again.
+        """
+        if project is None:
+            if solo is not None:
+                return solo
+            raise ToolError(
+                f"this server serves several projects — pass `project` (one of: {served_ids})"
+            )
+        found = by_id.get(project)
+        if found is None:
+            raise ToolError(
+                f"project {project!r} is not served by this server — tenancy is enforced "
+                f"server-side. Available: {served_ids}."
+            )
+        return found
+
+    if solo is not None:
+        scope = f"the {solo.project_id!r} Obsidian vault"
+        multi = ""
+    else:
+        scope = f"{len(by_id)} Obsidian vaults ({served_ids})"
+        multi = (
+            " This server holds several projects, so every tool takes a `project` "
+            "argument — call `list_projects` first if you do not know which one you want."
+        )
     mcp = FastMCP(
         name="vaultrag",
         instructions=(
-            f"Cited-snippet retrieval over the {project_id!r} Obsidian vault. Before "
+            f"Cited-snippet retrieval over {scope}. Before "
             "designing, debugging, or answering questions about this project, call "
             "`search` first with one focused query — prefer that over reading many "
             "files. Follow a citation with `open` (its `path`, plus its `anchor` as "
             "`heading`) when the snippet alone is not enough context, or with `related` "
-            "(its `path`) to see what the vault links to it."
+            f"(its `path`) to see what the vault links to it.{multi}"
         ),
     )
 
@@ -258,8 +402,10 @@ def build_mcp_server(
         project: Annotated[
             str | None,
             Field(
-                description="Optional project scope. This server serves exactly one "
-                "project, so this may only name that project; anything else is refused."
+                description="Which project/vault to search. Optional when this server "
+                "serves exactly one (then it may only name that one); required when it "
+                "serves several — call list_projects to see them. Never widens scope: a "
+                "project this server does not serve is refused."
             ),
         ] = None,
         k: Annotated[
@@ -303,39 +449,38 @@ def build_mcp_server(
         follow up with open(path, heading=anchor) for the full section. `truncated`
         means lower-ranked hits existed but were dropped for `budget_tokens`.
         """
-        if project is not None and project != project_id:
-            raise ToolError(
-                f"this server is scoped to project {project_id!r} and cannot search "
-                f"project {project!r} — tenancy is enforced server-side; start another "
-                "`vaultrag mcp --project` instance for other projects"
-            )
+        sel = _select(project)
         t0 = time.perf_counter()
-        effective_budget = budget_tokens if budget_tokens is not None else default_budget_tokens
+        effective_budget = budget_tokens if budget_tokens is not None else sel.default_budget_tokens
         # Fresh resolver per call: its parse cache dedupes reads *within* one search but must
         # not persist across calls, or an edited note would resolve stale (open re-reads too).
         # Skipped in compact mode — browsing by preview shouldn't pay for section reconstruction.
+        # Bound to *this* project's vault root, so a multi-project server can never
+        # reconstruct a parent section out of a neighbouring tenant's files.
         parent_resolver = (
-            VaultParentResolver(read_note=lambda p: _read_note(vault_root, p)[1])
-            if parent_swap_enabled and mode == "snippets"
+            VaultParentResolver(read_note=lambda p: _read_note(sel.vault_root, p)[1])
+            if sel.parent_swap_enabled and mode == "snippets"
             else None
         )
         try:
             result = retrieval_search(
                 query,
-                project_id=project_id,
+                project_id=sel.project_id,
                 vector_store=vector_store,
-                embedder=embedder,
+                embedder=sel.embedder,
                 sparse=sparse,
-                k=k if k is not None else default_k,
+                k=k if k is not None else sel.default_k,
                 filters=filters.to_filters() if filters is not None else None,
                 reranker=reranker,
-                rerank=rerank_params,
+                rerank=sel.rerank_params,
                 parent_resolver=parent_resolver,
-                parent_max_tokens=parent_max_tokens,
-                graph_store=graph_store,
-                graph=graph_params,
-                compress_params=compress_params,
-                vault_name=vault_name,
+                parent_max_tokens=sel.parent_max_tokens,
+                # Per-project: a tenant with graph expansion off gets the fusion-only path
+                # even though the process holds a link graph for its neighbours.
+                graph_store=graph_store if sel.graph_enabled else None,
+                graph=sel.graph_params,
+                compress_params=sel.compress_params,
+                vault_name=sel.vault_name,
                 # Compact mode budgets the *previews*, not the full texts: packing full
                 # texts first would silently drop hits the agent asked to browse (k),
                 # so retrieval runs unbounded and _compact re-packs to the real budget.
@@ -349,7 +494,7 @@ def build_mcp_server(
             result = _compact(result, budget_tokens=effective_budget)
         log.info(
             "mcp.search",  # q_hash, never the raw query, at info level (CLAUDE.md §5)
-            project=project_id,
+            project=sel.project_id,
             q_hash=blake3(query.encode("utf-8")).hexdigest()[:12],
             mode=mode,
             hits=len(result.snippets),
@@ -369,6 +514,14 @@ def build_mcp_server(
                 "gave it, e.g. 'projects/vaultrag/chunking-strategy.md'."
             ),
         ],
+        project: Annotated[
+            str | None,
+            Field(
+                description="Which project's vault the path is in. Optional when this "
+                "server serves one project; required when it serves several — pass the "
+                "same project you searched, or the path will not resolve."
+            ),
+        ] = None,
         heading: Annotated[
             str | None,
             Field(
@@ -394,12 +547,16 @@ def build_mcp_server(
         `lines=[start, end]` to page. Omit both for the whole note — very large notes
         come back with `truncated: true`; narrow with `heading`/`lines` then.
         """
+        sel = _select(project)
         if heading is not None and lines is not None:
             raise ToolError("pass `heading` or `lines`, not both")
         if heading is not None and not heading.strip():
             raise ToolError("`heading` must be non-empty when given")
 
-        rel, text = _read_note(vault_root, path)
+        # Resolved against the *selected* project's root — the failure mode this whole
+        # per-call plumbing exists to prevent is one project reading another's files
+        # through a root captured once at construction (p3-step-plan Stage 2 verify).
+        rel, text = _read_note(sel.vault_root, path)
         source_lines = text.splitlines()
         total = len(source_lines)
         # Parse once, for every mode: `heading` needs the block tree, and `title` is
@@ -446,6 +603,7 @@ def build_mcp_server(
         )
         log.info(
             "mcp.open",
+            project=sel.project_id,
             path=rel,
             line_start=result.line_start,
             line_end=result.line_end,
@@ -454,19 +612,109 @@ def build_mcp_server(
         )
         return result
 
-    if graph_store is not None:
-        _register_related_tool(
-            mcp,
-            project_id=project_id,
-            vault_root=vault_root,
-            graph_store=graph_store,
-            params=graph_params if graph_params is not None else GraphExpandParams(),
-            vault_name=vault_name,
-        )
-    if writer is not None:
-        _register_write_tools(mcp, writer)
+    _register_project_tools(
+        mcp, projects=list(by_id.values()), select=_select, meta_store=meta_store
+    )
+    # Registered when the process holds a link graph *and* at least one served project uses
+    # it; a call naming a graph-disabled project is refused inside the tool, the same
+    # per-project shape the write tools use.
+    if graph_store is not None and any(p.graph_enabled for p in projects):
+        _register_related_tool(mcp, select=_select, graph_store=graph_store)
+    # Registered when *any* served project is writable; a call naming a read-only one is
+    # refused per-project. The alternative — hiding the tools whenever a single tenant is
+    # read-only — would take the memory loop away from the projects that do have it.
+    if any(p.writer is not None for p in projects):
+        _register_write_tools(mcp, select=_select)
 
     return mcp
+
+
+# ---------------------------------------------------------------------------
+# Discovery + orientation (P3 Stage 2).
+# ---------------------------------------------------------------------------
+def _register_project_tools(
+    mcp: FastMCP,
+    *,
+    projects: Sequence[ServedProject],
+    select: _Select,
+    meta_store: OverviewStore | None,
+) -> None:
+    """Attach ``list_projects`` (always) and ``overview`` (with a metadata store).
+
+    ``list_projects`` is registered even on a single-project server: it is how an agent
+    learns the ``project`` string to pass, and answering "just this one" is a real answer
+    that costs a few tokens. ``overview`` follows ``related``'s rule — no store, no tool.
+    """
+
+    @mcp.tool
+    def list_projects() -> list[ProjectSummary]:
+        """List the projects (vaults) this server can search — start here if unsure.
+
+        Every other tool's `project` argument must name one of these. On a single-project
+        server the argument is optional and this returns that one project. `notes` is the
+        indexed document count (null if this server keeps no metadata store); `writable`
+        says whether write_note/append_section/patch_frontmatter accept that project.
+        """
+        summaries = [
+            ProjectSummary(
+                id=p.project_id,
+                name=p.display_name,
+                notes=None if meta_store is None else meta_store.document_count(p.project_id),
+                writable=p.writer is not None,
+            )
+            for p in projects
+        ]
+        log.info("mcp.list_projects", projects=len(summaries))
+        return summaries
+
+    if meta_store is None:
+        return
+
+    @mcp.tool
+    def overview(
+        project: Annotated[
+            str | None,
+            Field(
+                description="Which project to describe. Optional when this server serves "
+                "exactly one; required when it serves several."
+            ),
+        ] = None,
+    ) -> OverviewResult:
+        """Orient yourself in a vault: how many notes, which folders, which tags.
+
+        Call this once at the start of a session on an unfamiliar project, instead of
+        listing files. It returns the vault's *shape* — folders (2 levels deep) and tags,
+        each with a note count — not a file listing, so it stays small however large the
+        vault is. Use what it returns as `search` filters: a folder path narrows by
+        `filters.paths`, a tag by `filters.tags`. To see actual content, use `search`.
+        """
+        sel = select(project)
+        # One over each cap, so "a cap bit" is observed rather than inferred from equality
+        # (a vault with exactly 50 folders is not truncated, and must not say it is).
+        folders = meta_store.folder_counts(
+            sel.project_id, depth=_OVERVIEW_FOLDER_DEPTH, limit=_OVERVIEW_FOLDER_LIMIT + 1
+        )
+        tags = meta_store.top_tags(sel.project_id, limit=_OVERVIEW_TAG_LIMIT + 1)
+        truncated = len(folders) > _OVERVIEW_FOLDER_LIMIT or len(tags) > _OVERVIEW_TAG_LIMIT
+        result = OverviewResult(
+            project=sel.project_id,
+            name=sel.display_name,
+            notes=meta_store.document_count(sel.project_id),
+            folders=[
+                FolderCount(path=path, notes=n) for path, n in folders[:_OVERVIEW_FOLDER_LIMIT]
+            ],
+            tags=[TagCount(tag=tag, notes=n) for tag, n in tags[:_OVERVIEW_TAG_LIMIT]],
+            truncated=truncated,
+        )
+        log.info(
+            "mcp.overview",
+            project=sel.project_id,
+            notes=result.notes,
+            folders=len(result.folders),
+            tags=len(result.tags),
+            truncated=truncated,
+        )
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -475,11 +723,8 @@ def build_mcp_server(
 def _register_related_tool(
     mcp: FastMCP,
     *,
-    project_id: str,
-    vault_root: Path,
+    select: _Select,
     graph_store: GraphStore,
-    params: GraphExpandParams,
-    vault_name: str | None,
 ) -> None:
     """Attach ``related`` — graph exploration over P2 Stage 2's ``links`` table.
 
@@ -499,6 +744,13 @@ def _register_related_tool(
                 "it, e.g. 'projects/vaultrag/chunking-strategy.md'."
             ),
         ],
+        project: Annotated[
+            str | None,
+            Field(
+                description="Which project's graph to explore. Optional when this server "
+                "serves one project; required when it serves several."
+            ),
+        ] = None,
         hops: Annotated[
             int,
             Field(
@@ -526,25 +778,31 @@ def _register_related_tool(
         wikilinks in the note that point at nothing indexed — a broken link, or a note not
         written yet.
         """
-        rel = _vault_relative(vault_root, path)
-        document = graph_store.get_document(project_id, rel)
+        sel = select(project)
+        if not sel.graph_enabled:
+            raise ToolError(
+                f"project {sel.project_id!r} has graph expansion disabled, so it exposes no "
+                "link graph — use `search` instead"
+            )
+        rel = _vault_relative(sel.vault_root, path)
+        document = graph_store.get_document(sel.project_id, rel)
         if document is None:
             raise ToolError(
-                f"{rel!r} is not indexed in project {project_id!r} — pass a path exactly as "
-                "a search citation gave it (the graph only knows indexed notes)"
+                f"{rel!r} is not indexed in project {sel.project_id!r} — pass a path exactly "
+                "as a search citation gave it (the graph only knows indexed notes)"
             )
         notes, unresolved, truncated = related_notes(
-            project_id=project_id,
+            project_id=sel.project_id,
             doc_id=document.id,
             store=graph_store,
             hops=hops,
             limit=limit,
-            max_tag_siblings=params.max_tag_siblings,
-            vault_name=vault_name,
+            max_tag_siblings=sel.graph_params.max_tag_siblings,
+            vault_name=sel.vault_name,
         )
         log.info(
             "mcp.related",
-            project=project_id,
+            project=sel.project_id,
             path=rel,
             hops=hops,
             notes=len(notes),
@@ -565,15 +823,29 @@ def _register_related_tool(
 # ---------------------------------------------------------------------------
 # Write tools (P1 Stage 5) — registered only when a NoteWriter is supplied.
 # ---------------------------------------------------------------------------
-def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
+def _register_write_tools(mcp: FastMCP, *, select: _Select) -> None:
     """Attach ``write_note`` / ``append_section`` / ``patch_frontmatter`` to ``mcp``.
 
-    Each tool is a thin boundary over the :class:`~vaultrag.writeback.NoteWriter`: it
-    translates a :class:`~vaultrag.writeback.WriteRefused` into a plain ``ToolError`` (the
-    message is written for the agent) and a :class:`~vaultrag.writeback.WriteConflict` into
-    a 409-style error that echoes the current hash + content so the agent can rebase and
-    retry — no second read needed (``../Rag/projects/vaultrag/write-back-design.md``).
+    Each tool is a thin boundary over the selected project's
+    :class:`~vaultrag.writeback.NoteWriter`: it translates a
+    :class:`~vaultrag.writeback.WriteRefused` into a plain ``ToolError`` (the message is
+    written for the agent) and a :class:`~vaultrag.writeback.WriteConflict` into a 409-style
+    error that echoes the current hash + content so the agent can rebase and retry — no
+    second read needed (``../Rag/projects/vaultrag/write-back-design.md``).
+
+    Each writer owns its own vault, write root, git repo and rate limiter, so a
+    multi-project write is N independent commits rather than a distributed transaction
+    (one project = one vault dir = one git repo — [[multi-tenant-architecture]]).
     """
+
+    def _writer_for(project: str | None) -> NoteWriter:
+        sel = select(project)  # refuses an unserved project before anything else
+        if sel.writer is None:
+            raise ToolError(
+                f"project {sel.project_id!r} is served read-only — its write tools are "
+                "disabled (--no-write, or VAULTRAG_WRITEBACK_ENABLED=false)"
+            )
+        return sel.writer
 
     @mcp.tool
     def write_note(
@@ -603,6 +875,13 @@ def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
             list[str] | None,
             Field(description="Optional tags written to frontmatter (e.g. ['decision', 'auth'])."),
         ] = None,
+        project: Annotated[
+            str | None,
+            Field(
+                description="Which project's vault to write into. Optional when this "
+                "server serves one project; required when it serves several."
+            ),
+        ] = None,
     ) -> WriteResult:
         """Create a new note in the vault (defaults to agent-inbox/), committed + indexed.
 
@@ -611,6 +890,7 @@ def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
         note: pick a different title, or use append_section/patch_frontmatter. The result's
         `hash` is the `base_hash` for a later patch; `uri` opens the note in Obsidian.
         """
+        writer = _writer_for(project)
         try:
             return writer.write_note(title=title, content=content, folder=folder, tags=tags)
         except WriteConflict as exc:
@@ -639,6 +919,13 @@ def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
             str,
             Field(description="Markdown block to append to the section."),
         ],
+        project: Annotated[
+            str | None,
+            Field(
+                description="Which project's vault the note is in. Optional when this "
+                "server serves one project; required when it serves several."
+            ),
+        ] = None,
     ) -> WriteResult:
         """Append a Markdown block to a heading's section in an existing note, then reindex.
 
@@ -646,6 +933,7 @@ def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
         base_hash lock. Use it to grow a running note (a log, a checklist). Fails if the
         heading isn't found (the error lists the note's real headings).
         """
+        writer = _writer_for(project)
         try:
             return writer.append_section(path=path, heading=heading, content=content)
         except WriteConflict as exc:
@@ -676,6 +964,13 @@ def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
                 "matches, the call fails and returns the current hash + content to rebase on."
             ),
         ],
+        project: Annotated[
+            str | None,
+            Field(
+                description="Which project's vault the note is in. Optional when this "
+                "server serves one project; required when it serves several."
+            ),
+        ] = None,
     ) -> WriteResult:
         """Set frontmatter keys on an existing note under an optimistic lock, then reindex.
 
@@ -683,6 +978,7 @@ def _register_write_tools(mcp: FastMCP, writer: NoteWriter) -> None:
         call fails with the current hash and content — re-read, merge, and retry with the new
         base_hash. This is the only write tool that requires the lock (it mutates in place).
         """
+        writer = _writer_for(project)
         try:
             return writer.patch_frontmatter(path=path, updates=updates, base_hash=base_hash)
         except WriteConflict as exc:

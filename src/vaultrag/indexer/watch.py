@@ -331,7 +331,7 @@ class VaultWatcher:
                     self._sleep(self._retry_backoff * (2**attempt))
                 continue
             self._ctx.store.set_job_state(job_id, JobState.done)
-            record_ingest(str(outcome.status))
+            record_ingest(str(outcome.status), project=self._ctx.project_id)
             self._observe_lag(path, outcome)
             log.info(
                 "watch.reconciled",
@@ -361,7 +361,9 @@ class VaultWatcher:
         started = self._first_dirty.pop(path, None)
         if started is None or outcome.status not in (IngestStatus.indexed, IngestStatus.removed):
             return
-        record_ingest_lag(max(0.0, self._clock() - started), source="watch")
+        record_ingest_lag(
+            max(0.0, self._clock() - started), source="watch", project=self._ctx.project_id
+        )
 
     # --- draining / test hooks ------------------------------------------------
     def flush(self) -> None:

@@ -35,7 +35,7 @@ from vaultrag.index import QdrantVectorStore
 from vaultrag.index.base import ScoredChunk, SearchFilters
 from vaultrag.indexer.pipeline import IngestContext
 from vaultrag.indexer.scan import ExclusionReason
-from vaultrag.mcp import build_mcp_server
+from vaultrag.mcp import ServedProject, build_mcp_server
 from vaultrag.mcp.server import _EXCLUSION_MESSAGES, SearchFiltersParam, _apply_cap
 from vaultrag.models import DocumentMetadata, Link, LinkKind, document_id
 from vaultrag.retrieval import obsidian_uri
@@ -115,15 +115,19 @@ def build(
     embedder = embedder or FakeEmbedder()
     sparse = sparse or FakeSparse()
     server = build_mcp_server(
-        project_id=PROJECT,
-        vault_path=vault,
+        projects=[
+            ServedProject(
+                project_id=PROJECT,
+                vault_root=vault,
+                embedder=QueryEmbedder(embedder),
+                default_k=default_k,
+                default_budget_tokens=default_budget_tokens,
+                parent_swap_enabled=parent_swap_enabled,
+                vault_name=vault_name,
+            )
+        ],
         vector_store=store,
-        embedder=QueryEmbedder(embedder),
         sparse=sparse,
-        default_k=default_k,
-        default_budget_tokens=default_budget_tokens,
-        parent_swap_enabled=parent_swap_enabled,
-        vault_name=vault_name,
     )
     return server, store, embedder, sparse
 
@@ -178,7 +182,11 @@ def test_search_omits_uris_when_no_vault_name_is_configured(vault: Path) -> None
     assert result["snippets"][0]["uri"] is None
 
 
-def test_search_lists_both_tools(vault: Path) -> None:
+def test_a_minimal_server_lists_search_open_and_list_projects(vault: Path) -> None:
+    """`list_projects` is registered unconditionally — it is how an agent learns the
+    `project` string every other tool takes, and answering "just this one" is a real
+    answer. `overview`/`related`/the write tools need a store or a writer, so a minimal
+    read-only server exposes neither."""
     server, _, _, _ = build(vault)
 
     async def _run() -> list[str]:
@@ -186,14 +194,14 @@ def test_search_lists_both_tools(vault: Path) -> None:
             return [t.name for t in await client.list_tools()]
 
     names = asyncio.run(_run())
-    assert set(names) == {"search", "open"}
+    assert set(names) == {"search", "open", "list_projects"}
 
 
 def test_search_rejects_a_foreign_project(vault: Path) -> None:
-    """Tenancy: the served scope is fixed at construction; a client can never widen it."""
+    """Tenancy: the served set is fixed at construction; a client can never widen it."""
     server, store, _, _ = build(vault, hits=[make_hit()])
     message = call_expecting_error(server, "search", {"query": "q", "project": "other-project"})
-    assert "scoped to project" in message
+    assert "is not served by this server" in message
     assert store.calls == []  # refused before any engine work
 
 
@@ -618,12 +626,16 @@ def build_with_writer(
         **writer_kwargs,  # type: ignore[arg-type]
     )
     server = build_mcp_server(
-        project_id=PROJECT,
-        vault_path=vault,
+        projects=[
+            ServedProject(
+                project_id=PROJECT,
+                vault_root=vault,
+                embedder=QueryEmbedder(WriteFakeEmbedder()),
+                writer=writer,
+            )
+        ],
         vector_store=vstore,
-        embedder=QueryEmbedder(WriteFakeEmbedder()),
         sparse=WriteFakeSparse(),
-        writer=writer,
     )
     return server, store, vstore
 
@@ -668,7 +680,7 @@ def test_write_tools_are_absent_without_a_writer(vault: Path) -> None:
         async with Client(server) as client:
             return {t.name for t in await client.list_tools()}
 
-    assert asyncio.run(_run()) == {"search", "open"}
+    assert asyncio.run(_run()) == {"search", "open", "list_projects"}
 
 
 def test_write_tools_are_registered_with_a_writer(vault: Path) -> None:
@@ -681,6 +693,7 @@ def test_write_tools_are_registered_with_a_writer(vault: Path) -> None:
     assert asyncio.run(_run()) == {
         "search",
         "open",
+        "list_projects",
         "write_note",
         "append_section",
         "patch_frontmatter",
@@ -760,13 +773,18 @@ def build_with_graph(
     store.reresolve_links(PROJECT, other)
     assert guide  # the graph is keyed on it
     server = build_mcp_server(
-        project_id=PROJECT,
-        vault_path=vault,
+        projects=[
+            ServedProject(
+                project_id=PROJECT,
+                vault_root=vault,
+                embedder=QueryEmbedder(FakeEmbedder()),
+                vault_name=vault_name,
+            )
+        ],
         vector_store=FakeVectorStore(hits=hits),
-        embedder=QueryEmbedder(FakeEmbedder()),
         sparse=FakeSparse(),
         graph_store=store,
-        vault_name=vault_name,
+        meta_store=store,
     )
     return server, store
 
@@ -852,7 +870,13 @@ def test_related_is_registered_when_a_graph_store_is_given(vault: Path) -> None:
             async with Client(server) as client:
                 return [t.name for t in await client.list_tools()]
 
-        assert set(asyncio.run(_run())) == {"search", "open", "related"}
+        assert set(asyncio.run(_run())) == {
+            "search",
+            "open",
+            "related",
+            "list_projects",
+            "overview",  # build_with_graph passes the same store as meta_store
+        }
     finally:
         store.close()
 
@@ -883,3 +907,156 @@ def test_compact_mode_still_carries_graph_neighbours(vault: Path) -> None:
         assert [n["path"] for n in result["related"]] == ["notes/other.md"]
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# overview + list_projects (P3 Stage 2) — orientation, bounded by construction
+#
+# The shape asserted here is the one settled in
+# `../Rag/agent-inbox/overview-tool-shape.md`: a *map* (counted folders + top tags), never
+# a file listing, with both lists capped by a constant so the response's token cost is flat
+# in vault size. Each cap is tested at its boundary, because "bounded" that is only true
+# for small vaults is the failure this design exists to avoid.
+# ---------------------------------------------------------------------------
+class _StubOverviewStore:
+    """A metadata store stand-in that returns exactly what it is told to.
+
+    `overview`'s own logic is the caps, the truncation flag and the tenancy selection —
+    the aggregates themselves are SQL, tested against the real store in `test_store.py`.
+    """
+
+    def __init__(
+        self,
+        *,
+        notes: int = 0,
+        folders: list[tuple[str, int]] | None = None,
+        tags: list[tuple[str, int]] | None = None,
+    ) -> None:
+        self._notes = notes
+        self._folders = folders or []
+        self._tags = tags or []
+        self.folder_limits: list[int] = []
+        self.tag_limits: list[int] = []
+
+    def document_count(self, project_id: str) -> int:
+        return self._notes
+
+    def folder_counts(
+        self, project_id: str, depth: int = 2, limit: int = 50
+    ) -> list[tuple[str, int]]:
+        self.folder_limits.append(limit)
+        assert depth == 2, "overview asks for the depth its design note settled on"
+        return self._folders[:limit]
+
+    def top_tags(self, project_id: str, limit: int = 20) -> list[tuple[str, int]]:
+        self.tag_limits.append(limit)
+        return self._tags[:limit]
+
+
+def build_with_overview(vault: Path, store: _StubOverviewStore) -> FastMCP:
+    return build_mcp_server(
+        projects=[
+            ServedProject(
+                project_id=PROJECT,
+                vault_root=vault,
+                embedder=QueryEmbedder(FakeEmbedder()),
+                name="Design Vault",
+            )
+        ],
+        vector_store=FakeVectorStore(hits=[]),
+        sparse=FakeSparse(),
+        meta_store=store,
+    )
+
+
+def test_overview_returns_counts_and_never_file_paths(vault: Path) -> None:
+    """The core of the design: a folder with a number is a pointer to a `search` filter;
+    a list of filenames is a worse substitute for `search` itself."""
+    server = build_with_overview(
+        vault,
+        _StubOverviewStore(
+            notes=63,
+            folders=[("projects/vaultrag", 23), ("decisions", 13)],
+            tags=[("project/vaultrag", 40), ("type/decision", 13)],
+        ),
+    )
+    result = call(server, "overview", {})
+    assert result["project"] == PROJECT
+    assert result["name"] == "Design Vault"
+    assert result["notes"] == 63
+    assert result["folders"] == [
+        {"path": "projects/vaultrag", "notes": 23},
+        {"path": "decisions", "notes": 13},
+    ]
+    assert result["tags"][0] == {"tag": "project/vaultrag", "notes": 40}
+    assert result["truncated"] is False
+    assert "text" not in result  # it is a map, not content
+
+
+def test_overview_caps_both_lists_and_says_so(vault: Path) -> None:
+    """Bounded by a constant, not by vault size — a 500-folder vault costs the same as a
+    5-folder one, which is the property that makes this cheaper than listing files."""
+    store = _StubOverviewStore(
+        notes=9_999,
+        folders=[(f"f{i}", 1) for i in range(500)],
+        tags=[(f"t{i}", 1) for i in range(500)],
+    )
+    result = call(build_with_overview(vault, store), "overview", {})
+    assert len(result["folders"]) == 50
+    assert len(result["tags"]) == 20
+    assert result["truncated"] is True
+
+
+def test_overview_does_not_claim_truncation_at_exactly_the_cap(vault: Path) -> None:
+    """The off-by-one that matters: a vault with exactly 50 folders is complete, and
+    saying otherwise would send an agent hunting for content that does not exist. This is
+    why the tool asks the store for cap+1 rather than comparing lengths to the cap."""
+    store = _StubOverviewStore(notes=50, folders=[(f"f{i}", 1) for i in range(50)], tags=[("t", 1)])
+    result = call(build_with_overview(vault, store), "overview", {})
+    assert len(result["folders"]) == 50
+    assert result["truncated"] is False
+    assert store.folder_limits == [51], "must over-fetch by one to observe the cap biting"
+    assert store.tag_limits == [21]
+
+
+def test_overview_is_absent_without_a_metadata_store(vault: Path) -> None:
+    """Same rule as `related`: no store, no tool — never a tool that answers zero for
+    everything, which reads as an empty vault rather than a missing capability."""
+    server, _, _, _ = build(vault)
+
+    async def _run() -> set[str]:
+        async with Client(server) as client:
+            return {t.name for t in await client.list_tools()}
+
+    assert "overview" not in asyncio.run(_run())
+
+
+def test_overview_needs_no_vector_store_to_answer(vault: Path) -> None:
+    """It is a SQLite-only tool, so "what is actually in here?" still answers when Qdrant
+    is down — one of the states in which that question is most worth asking."""
+    server = build_mcp_server(
+        projects=[
+            ServedProject(
+                project_id=PROJECT, vault_root=vault, embedder=QueryEmbedder(FakeEmbedder())
+            )
+        ],
+        vector_store=DownVectorStore(),
+        sparse=FakeSparse(),
+        meta_store=_StubOverviewStore(notes=7, folders=[("notes", 7)]),
+    )
+    assert call(server, "overview", {})["notes"] == 7
+
+
+def test_list_projects_answers_on_a_single_project_server(vault: Path) -> None:
+    """Registered unconditionally: it is how an agent learns the `project` string, and
+    "just this one" is a real answer worth a few tokens."""
+    server, _, _, _ = build(vault)
+    rows = call(server, "list_projects", {})["result"]
+    assert rows == [{"id": PROJECT, "name": PROJECT, "notes": None, "writable": False}]
+
+
+def test_list_projects_reports_note_counts_when_a_store_is_present(vault: Path) -> None:
+    """`notes: null` means "this server cannot count", which is honestly different from a
+    project with zero notes — so the count only appears when a store can supply it."""
+    server = build_with_overview(vault, _StubOverviewStore(notes=12))
+    assert call(server, "list_projects", {})["result"][0]["notes"] == 12

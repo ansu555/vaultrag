@@ -162,7 +162,7 @@ def search(
         with time_stage("compress"):
             packed, total_tokens, truncated = compress(snippets, budget_tokens, compress_params)
 
-    record_search(empty=not packed)
+    record_search(empty=not packed, project=project_id)
     return SearchResult(
         query=query,
         project_id=project_id,

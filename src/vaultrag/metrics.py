@@ -26,12 +26,20 @@ rework, and nothing here is coupled to the HTTP transport.
    lifetime average is still recoverable. This is Prometheus's own guidance and the one
    place the metric *names* deliberately diverge from the vault note.
 
-2. **No metric carries a path, query, title, or project label.** Cardinality first — one
-   series per vault file would dwarf the vault — but privacy too: ``/metrics`` is
-   unauthenticated, and CLAUDE.md §6 keeps raw query text out of logs, so it certainly
-   does not belong in a label. (A ``project`` label is deliberately absent as well: one
-   process serves one project today, so it would be a constant. Multi-project is P3, and
-   that is when it earns its place.)
+2. **No metric carries a path, query, or title label.** Cardinality first — one series per
+   vault file would dwarf the vault — but privacy too: ``/metrics`` is unauthenticated, and
+   CLAUDE.md §6 keeps raw query text out of logs, so it certainly does not belong in a
+   label. ``project`` **is** a label as of P3 Stage 2, and only as of then: it was withheld
+   while one process served one project (where it is a constant) and earns its place now
+   that one process serves N, because "is *this* tenant's ingest lagging / returning
+   nothing?" is unanswerable without it. It is bounded by the registry, which is an
+   operator-managed list, not by user input.
+
+   It is on the **counters** and on ``ingest_lag`` — the per-tenant questions — and
+   deliberately **not** on ``search_latency``. That histogram is already 8 stages by 18
+   buckets; multiplying it by tenants buys the least (stage latency is dominated by shared
+   components — the embedder, Qdrant, the reranker — not by which vault was queried) and
+   costs the most. Cardinality is spent where it answers something.
 
 3. **The exporter never takes down the process it observes.** A failed bind (the usual
    cause: ``vaultrag watch`` and ``vaultrag mcp --metrics`` both up) logs a warning and
@@ -67,6 +75,10 @@ SEARCH_STAGES = ("embed", "fetch", "rerank", "parents", "graph", "cite", "compre
 
 #: The two routes by which a change becomes searchable — see :func:`record_ingest_lag`.
 INGEST_SOURCES = ("watch", "writeback")
+
+#: Mirrors :class:`~vaultrag.indexer.pipeline.IngestStatus`, same leaf argument as
+#: :data:`WRITE_ACTIONS` below. ``test_metrics`` pins the two in sync.
+INGEST_STATUSES = ("indexed", "unchanged", "removed", "skipped")
 
 #: Mirrors :class:`~vaultrag.writeback.writer._Action`. Duplicated rather than imported
 #: because this module is a leaf (like ``config``/``logging``) that write-back imports —
@@ -166,14 +178,14 @@ def _build() -> _Metrics:
     ingest_lag = Histogram(
         "vaultrag_ingest_lag_seconds",
         "Seconds from a change being made to that path being searchable, by ingest route.",
-        ["source"],
+        ["source", "project"],
         buckets=_LAG_BUCKETS,
         registry=registry,
     )
     ingests = Counter(
         "vaultrag_ingests_total",
         "Single-path reconciles completed by the watcher, by outcome.",
-        ["status"],
+        ["status", "project"],
         registry=registry,
     )
     jobs_queue_depth = Gauge(
@@ -202,11 +214,13 @@ def _build() -> _Metrics:
     searches = Counter(
         "vaultrag_searches_total",
         "Searches served (the denominator for the empty-result ratio).",
+        ["project"],
         registry=registry,
     )
     searches_empty = Counter(
         "vaultrag_searches_empty_total",
         "Searches that returned no snippets.",
+        ["project"],
         registry=registry,
     )
     rerank_decisions = Counter(
@@ -218,7 +232,7 @@ def _build() -> _Metrics:
     write_ops = Counter(
         "vaultrag_write_ops_total",
         "Write-back operations that reached the vault, by action.",
-        ["action"],
+        ["action", "project"],
         registry=registry,
     )
     write_refused = Counter(
@@ -231,20 +245,18 @@ def _build() -> _Metrics:
     # Pre-initialise every known label value to 0 so a scrape shows the full shape of the
     # system from the first second. Without this a stage/reason that has not fired yet is
     # simply absent, and "no series" is indistinguishable from "not scraped".
+    #
+    # The `project`-labelled metrics are absent from this loop by necessity — their label
+    # set is not known until a composition root decides which projects it serves. They are
+    # pre-initialised the same way, just later, by `init_project_labels`.
     for stage in SEARCH_STAGES:
         search_latency.labels(stage=stage)
     for result in ("hit", "miss"):
         embed_cache_lookups.labels(result=result)
     for decision in ("ran", "skipped"):
         rerank_decisions.labels(decision=decision)
-    for action in WRITE_ACTIONS:
-        write_ops.labels(action=action)
     for reason in WRITE_REFUSAL_REASONS:
         write_refused.labels(reason=reason)
-    for status in ("indexed", "unchanged", "removed", "skipped"):
-        ingests.labels(status=status)
-    for source in INGEST_SOURCES:
-        ingest_lag.labels(source=source)
 
     return _Metrics(
         registry=registry,
@@ -294,7 +306,29 @@ def set_build_info(version: str) -> None:
     _M.build_info.labels(version=version).set(1)
 
 
-def record_ingest_lag(seconds: float, *, source: str) -> None:
+def init_project_labels(project_id: str) -> None:
+    """Pre-initialise every ``project``-labelled series for one tenant, at zero.
+
+    The deferred half of ``_build``'s pre-initialisation: those metrics cannot be
+    materialised up front because the label's values are whatever projects this process was
+    told to serve. Composition roots (``vaultrag mcp``/``watch``/``reindex``) call this once
+    per served project at startup, which restores the property the eager loop exists for —
+    a scrape shows the full shape of the deployment from the first second, so "this tenant
+    has served no searches" and "this tenant is not being scraped" stay distinguishable.
+
+    Idempotent: ``labels()`` returns the existing child on a repeat call.
+    """
+    for status in INGEST_STATUSES:
+        _M.ingests.labels(status=status, project=project_id)
+    for source in INGEST_SOURCES:
+        _M.ingest_lag.labels(source=source, project=project_id)
+    for action in WRITE_ACTIONS:
+        _M.write_ops.labels(action=action, project=project_id)
+    _M.searches.labels(project=project_id)
+    _M.searches_empty.labels(project=project_id)
+
+
+def record_ingest_lag(seconds: float, *, source: str, project: str) -> None:
     """Observe one path's change → searchable latency (the SLO that matters).
 
     ``source`` separates the two routes a note becomes searchable by, because they are
@@ -310,12 +344,12 @@ def record_ingest_lag(seconds: float, *, source: str) -> None:
     Without the label the watch route's debounce floor would drag every write-back
     observation into the same buckets and a p95 would describe neither one.
     """
-    _M.ingest_lag.labels(source=source).observe(seconds)
+    _M.ingest_lag.labels(source=source, project=project).observe(seconds)
 
 
-def record_ingest(status: str) -> None:
+def record_ingest(status: str, *, project: str) -> None:
     """Count one completed single-path reconcile by its :class:`IngestStatus`."""
-    _M.ingests.labels(status=status).inc()
+    _M.ingests.labels(status=status, project=project).inc()
 
 
 def set_queue_depth(depth: int) -> None:
@@ -336,11 +370,11 @@ def record_embed_cache(*, hits: int, misses: int) -> None:
         _M.embed_cache_lookups.labels(result="miss").inc(misses)
 
 
-def record_search(*, empty: bool) -> None:
+def record_search(*, empty: bool, project: str) -> None:
     """Count one served search, and whether it came back with nothing."""
-    _M.searches.inc()
+    _M.searches.labels(project=project).inc()
     if empty:
-        _M.searches_empty.inc()
+        _M.searches_empty.labels(project=project).inc()
 
 
 def record_rerank_decision(*, ran: bool) -> None:
@@ -348,9 +382,9 @@ def record_rerank_decision(*, ran: bool) -> None:
     _M.rerank_decisions.labels(decision="ran" if ran else "skipped").inc()
 
 
-def record_write(action: str) -> None:
+def record_write(action: str, *, project: str) -> None:
     """Count one write that reached the vault."""
-    _M.write_ops.labels(action=action).inc()
+    _M.write_ops.labels(action=action, project=project).inc()
 
 
 def record_write_refused(reason: str) -> None:

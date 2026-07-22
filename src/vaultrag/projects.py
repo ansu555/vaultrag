@@ -30,8 +30,24 @@ if TYPE_CHECKING:
 # infrastructure, not per-project configuration. ``vault_path``/``project_id`` come from the
 # row itself; ``state_dir``/``qdrant_*`` are the shared stores that make one-process-serves-N
 # work — letting a project point them elsewhere would silently re-partition the deployment.
+#
+# ``embed_dims`` is reserved for a subtler reason than the rest: the shared collection is
+# *created* with one dense vector size, so a project that overrode it would upsert vectors
+# the collection cannot hold — the failure surfaces at index time, far from the setting that
+# caused it. ``embed_model`` stays overridable (per-project embedding models are
+# [[multi-tenant-architecture]]'s explicit design) because a different model at the *same*
+# dimensionality is safe: every project's vectors are compared only against its own, the
+# ``project_id`` filter being an unconditional ``must``. A model at a different width needs
+# the note's documented scale path — promotion to its own collection — not a settings key.
 _RESERVED_SETTINGS: frozenset[str] = frozenset(
-    {"project_id", "vault_path", "state_dir", "qdrant_url", "qdrant_collection"}
+    {
+        "project_id",
+        "vault_path",
+        "state_dir",
+        "qdrant_url",
+        "qdrant_collection",
+        "embed_dims",
+    }
 )
 
 
@@ -156,6 +172,7 @@ class ProjectRegistry:
             raise ValueError(
                 f"per-project settings override unknown or reserved keys: {sorted(bad)}. "
                 f"vault_path is set from the registry row; state_dir/qdrant_* are shared "
-                f"across tenants and cannot be per-project."
+                f"across tenants and cannot be per-project; embed_dims is fixed by the "
+                f"shared collection (embed_model itself is overridable at the same width)."
             )
         return dict(settings)

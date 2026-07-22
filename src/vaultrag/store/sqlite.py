@@ -17,6 +17,7 @@ import json
 import sqlite3
 import time
 import uuid
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
@@ -362,6 +363,34 @@ class SQLiteMetaStore:
             "SELECT COUNT(*) AS n FROM documents WHERE project_id = ?", (project_id,)
         ).fetchone()
         return int(row["n"])
+
+    def folder_counts(
+        self, project_id: str, depth: int = 2, limit: int = 50
+    ) -> list[tuple[str, int]]:
+        """Notes per folder, folded to ``depth`` path segments — ``overview``'s map.
+
+        The fold keeps a path's first ``depth`` segments; a note shallower than that
+        contributes its own folder, and a top-level note contributes ``''`` (the vault
+        root). Ordered by count desc then path, so the mass of the vault comes first, and
+        cut to ``limit`` — the response is bounded by a constant, not by vault size
+        (``../Rag/agent-inbox/overview-tool-shape.md``).
+
+        Folds in Python rather than in SQL on purpose. SQLite has no "position of the Nth
+        separator", so a depth-general SQL fold is a nest of ``instr``/``substr`` that is
+        hard to read and harder to trust; the input here is one short string per *document*
+        (~10k at the architecture's 100k-chunk target), which is a few milliseconds and
+        about a megabyte. Clarity wins until that stops being true.
+        """
+        if depth < 1:
+            raise ValueError(f"depth must be >= 1, got {depth}")
+        counts: Counter[str] = Counter()
+        for row in self._conn.execute(
+            "SELECT path FROM documents WHERE project_id = ?", (project_id,)
+        ):
+            # Drop the filename, then keep the leading `depth` folder segments.
+            folders = str(row["path"]).split("/")[:-1]
+            counts["/".join(folders[:depth])] += 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
     def top_tags(self, project_id: str, limit: int = 20) -> list[tuple[str, int]]:
         """The project's most-used tags, most-frequent first — for ``overview``.

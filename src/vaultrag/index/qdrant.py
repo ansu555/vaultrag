@@ -293,6 +293,32 @@ class QdrantVectorStore:
                 f"delete of doc {doc_id} from {self._collection!r} failed: {exc}"
             ) from exc
 
+    def delete_by_project(self, project_id: str) -> None:
+        """Delete every point belonging to one tenant — the vector half of deregistration.
+
+        The metadata store's :meth:`~vaultrag.store.base.MetaStore.delete_project` cascades
+        SQLite; this is its counterpart in the other derived cache, and both are needed
+        because they are lost independently. Without it a removed project leaves orphaned
+        vectors that are not merely wasted space: re-registering the same id would make
+        stale chunks immediately searchable with no ``documents`` row behind them, which is
+        exactly the drift ``consistency.check_drift`` exists to catch after the fact.
+
+        Tenant-scoped by the same unconditional ``project_id`` filter every other operation
+        uses, so it can never reach past its own partition.
+        """
+        try:
+            self._client.delete(
+                self._collection,
+                points_selector=models.FilterSelector(
+                    filter=models.Filter(must=[_match("project_id", project_id)])
+                ),
+                wait=True,
+            )
+        except _CLIENT_ERRORS as exc:
+            raise VectorStoreError(
+                f"delete of project {project_id!r} from {self._collection!r} failed: {exc}"
+            ) from exc
+
     # --- reads ----------------------------------------------------------------
     def query(
         self,

@@ -39,12 +39,15 @@ from vaultrag import metrics
 from vaultrag.embedding.base import Vector
 from vaultrag.embedding.cache import QueryEmbedder, embed_chunks
 from vaultrag.index import QdrantVectorStore, SparseVector
-from vaultrag.indexer.pipeline import IngestContext
+from vaultrag.indexer.pipeline import IngestContext, IngestStatus
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.metrics import (
+    INGEST_SOURCES,
+    INGEST_STATUSES,
     SEARCH_STAGES,
     WRITE_ACTIONS,
     WRITE_REFUSAL_REASONS,
+    init_project_labels,
     registry,
     reset_metrics,
 )
@@ -87,7 +90,12 @@ def test_every_series_the_design_note_names_is_exposed() -> None:
     ``embed_cache_hit_ratio``, ``empty_result_ratio`` and ``rerank_skipped_total`` ship as
     component counters instead (metrics.py rule 1) — this pins that the *information* is
     all present, so the deviation is a naming choice and never a gap.
+
+    The ``project``-labelled families materialise only once a project is announced (P3
+    Stage 2 — their label values are whatever the process was told to serve), so this
+    announces one first, exactly as every composition root does at startup.
     """
+    init_project_labels(PROJECT)
     names = series_names()
     for expected in (
         "vaultrag_ingest_lag_seconds",
@@ -121,13 +129,19 @@ def test_labels_are_preinitialised_so_a_scrape_shows_zero_not_nothing() -> None:
         assert value("vaultrag_embed_cache_lookups_total", result=result) == 0.0
 
 
-def test_no_metric_carries_a_path_query_or_project_label() -> None:
+def test_no_metric_carries_a_path_query_or_title_label() -> None:
     """metrics.py rule 2, enforced rather than documented.
 
     Cardinality (one series per vault file) and privacy (``/metrics`` is unauthenticated;
     CLAUDE.md §6 keeps query text out of logs) both forbid these. An allowlist rather than
     a denylist, so a *new* high-cardinality label fails this test by default.
+
+    ``project`` joined the allowlist in P3 Stage 2, when one process began serving several
+    projects and the label stopped being a constant. It is bounded by the registry — an
+    operator-managed list — which is what distinguishes it from the labels this test exists
+    to keep out: a path or a query is bounded only by user behaviour.
     """
+    init_project_labels(PROJECT)  # the label must be present to be judged
     allowed = {
         "stage",
         "result",
@@ -137,11 +151,62 @@ def test_no_metric_carries_a_path_query_or_project_label() -> None:
         "status",
         "version",
         "source",
+        "project",
         "le",  # Prometheus's own histogram bucket boundary, not user data.
     }
     for metric in registry().collect():
         for sample in metric.samples:
             assert set(sample.labels) <= allowed, f"{sample.name} carries {set(sample.labels)}"
+
+
+def test_search_latency_stays_unlabelled_by_project() -> None:
+    """The one place cardinality was deliberately *not* spent (metrics.py rule 2).
+
+    8 stages by 18 buckets multiplied by tenants is the largest series count in the module
+    and answers the least — stage latency is dominated by the shared embedder, Qdrant and
+    reranker. Pinned as a test because "we chose not to" is invisible in the code otherwise,
+    and the obvious next edit is to add it everywhere for consistency.
+    """
+    init_project_labels(PROJECT)
+    for metric in registry().collect():
+        if metric.name == "vaultrag_search_latency_seconds":
+            for sample in metric.samples:
+                assert "project" not in sample.labels
+
+
+def test_a_project_is_preinitialised_at_zero_across_every_labelled_series() -> None:
+    """``init_project_labels`` is the deferred half of ``_build``'s pre-initialisation.
+
+    Without it a tenant that has served no traffic is *absent* rather than zero, and
+    "this project is idle" reads identically to "this project is not being scraped" —
+    the exact confusion the eager loop exists to prevent.
+    """
+    init_project_labels("fresh-tenant")
+    assert value("vaultrag_searches_total", project="fresh-tenant") == 0.0
+    assert value("vaultrag_searches_empty_total", project="fresh-tenant") == 0.0
+    for action in WRITE_ACTIONS:
+        assert value("vaultrag_write_ops_total", action=action, project="fresh-tenant") == 0.0
+    for status in INGEST_STATUSES:
+        assert value("vaultrag_ingests_total", status=status, project="fresh-tenant") == 0.0
+    for source in INGEST_SOURCES:
+        assert (
+            value("vaultrag_ingest_lag_seconds_count", source=source, project="fresh-tenant") == 0.0
+        )
+
+
+def test_ingest_statuses_stay_in_sync_with_the_pipeline_enum() -> None:
+    """metrics.py duplicates these to stay a leaf module; this keeps the copy honest."""
+    assert set(INGEST_STATUSES) == {s.value for s in IngestStatus}
+
+
+def test_two_projects_count_independently() -> None:
+    """The whole point of the label: one tenant's traffic never lands on another's series."""
+    metrics.record_search(empty=False, project="alpha")
+    metrics.record_search(empty=True, project="beta")
+    assert value("vaultrag_searches_total", project="alpha") == 1.0
+    assert value("vaultrag_searches_empty_total", project="alpha") == 0.0
+    assert value("vaultrag_searches_total", project="beta") == 1.0
+    assert value("vaultrag_searches_empty_total", project="beta") == 1.0
 
 
 def test_write_actions_stay_in_sync_with_the_writer() -> None:
@@ -194,8 +259,8 @@ def test_a_search_times_every_stage_and_the_total() -> None:
 
 def test_a_search_counts_toward_the_empty_result_denominator() -> None:
     _search()
-    assert value("vaultrag_searches_total") == 1.0
-    assert value("vaultrag_searches_empty_total") == 0.0
+    assert value("vaultrag_searches_total", project=PROJECT) == 1.0
+    assert value("vaultrag_searches_empty_total", project=PROJECT) == 0.0
 
 
 def test_a_search_that_returns_nothing_counts_as_empty() -> None:
@@ -206,8 +271,8 @@ def test_a_search_that_returns_nothing_counts_as_empty() -> None:
         embedder=QueryEmbedder(FakeEmbedder()),
         sparse=FakeSparse(),
     )
-    assert value("vaultrag_searches_total") == 1.0
-    assert value("vaultrag_searches_empty_total") == 1.0
+    assert value("vaultrag_searches_total", project=PROJECT) == 1.0
+    assert value("vaultrag_searches_empty_total", project=PROJECT) == 1.0
 
 
 def test_a_blank_query_is_not_counted_as_a_search_at_all() -> None:
@@ -220,8 +285,8 @@ def test_a_blank_query_is_not_counted_as_a_search_at_all() -> None:
         embedder=QueryEmbedder(FakeEmbedder()),
         sparse=FakeSparse(),
     )
-    assert value("vaultrag_searches_total") == 0.0
-    assert value("vaultrag_searches_empty_total") == 0.0
+    assert value("vaultrag_searches_total", project=PROJECT) == 0.0
+    assert value("vaultrag_searches_empty_total", project=PROJECT) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +431,7 @@ def ingest_ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
 def test_an_accepted_write_counts_as_a_write_op(ingest_ctx: IngestContext) -> None:
     writer = NoteWriter(ingest_ctx, git_enabled=False)
     writer.write_note(title="Metrics Note", content="body text here")
-    assert value("vaultrag_write_ops_total", action="created") == 1.0
+    assert value("vaultrag_write_ops_total", action="created", project=WATCH_PROJECT) == 1.0
     assert value("vaultrag_write_refused_total", reason="secret") == 0.0
 
 
@@ -376,7 +441,7 @@ def test_a_refused_write_counts_its_reason_and_no_write_op(ingest_ctx: IngestCon
         # Outside the default agent-inbox/ write root → the allowlist gate.
         writer.write_note(title="Escapee", content="body", folder="decisions")
     assert value("vaultrag_write_refused_total", reason="outside-write-root") == 1.0
-    assert value("vaultrag_write_ops_total", action="created") == 0.0
+    assert value("vaultrag_write_ops_total", action="created", project=WATCH_PROJECT) == 0.0
 
 
 def test_a_secret_body_is_counted_as_a_secret_refusal(ingest_ctx: IngestContext) -> None:
@@ -403,8 +468,10 @@ def test_a_write_back_write_records_its_own_ingest_lag(ingest_ctx: IngestContext
     writer = NoteWriter(ingest_ctx, git_enabled=False)
     result = writer.write_note(title="Loop Note", content="body text here")
     assert result.indexed, "precondition: the synchronous reindex made it searchable"
-    assert value("vaultrag_ingest_lag_seconds_count", source="writeback") == 1.0
-    assert value("vaultrag_ingest_lag_seconds_count", source="watch") == 0.0
+    assert (
+        value("vaultrag_ingest_lag_seconds_count", source="writeback", project=WATCH_PROJECT) == 1.0
+    )
+    assert value("vaultrag_ingest_lag_seconds_count", source="watch", project=WATCH_PROJECT) == 0.0
 
 
 def test_the_two_ingest_routes_are_separate_distributions(ingest_ctx: IngestContext) -> None:
@@ -417,16 +484,18 @@ def test_the_two_ingest_routes_are_separate_distributions(ingest_ctx: IngestCont
     (ingest_ctx.vault_path / "external.md").write_text("# Ext\n\nbody\n", encoding="utf-8")
     watcher._mark_dirty("external.md")
     watcher.process_path("external.md")
-    assert value("vaultrag_ingest_lag_seconds_count", source="writeback") == 1.0
-    assert value("vaultrag_ingest_lag_seconds_count", source="watch") == 1.0
+    assert (
+        value("vaultrag_ingest_lag_seconds_count", source="writeback", project=WATCH_PROJECT) == 1.0
+    )
+    assert value("vaultrag_ingest_lag_seconds_count", source="watch", project=WATCH_PROJECT) == 1.0
 
 
 def test_an_append_counts_as_appended(ingest_ctx: IngestContext) -> None:
     writer = NoteWriter(ingest_ctx, git_enabled=False)
     writer.write_note(title="Target", content="## Section\n\nfirst line\n")
     writer.append_section(path="agent-inbox/target.md", heading="Section", content="second line")
-    assert value("vaultrag_write_ops_total", action="created") == 1.0
-    assert value("vaultrag_write_ops_total", action="appended") == 1.0
+    assert value("vaultrag_write_ops_total", action="created", project=WATCH_PROJECT) == 1.0
+    assert value("vaultrag_write_ops_total", action="appended", project=WATCH_PROJECT) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -453,9 +522,11 @@ def test_ingest_lag_spans_the_first_event_not_the_last(ingest_ctx: IngestContext
     clock.t = 5.0
     watcher.process_path("note.md")
 
-    assert value("vaultrag_ingest_lag_seconds_count", source="watch") == 1.0
+    assert value("vaultrag_ingest_lag_seconds_count", source="watch", project=WATCH_PROJECT) == 1.0
     # 5.0 from the *first* event; timing from the last would have recorded 4.0.
-    assert value("vaultrag_ingest_lag_seconds_sum", source="watch") == pytest.approx(5.0)
+    assert value(
+        "vaultrag_ingest_lag_seconds_sum", source="watch", project=WATCH_PROJECT
+    ) == pytest.approx(5.0)
 
 
 def test_an_unchanged_reconcile_records_no_lag(ingest_ctx: IngestContext) -> None:
@@ -467,14 +538,14 @@ def test_an_unchanged_reconcile_records_no_lag(ingest_ctx: IngestContext) -> Non
 
     watcher._mark_dirty("note.md")
     watcher.process_path("note.md")  # indexed
-    assert value("vaultrag_ingest_lag_seconds_count", source="watch") == 1.0
+    assert value("vaultrag_ingest_lag_seconds_count", source="watch", project=WATCH_PROJECT) == 1.0
 
     watcher._mark_dirty("note.md")
     watcher.process_path("note.md")  # hash-equal → unchanged
-    assert value("vaultrag_ingests_total", status="unchanged") == 1.0
-    assert value("vaultrag_ingest_lag_seconds_count", source="watch") == 1.0, (
-        "unchanged must not observe lag"
-    )
+    assert value("vaultrag_ingests_total", status="unchanged", project=WATCH_PROJECT) == 1.0
+    assert (
+        value("vaultrag_ingest_lag_seconds_count", source="watch", project=WATCH_PROJECT) == 1.0
+    ), "unchanged must not observe lag"
 
 
 def test_process_path_without_a_recorded_event_reports_no_fabricated_lag(
@@ -485,8 +556,8 @@ def test_process_path_without_a_recorded_event_reports_no_fabricated_lag(
     watcher = VaultWatcher(ingest_ctx, sleep=lambda _: None)
     (ingest_ctx.vault_path / "note.md").write_text("# Note\n\nbody\n", encoding="utf-8")
     watcher.process_path("note.md")
-    assert value("vaultrag_ingests_total", status="indexed") == 1.0
-    assert value("vaultrag_ingest_lag_seconds_count", source="watch") == 0.0
+    assert value("vaultrag_ingests_total", status="indexed", project=WATCH_PROJECT) == 1.0
+    assert value("vaultrag_ingest_lag_seconds_count", source="watch", project=WATCH_PROJECT) == 0.0
 
 
 def test_queue_depth_tracks_pending_and_inflight(ingest_ctx: IngestContext) -> None:
@@ -536,9 +607,9 @@ def test_a_dead_job_is_counted(ingest_ctx: IngestContext) -> None:
     watcher._mark_dirty("bad.md")
     assert watcher.process_path("bad.md") is None
     assert value("vaultrag_jobs_dead_total") == 1.0
-    assert value("vaultrag_ingest_lag_seconds_count", source="watch") == 0.0, (
-        "a dead job has no lag to report"
-    )
+    assert (
+        value("vaultrag_ingest_lag_seconds_count", source="watch", project=WATCH_PROJECT) == 0.0
+    ), "a dead job has no lag to report"
 
 
 # ---------------------------------------------------------------------------
