@@ -48,6 +48,7 @@ from vaultrag.metrics import (
     WRITE_ACTIONS,
     WRITE_REFUSAL_REASONS,
     init_project_labels,
+    record_key_request,
     registry,
     reset_metrics,
 )
@@ -96,6 +97,7 @@ def test_every_series_the_design_note_names_is_exposed() -> None:
     announces one first, exactly as every composition root does at startup.
     """
     init_project_labels(PROJECT)
+    record_key_request(key_id="test-key")  # materialises the P3 Stage 5 family, once
     names = series_names()
     for expected in (
         "vaultrag_ingest_lag_seconds",
@@ -107,6 +109,7 @@ def test_every_series_the_design_note_names_is_exposed() -> None:
         "vaultrag_searches_total",  # denominator for...
         "vaultrag_searches_empty_total",  # ...the empty-result ratio
         "vaultrag_write_ops_total",
+        "vaultrag_key_requests_total",  # P3 Stage 5: per-key request counts
     ):
         # Prefix match: a Histogram never emits its bare name, only `_bucket`/`_sum`/
         # `_count` samples, so an exact match would reject the two histograms outright.
@@ -143,6 +146,11 @@ def test_no_metric_carries_a_path_query_or_title_label() -> None:
     projects and the label stopped being a constant. It is bounded by the registry — an
     operator-managed list — which is what distinguishes it from the labels this test exists
     to keep out: a path or a query is bounded only by user behaviour.
+
+    ``key_id`` joined in P3 Stage 5, on the same argument: it is bounded by the
+    ``api_keys`` table, which only an operator writes to (``vaultrag key add``), and it is
+    the id half of a key — never the secret, and not itself sensitive (``auth.py``'s
+    module docstring covers why the id is safe to log).
     """
     init_project_labels(PROJECT)  # the label must be present to be judged
     allowed = {
@@ -155,6 +163,7 @@ def test_no_metric_carries_a_path_query_or_title_label() -> None:
         "version",
         "source",
         "project",
+        "key_id",
         "le",  # Prometheus's own histogram bucket boundary, not user data.
     }
     for metric in registry().collect():
@@ -210,6 +219,15 @@ def test_two_projects_count_independently() -> None:
     assert value("vaultrag_searches_empty_total", project="alpha") == 0.0
     assert value("vaultrag_searches_total", project="beta") == 1.0
     assert value("vaultrag_searches_empty_total", project="beta") == 1.0
+
+
+def test_two_keys_count_independently() -> None:
+    """P3 Stage 5's per-key request counter — one key's traffic never lands on another's."""
+    record_key_request(key_id="key-a")
+    record_key_request(key_id="key-a")
+    record_key_request(key_id="key-b")
+    assert value("vaultrag_key_requests_total", key_id="key-a") == 2.0
+    assert value("vaultrag_key_requests_total", key_id="key-b") == 1.0
 
 
 def test_write_actions_stay_in_sync_with_the_writer() -> None:

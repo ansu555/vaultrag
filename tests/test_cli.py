@@ -11,6 +11,7 @@ from fastmcp import Client, FastMCP
 from typer.testing import CliRunner
 
 from vaultrag import __version__
+from vaultrag.auth import Scope
 from vaultrag.cli import app
 from vaultrag.embedding.ollama import OllamaEmbedder
 from vaultrag.eval import load_candidates
@@ -796,11 +797,11 @@ def test_serve_warns_when_bound_wider_than_loopback(
     assert "Tailscale" in result.output
 
 
-def test_serve_mints_and_prints_a_key_when_none_is_configured(
+def test_serve_mints_and_prints_a_key_when_the_store_is_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Decision 4: the HTTP transport is never keyless, but a missing key is a
-    configuration gap rather than a reason to refuse to boot."""
+    """P3 Stage 5: the HTTP transport is never keyless, but an empty ``api_keys`` table is
+    a bootstrapping gap rather than a reason to refuse to boot."""
     vault = tmp_path / "vault"
     vault.mkdir()
     bound = _stub_uvicorn(monkeypatch)
@@ -808,28 +809,43 @@ def test_serve_mints_and_prints_a_key_when_none_is_configured(
         app, ["serve", "--project", "p", "--vault", str(vault)], env=_serve_env(tmp_path)
     )
     assert result.exit_code == 0, result.output
-    assert "API key" in result.output
-    assert "VAULTRAG_API_KEY" in result.output
-    assert bound[0]["app"].state.api_key in result.output
+    assert "no API keys registered" in result.output
+    assert "vaultrag key add" in result.output
+    minted = result.output.split("admin access to every served project: ")[1].splitlines()[0]
+    assert bound[0]["app"].state.api_keys is not None
+    # The printed key must actually work — not just look like one. The stack (and its
+    # store) is already closed by the time `serve` returns, so re-open it fresh rather
+    # than reuse the app's now-dead connection.
+    from vaultrag.auth import KeyAuthenticator
+
+    store = SQLiteMetaStore(tmp_path / "state" / "vaultrag.db")
+    try:
+        authenticated = KeyAuthenticator(store).authenticate(minted)
+    finally:
+        store.close()
+    assert authenticated.scope_for("p") == Scope.admin
 
 
-def test_serve_uses_the_configured_key_and_never_prints_it(
+def test_serve_does_not_remint_once_a_key_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A configured key is the operator's secret; echoing it to stdout would put it in
-    every terminal scrollback and CI log that ever started the server."""
+    """A key minted by `key add` before the first `serve` must not be shadowed by a second,
+    silently-discarded bootstrap key — the store is empty exactly once, ever."""
     vault = tmp_path / "vault"
     vault.mkdir()
-    bound = _stub_uvicorn(monkeypatch)
-    result = runner.invoke(
-        app,
-        ["serve", "--project", "p", "--vault", str(vault)],
-        env={**_serve_env(tmp_path), "VAULTRAG_API_KEY": "configured-secret-key"},
-    )
+    env = _serve_env(tmp_path)
+    added = runner.invoke(app, ["key", "add", "--scope", "p:read"], env=env)
+    assert added.exit_code == 0, added.output
+
+    _stub_uvicorn(monkeypatch)
+    result = runner.invoke(app, ["serve", "--project", "p", "--vault", str(vault)], env=env)
     assert result.exit_code == 0, result.output
-    assert bound[0]["app"].state.api_key == "configured-secret-key"
-    assert bound[0]["app"].state.key_was_minted is False
-    assert "configured-secret-key" not in result.output
+    assert "no API keys registered" not in result.output
+    store = SQLiteMetaStore(tmp_path / "state" / "vaultrag.db")
+    try:
+        assert len(store.list_api_keys()) == 1
+    finally:
+        store.close()
 
 
 def test_serve_refuses_a_vault_path_that_is_not_a_directory(tmp_path: Path) -> None:

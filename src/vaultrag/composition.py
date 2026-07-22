@@ -100,20 +100,24 @@ def build_stack(
     *,
     write: bool = True,
     watch: bool = False,
+    auth: bool = False,
 ) -> Iterator[ServedStack]:
     """Build the whole stack for one role, and tear it down on exit.
 
     ``write`` exposes the write operations (and, with them, the per-project ingest context
     that ``POST /v1/{project}/reindex`` needs — the same capability under two names: both
     mean "this process may modify this project's index"). ``watch`` additionally starts a
-    live watcher per vault.
+    live watcher per vault. ``auth`` is P3 Stage 5's addition: the ``api`` role always needs
+    the ``api_keys`` table to authenticate a request, even when it serves no writes, no
+    watch, and no graph — a read-only deployment is still an HTTP deployment, and an HTTP
+    deployment always needs somewhere to check a key against.
 
     By default search reads only Qdrant and ``open`` reads only the vault, and neither
     client connects at construction time, so a read-only stack comes up instantly (a down
-    Qdrant/Ollama surfaces as an actionable per-call error). Three features need more: the
-    write operations and ``watch`` both drive the single-file pipeline, and graph expand +
-    ``related`` read the link graph — all of them want the SQLite store, so it is opened
-    once and shared.
+    Qdrant/Ollama surfaces as an actionable per-call error). Four features need more: the
+    write operations and ``watch`` both drive the single-file pipeline, graph expand +
+    ``related`` read the link graph, and now auth reads the key table — all of them want
+    the SQLite store, so it is opened once and shared.
 
     Raises ``ValueError`` (misconfiguration), ``OSError`` (a client that resolves/binds at
     construction) or ``sqlite3.Error`` (an unopenable store) — the caller owns how to
@@ -143,11 +147,14 @@ def build_stack(
         # One store for every tenant — it is one db with `project_id` on every row
         # (payload-partitioned tenancy, [[multi-tenant-architecture]]). SQLite serializes
         # its own writes and is opened check_same_thread=False for exactly this
-        # multi-thread reuse. The write/watch paths *create* it — they own the manifest
-        # and jobs tables. The graph/overview readers only attach to an existing DB and
-        # never conjure one: a read-only server pointed at a state dir with no index
-        # would otherwise leave an empty database behind, and an index that was never
-        # built has no graph to serve anyway.
+        # multi-thread reuse. The write/watch/auth paths *create* it — write/watch own the
+        # manifest and jobs tables, and auth owns (or bootstraps) the key table. The
+        # graph/overview readers only attach to an existing DB and never conjure one: a
+        # read-only server pointed at a state dir with no index would otherwise leave an
+        # empty database behind, and an index that was never built has no graph to serve
+        # anyway. ``auth`` is unconditional (not gated on the db already existing) because
+        # an api role with no prior state is exactly the first-boot case that needs the
+        # table created so a key can be bootstrapped into it.
         any_write = any(write and s.writeback_enabled for s in settings_list)
         any_read_store = base.db_path.is_file() and any(
             s.graph_expand_enabled for s in settings_list
@@ -157,7 +164,7 @@ def build_stack(
         # every search against it is a zero-hit by construction. Conjuring a db to record
         # that would fill the mining report with rows that say nothing about retrieval.
         any_query_log = base.db_path.is_file() and any(s.query_log_enabled for s in settings_list)
-        if any_write or watch or any_read_store or any_query_log:
+        if any_write or watch or any_read_store or any_query_log or auth:
             stack.store = SQLiteMetaStore.from_settings(base)
         store = stack.store
 

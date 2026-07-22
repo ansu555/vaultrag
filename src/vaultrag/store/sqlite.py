@@ -4,8 +4,8 @@ Zero-ops, single-file, single-writer — the right default for a single-user box
 (``../Rag/decisions/metadata-store-sqlite-to-postgres.md``). The DDL is written to
 carry forward to Postgres 16 unchanged (``reference-database-schema.md``). Tables:
 ``projects, documents, chunks, tags, jobs, embed_cache`` (P0) + ``links, doc_keys``
-(P2 Stage 2 — the wikilink graph) + ``query_log`` (P3 Stage 3); ``api_keys`` remains
-deferred to P3 Stage 5.
+(P2 Stage 2 — the wikilink graph) + ``query_log`` (P3 Stage 3) + ``api_keys`` (P3 Stage 5,
+hashing and scope checks in :mod:`vaultrag.auth` — this module is storage only).
 
 Identity is content-addressed (``vaultrag.models``): a document is
 ``document_id(project, path)`` and a chunk is ``chunk_point_id(project, path, ix)``,
@@ -27,6 +27,7 @@ from typing import Any
 from vaultrag.config import Settings
 from vaultrag.models import Chunk, DocumentMetadata, Link, document_id
 from vaultrag.store.base import (
+    ApiKeyRow,
     ChunkRow,
     DocumentRow,
     JobRow,
@@ -212,6 +213,34 @@ CREATE TABLE IF NOT EXISTS embed_cache (
     chunk_hash TEXT NOT NULL,
     vector     BLOB NOT NULL,
     PRIMARY KEY (model, dims, chunk_hash)
+);
+
+-- Bearer keys for the HTTP transport (P3 Stage 5), replacing Stage 4's single bootstrap
+-- key. `key_hash` is the argon2 digest of the key's secret half; `id` is the OTHER half
+-- (see auth.py's module docstring for why a key is `id.secret`, not one opaque blob) and
+-- is not itself a secret — it is how a request is looked up in O(1) without re-hashing
+-- and comparing against every stored key, which argon2's deliberate slowness makes
+-- expensive at more than a handful of rows.
+--
+-- `scopes` is a JSON object, `{project_id: "read"|"write"|"admin"}` — one key can span
+-- projects (a CI key scoped to two vaults) with a different level on each, and a project
+-- absent from the map is unreachable by this key. No FK to `projects`, deliberately, for
+-- the same reason `query_log` has none: a key can be minted for a project id before (or
+-- after) that project is registered/removed, and a stale scope entry is inert rather than
+-- a dangling reference — the tenancy check refuses an unserved project regardless of what
+-- a key's scopes say about it.
+--
+-- `rate_limit` is requests/minute, the token-bucket capacity `auth.TokenBucket` refills
+-- toward. No FK-cascaded revocation table: revoking a key is a DELETE (see
+-- `delete_api_key`), so there is nothing to expire.
+CREATE TABLE IF NOT EXISTS api_keys (
+    id          TEXT PRIMARY KEY,
+    name        TEXT,
+    key_hash    TEXT NOT NULL,
+    scopes      TEXT NOT NULL DEFAULT '{}',
+    rate_limit  INTEGER NOT NULL DEFAULT 60,
+    created_ts  INTEGER NOT NULL,
+    last_used   INTEGER
 );
 """
 
@@ -406,6 +435,54 @@ class SQLiteMetaStore:
             settings=json.loads(row["settings"]),
             status=row["status"],
             created_ts=int(row["created_ts"]),
+        )
+
+    # --- api keys (P3 Stage 5) -------------------------------------------------
+    def create_api_key(
+        self,
+        *,
+        key_id: str,
+        name: str | None,
+        key_hash: str,
+        scopes: Mapping[str, str],
+        rate_limit: int,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO api_keys (id, name, key_hash, scopes, rate_limit, created_ts)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (key_id, name, key_hash, json.dumps(dict(scopes)), rate_limit, _now()),
+            )
+
+    def get_api_key(self, key_id: str) -> ApiKeyRow | None:
+        row = self._conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+        return None if row is None else self._api_key_row(row)
+
+    def list_api_keys(self) -> list[ApiKeyRow]:
+        rows = self._conn.execute("SELECT * FROM api_keys ORDER BY created_ts DESC").fetchall()
+        return [self._api_key_row(r) for r in rows]
+
+    def delete_api_key(self, key_id: str) -> bool:
+        with self._conn:
+            cur = self._conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+        return cur.rowcount > 0
+
+    def touch_api_key(self, key_id: str, *, used_ts: int) -> None:
+        with self._conn:
+            self._conn.execute("UPDATE api_keys SET last_used = ? WHERE id = ?", (used_ts, key_id))
+
+    @staticmethod
+    def _api_key_row(row: sqlite3.Row) -> ApiKeyRow:
+        return ApiKeyRow(
+            id=row["id"],
+            name=row["name"],
+            key_hash=row["key_hash"],
+            scopes=json.loads(row["scopes"]),
+            rate_limit=int(row["rate_limit"]),
+            created_ts=int(row["created_ts"]),
+            last_used=None if row["last_used"] is None else int(row["last_used"]),
         )
 
     # --- documents ------------------------------------------------------------

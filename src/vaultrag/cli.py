@@ -11,6 +11,7 @@ Subcommands:
   (P3 Stage 4: :mod:`vaultrag.api`, ``VAULTRAG_ROLE``).
 * ``project`` — register/inspect/remove the vaults one process serves (P3 Stage 2).
 * ``queries`` — report on the query log and mine it for golden-set cases (P3 Stage 3).
+* ``key``     — mint/list/revoke API keys for the HTTP transport (P3 Stage 5).
 * ``eval``    — score retrieval against a golden set; the CI gate (P2 Stage 1).
 
 The long-running roles (``watch``, ``mcp``) take ``--metrics`` to expose the standalone
@@ -39,6 +40,7 @@ import typer
 from structlog.typing import FilteringBoundLogger
 
 from vaultrag import __version__
+from vaultrag.auth import DEFAULT_RATE_LIMIT, KeyAuthenticator, Scope, generate_key, hash_secret
 from vaultrag.composition import ServedStack, build_stack, check_startup_drift
 from vaultrag.config import RerankMode, Role, Settings, load_settings
 from vaultrag.consistency import DriftError, check_drift
@@ -588,9 +590,11 @@ def serve(
 
     One image, two roles (reference-docker-compose). The api role binds 127.0.0.1 by
     default and requires 'Authorization: Bearer <key>' on every /v1 route and on /metrics
-    (reference-security-model) — set VAULTRAG_API_KEY, or one is minted and printed at
-    startup. The indexer role runs the boot reconcile and the file watcher, and opens no
-    port beyond the optional standalone metrics exporter.
+    (reference-security-model) — argon2-hashed, per-project-scoped, rate-limited keys
+    managed with `vaultrag key add|list|revoke`. An empty `api_keys` table gets one
+    admin-everywhere key minted and printed at startup so there is always a way in. The
+    indexer role runs the boot reconcile and the file watcher, and opens no port beyond
+    the optional standalone metrics exporter.
     """
     served_settings = _resolve_served_settings(project, vault)
     base = served_settings[0]
@@ -607,7 +611,9 @@ def serve(
 
     project_ids = [s.project_id for s in served_settings]
     try:
-        with build_stack(served_settings, write=write, watch=watching) as stack:
+        with build_stack(
+            served_settings, write=write, watch=watching, auth=(effective_role is Role.api)
+        ) as stack:
             _startup_drift_gate(stack, allow_drift=allow_drift, command="serve")
             if effective_role is Role.indexer:
                 _run_indexer_role(stack, log=log, watching=watching)
@@ -628,17 +634,29 @@ def serve(
 def _run_api_role(
     stack: ServedStack, *, log: FilteringBoundLogger, host: str, port: int, watching: bool
 ) -> None:
-    """Bind uvicorn over the app built around the already-constructed service."""
+    """Bind uvicorn over the app built around the already-constructed service.
+
+    ``build_stack(auth=True)`` guarantees ``stack.store`` is open here — the ``api_keys``
+    table lives on the same shared store as everything else P3 Stage 5 built on.
+    """
     import uvicorn
 
     from vaultrag.api import create_app
 
-    app_ = create_app(stack.service, api_key=stack.base.api_key or None)
-    if app_.state.key_was_minted:
+    assert stack.store is not None  # auth=True in build_stack's call above guarantees this
+    authenticator = KeyAuthenticator(stack.store)
+    minted = authenticator.bootstrap_if_empty(stack.project_ids)
+    if minted is not None:
         # Printed to stdout, once: `serve` owns its stdout (unlike `mcp`), and a key that
         # exists only in a log line the operator has to go find is a key they will work
-        # around by disabling auth. Naming the env var makes the next restart stable.
-        typer.echo(f"API key (ephemeral — set VAULTRAG_API_KEY to fix it): {app_.state.api_key}")
+        # around by disabling auth. `vaultrag key add` is how every key after this one is
+        # made — there is no env var to set for next time, unlike Stage 4's bootstrap key.
+        typer.echo(
+            f"no API keys registered — minted one with admin access to every served "
+            f"project: {minted}\nStore it now; this is the only time it is shown. Add "
+            f"more with `vaultrag key add`, revoke this one with `vaultrag key revoke`."
+        )
+    app_ = create_app(stack.service, api_keys=authenticator)
     typer.echo(f"serving http://{host}:{port}  (docs: /docs, health: /healthz)")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         # Not a refusal — an operator behind Tailscale has a real reason — but the security
@@ -839,6 +857,124 @@ def project_rm(
         for closer in (vector_store, store):
             if closer is not None:
                 closer.close()
+
+
+# --- API keys (P3 Stage 5) ----------------------------------------------------
+key_app = typer.Typer(
+    name="key",
+    help="Manage API keys for the HTTP transport: mint, list, revoke (P3 Stage 5).",
+    no_args_is_help=True,
+)
+app.add_typer(key_app, name="key")
+
+
+def _open_key_store() -> SQLiteMetaStore:
+    """Open the shared metadata store the ``api_keys`` table lives on (caller closes it)."""
+    store = SQLiteMetaStore.from_settings(load_settings())
+    store.init_schema()
+    return store
+
+
+def _parse_scopes(pairs: list[str]) -> dict[str, str]:
+    """Parse repeatable ``project:level`` pairs into a scopes mapping.
+
+    Validated against :class:`~vaultrag.auth.Scope` here, at the CLI boundary, rather than
+    left for the authenticator to discover at request time — a typo'd level should fail
+    the command that made it, not silently mint a key nothing can ever use.
+    """
+    out: dict[str, str] = {}
+    for pair in pairs:
+        project_id, sep, level = pair.partition(":")
+        if not sep or not project_id or not level:
+            raise typer.BadParameter(f"--scope expects project:level, got {pair!r}")
+        try:
+            out[project_id] = Scope(level).value
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"--scope level must be one of {[s.value for s in Scope]}, got {level!r}"
+            ) from exc
+    return out
+
+
+@key_app.command("add")
+def key_add(
+    scope: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--scope",
+            help="project:level, repeatable — level is read/write/admin, each implying "
+            "the ones before it. E.g. --scope vaultrag-design:read "
+            "--scope vaultrag-code:write.",
+        ),
+    ] = None,
+    name: Annotated[
+        str | None, typer.Option("--name", help="Label shown by `key list` (e.g. 'ci-bot').")
+    ] = None,
+    rate_limit: Annotated[
+        int,
+        typer.Option(
+            "--rate-limit",
+            help="Requests/minute this key's token bucket refills to. 0 disables the limit.",
+        ),
+    ] = DEFAULT_RATE_LIMIT,
+) -> None:
+    """Mint a new key and print it once. Nothing on this process holds it again.
+
+    The store never sees the raw key, only its argon2 hash — a lost key has no recovery
+    path, the same as any password: revoke it and mint a new one.
+    """
+    scopes = _parse_scopes(scope or [])
+    if not scopes:
+        typer.echo("key add failed: at least one --scope project:level is required", err=True)
+        raise typer.Exit(code=1)
+    store = _open_key_store()
+    try:
+        material = generate_key()
+        store.create_api_key(
+            key_id=material.id,
+            name=name,
+            key_hash=hash_secret(material.secret),
+            scopes=scopes,
+            rate_limit=rate_limit,
+        )
+        typer.echo(f"key: {material.raw}")
+        typer.echo("store it now — this is the only time it is shown.")
+        typer.echo(f"id: {material.id}  scopes: {scopes}  rate_limit: {rate_limit}/min")
+    finally:
+        store.close()
+
+
+@key_app.command("list")
+def key_list() -> None:
+    """List keys by id and scope — never the key itself, never its hash."""
+    store = _open_key_store()
+    try:
+        rows = store.list_api_keys()
+        if not rows:
+            typer.echo("no API keys registered — `serve` mints one on its next start")
+            return
+        for row in rows:
+            scopes = ", ".join(f"{p}:{lvl}" for p, lvl in sorted(row.scopes.items()))
+            last = "never" if row.last_used is None else str(row.last_used)
+            label = f" ({row.name})" if row.name else ""
+            typer.echo(f"{row.id}{label}\t{scopes}\trate={row.rate_limit}/min\tlast_used={last}")
+    finally:
+        store.close()
+
+
+@key_app.command("revoke")
+def key_revoke(
+    key_id: Annotated[str, typer.Argument(help="Key id, as shown by `key list`.")],
+) -> None:
+    """Revoke a key. Takes effect on its very next request, not the next restart."""
+    store = _open_key_store()
+    try:
+        if not store.delete_api_key(key_id):
+            typer.echo(f"no such key: {key_id}", err=True)
+            raise typer.Exit(code=1)
+        typer.echo(f"revoked {key_id}")
+    finally:
+        store.close()
 
 
 # --- query log / mining (P3 Stage 3) ----------------------------------------

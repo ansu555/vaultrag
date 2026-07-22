@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +26,10 @@ from fastapi.testclient import TestClient
 from fastmcp import Client, FastMCP
 from qdrant_client import QdrantClient
 
-from tests.fakes import PROJECT, FakeEmbedder, FakeSparse, FakeVectorStore, make_hit
+from tests.fakes import PROJECT, FakeEmbedder, FakeKeyStore, FakeSparse, FakeVectorStore, make_hit
 from tests.test_graph import FakeGraph
 from vaultrag.api import PROBLEM_MEDIA_TYPE, create_app
+from vaultrag.auth import KeyAuthenticator, Scope, hash_secret
 from vaultrag.embedding.cache import QueryEmbedder
 from vaultrag.index import QdrantVectorStore
 from vaultrag.index.base import ScoredChunk
@@ -39,7 +40,13 @@ from vaultrag.store.base import DocumentRow
 from vaultrag.store.sqlite import SQLiteMetaStore
 from vaultrag.writeback import NoteWriter
 
-KEY = "test-key-abcdefghijklmnop"
+# A fixed id/secret pair, reused across nearly every test the same way Stage 4's single
+# literal KEY was: what varies from test to test is the *scopes* a key with this id is
+# granted (see `client_for`'s `scopes` argument), not the credential itself. Tests that are
+# specifically about a wrong/malformed/absent/revoked/rate-limited key build their own.
+KEY_ID = "test-key-id"
+KEY_SECRET = "test-key-secret-abcdefghijklmnop"
+KEY = f"{KEY_ID}.{KEY_SECRET}"
 AUTH = {"Authorization": f"Bearer {KEY}"}
 
 GUIDE = """\
@@ -161,10 +168,48 @@ def build_service(
     )
 
 
-def client_for(service: VaultRAGService, *, api_key: str | None = KEY) -> TestClient:
+def authenticator_for(
+    service: VaultRAGService,
+    *,
+    scopes: Mapping[str, str] | None = None,
+    key_id: str = KEY_ID,
+    key_secret: str = KEY_SECRET,
+    rate_limit: int = 1_000_000,
+) -> KeyAuthenticator:
+    """One key, in a fresh in-memory ``api_keys`` table.
+
+    Default scopes grant admin on every project ``service`` serves: almost every test here
+    is about retrieval, write-back or tenancy behaviour, not authorization, so the default
+    key must not be the thing that refuses them. Tests that ARE about scope pass ``scopes``
+    explicitly — same key id, a narrower grant, per the Stage 5 verify block.
+    """
+    if scopes is None:
+        scopes = dict.fromkeys((p.project_id for p in service.projects), Scope.admin.value)
+    store = FakeKeyStore()
+    store.create_api_key(
+        key_id=key_id,
+        name="test",
+        key_hash=hash_secret(key_secret),
+        scopes=scopes,
+        rate_limit=rate_limit,
+    )
+    return KeyAuthenticator(store)
+
+
+def client_for(
+    service: VaultRAGService,
+    *,
+    scopes: Mapping[str, str] | None = None,
+    key_id: str = KEY_ID,
+    key_secret: str = KEY_SECRET,
+    rate_limit: int = 1_000_000,
+) -> TestClient:
+    api_keys = authenticator_for(
+        service, scopes=scopes, key_id=key_id, key_secret=key_secret, rate_limit=rate_limit
+    )
     # raise_server_exceptions=False so the catch-all 500 handler is exercised as a client
     # would see it, rather than the exception propagating into the test.
-    return TestClient(create_app(service, api_key=api_key), raise_server_exceptions=False)
+    return TestClient(create_app(service, api_keys=api_keys), raise_server_exceptions=False)
 
 
 def build_both(service: VaultRAGService) -> tuple[TestClient, FastMCP]:
@@ -352,7 +397,7 @@ def test_every_endpoint_in_the_reference_table_is_routed(vault: Path) -> None:
     is what keeps "deferred" from silently becoming "forgotten".
     """
     service = build_service(vault, meta_store=_StubOverviewStore())
-    app: FastAPI = create_app(service, api_key=KEY)
+    app: FastAPI = create_app(service, api_keys=authenticator_for(service))
     # Read from the OpenAPI document rather than `app.routes`: that is the contract a
     # client actually sees, and it stays correct however FastAPI nests included routers
     # internally.
@@ -442,20 +487,214 @@ def test_a_malformed_authorization_header_is_refused(vault: Path) -> None:
     assert rest.get("/v1/projects", headers={"Authorization": "Bearer "}).status_code == 401
 
 
-def test_an_absent_configured_key_is_minted_rather_than_left_open(vault: Path) -> None:
-    """A missing VAULTRAG_API_KEY must never mean "no auth" — that is the one thing the
-    security model forbids. It means an ephemeral key, announced."""
-    app = create_app(build_service(vault), api_key=None)
-    assert app.state.api_key
-    assert app.state.key_was_minted is True
-    rest = TestClient(app)
+def test_an_empty_key_store_is_bootstrapped_rather_than_left_open(vault: Path) -> None:
+    """An ``api_keys`` table with no rows must never mean "no auth" — that is the one thing
+    the security model forbids. It means one admin-everywhere key, minted and returned once
+    (``vaultrag serve`` is what prints it; this only checks the mechanism)."""
+    service = build_service(vault)
+    store = FakeKeyStore()
+    authenticator = KeyAuthenticator(store)
+    minted = authenticator.bootstrap_if_empty([p.project_id for p in service.projects])
+    assert minted
+    assert authenticator.bootstrap_if_empty([PROJECT]) is None  # idempotent: table isn't empty now
+
+    rest = TestClient(create_app(service, api_keys=authenticator))
     assert rest.get("/v1/projects").status_code == 401
-    assert (
-        rest.get(
-            "/v1/projects", headers={"Authorization": f"Bearer {app.state.api_key}"}
-        ).status_code
-        == 200
+    response = rest.get("/v1/projects", headers={"Authorization": f"Bearer {minted}"})
+    assert response.status_code == 200
+    assert response.json() == [
+        {"id": PROJECT, "name": "Design Vault", "notes": None, "writable": False}
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Scopes (P3 Stage 5: read < write < admin, enforced before the service is asked)
+# ---------------------------------------------------------------------------
+def test_a_read_scoped_key_is_refused_on_every_write_endpoint_and_on_reindex(vault: Path) -> None:
+    """The adversarial floor from the Stage 5 plan: read cannot write, and cannot admin."""
+    service = build_service(vault, meta_store=_StubOverviewStore())
+    rest = client_for(service, scopes={PROJECT: "read"})
+    for method, path, body in (
+        ("post", f"/v1/{PROJECT}/notes", {"title": "x", "content": "y"}),
+        (
+            "patch",
+            f"/v1/{PROJECT}/notes",
+            {"op": "append_section", "path": "notes/guide.md", "heading": "Setup", "content": "z"},
+        ),
+        ("post", f"/v1/{PROJECT}/reindex", {}),
+    ):
+        response = getattr(rest, method)(path, json=body, headers=AUTH)
+        assert response.status_code == 403, (method, path, response.text)
+        assert response.json()["type"] == "urn:vaultrag:problem:insufficient-scope"
+    # Read routes are unaffected by the same key.
+    assert rest.get(f"/v1/{PROJECT}/overview", headers=AUTH).status_code == 200
+
+
+def test_a_write_scoped_key_clears_the_write_gate_but_not_the_admin_one(vault: Path) -> None:
+    """Distinguishes the two layers: a write-scoped key must get *past* the scope check on
+    a write route (the service then refuses it for its own reason — no writer configured —
+    which is a different problem type) while still being stopped at the scope check itself
+    on the admin-only reindex route."""
+    rest = client_for(build_service(vault), scopes={PROJECT: "write"})  # no writer on the service
+    written = rest.post(f"/v1/{PROJECT}/notes", json={"title": "x", "content": "y"}, headers=AUTH)
+    assert written.status_code == 403
+    # The service refused it (no writer), not the scope gate — a different problem type.
+    assert written.json()["type"] == "urn:vaultrag:problem:refused"
+
+    admin = rest.post(f"/v1/{PROJECT}/reindex", json={}, headers=AUTH)
+    assert admin.status_code == 403
+    assert admin.json()["type"] == "urn:vaultrag:problem:insufficient-scope"
+
+
+def test_a_key_scoped_to_one_project_cannot_reach_a_different_served_project(
+    tmp_path: Path,
+) -> None:
+    """Both projects are real and served — this must read as "you can't see this", not
+    "unknown project" (that case is covered separately, for a project neither exists)."""
+    alpha_root, beta_root = tmp_path / "alpha", tmp_path / "beta"
+    for root in (alpha_root, beta_root):
+        root.mkdir()
+        (root / "note.md").write_text("# hi\n", encoding="utf-8")
+    service = VaultRAGService(
+        projects=[
+            ServedProject(
+                project_id="alpha", vault_root=alpha_root, embedder=QueryEmbedder(FakeEmbedder())
+            ),
+            ServedProject(
+                project_id="beta", vault_root=beta_root, embedder=QueryEmbedder(FakeEmbedder())
+            ),
+        ],
+        vector_store=FakeVectorStore(hits=[]),
+        sparse=FakeSparse(),
     )
+    rest = client_for(service, scopes={"alpha": "admin"})  # nothing granted on beta
+    assert rest.get("/v1/alpha/doc", params={"path": "note.md"}, headers=AUTH).status_code == 200
+    refused = rest.get("/v1/beta/doc", params={"path": "note.md"}, headers=AUTH)
+    assert refused.status_code == 403
+    body = refused.json()
+    assert body["type"] == "urn:vaultrag:problem:insufficient-scope"
+    assert "beta" in body["detail"]
+
+
+def test_list_projects_is_filtered_to_the_callers_own_scopes(tmp_path: Path) -> None:
+    """Listing every served project regardless of scope would leak the existence of tenants
+    a key cannot otherwise reach — the same "narrow, never widen" rule applied to discovery."""
+    alpha_root, beta_root = tmp_path / "alpha", tmp_path / "beta"
+    alpha_root.mkdir()
+    beta_root.mkdir()
+    service = VaultRAGService(
+        projects=[
+            ServedProject(
+                project_id="alpha", vault_root=alpha_root, embedder=QueryEmbedder(FakeEmbedder())
+            ),
+            ServedProject(
+                project_id="beta", vault_root=beta_root, embedder=QueryEmbedder(FakeEmbedder())
+            ),
+        ],
+        vector_store=FakeVectorStore(hits=[]),
+        sparse=FakeSparse(),
+    )
+    rest = client_for(service, scopes={"alpha": "read"})
+    response = rest.get("/v1/projects", headers=AUTH)
+    assert response.status_code == 200
+    assert {p["id"] for p in response.json()} == {"alpha"}  # beta exists, but is invisible
+
+
+def test_a_key_with_no_scope_anywhere_is_refused_on_list_projects(vault: Path) -> None:
+    rest = client_for(build_service(vault), scopes={})
+    assert rest.get("/v1/projects", headers=AUTH).status_code == 403
+
+
+def test_register_project_requires_admin_scope_before_it_can_answer_501(vault: Path) -> None:
+    """The 501 is still gated: a non-admin key never reaches the "not implemented" body."""
+    rest = client_for(build_service(vault), scopes={PROJECT: "write"})
+    response = rest.post("/v1/projects", json={"id": "x"}, headers=AUTH)
+    assert response.status_code == 403
+    assert response.json()["type"] == "urn:vaultrag:problem:insufficient-scope"
+
+
+def test_a_revoked_key_is_refused_on_its_very_next_rest_request(vault: Path) -> None:
+    """Revocation takes effect on the next request, not the next restart — there is no
+    cache between the route and the store for a revoked row to survive in."""
+    service = build_service(vault)
+    store = FakeKeyStore()
+    store.create_api_key(
+        key_id=KEY_ID,
+        name="t",
+        key_hash=hash_secret(KEY_SECRET),
+        scopes={PROJECT: "admin"},
+        rate_limit=1_000_000,
+    )
+    authenticator = KeyAuthenticator(store)
+    rest = TestClient(create_app(service, api_keys=authenticator))
+    assert rest.get("/v1/projects", headers=AUTH).status_code == 200
+    assert store.delete_api_key(KEY_ID) is True
+    assert rest.get("/v1/projects", headers=AUTH).status_code == 401
+
+
+def test_a_rate_limited_key_gets_429_with_retry_after_and_recovers_on_schedule(
+    vault: Path,
+) -> None:
+    service = build_service(vault, meta_store=_StubOverviewStore())
+    store = FakeKeyStore()
+    store.create_api_key(
+        key_id=KEY_ID,
+        name="t",
+        key_hash=hash_secret(KEY_SECRET),
+        scopes={PROJECT: "admin"},
+        rate_limit=1,  # 1/minute
+    )
+    clock = [0.0]
+    authenticator = KeyAuthenticator(store, monotonic=lambda: clock[0])
+    rest = TestClient(create_app(service, api_keys=authenticator))
+
+    first = rest.get(f"/v1/{PROJECT}/overview", headers=AUTH)
+    assert first.status_code == 200
+    second = rest.get(f"/v1/{PROJECT}/overview", headers=AUTH)
+    assert second.status_code == 429
+    assert second.headers["content-type"].startswith(PROBLEM_MEDIA_TYPE)
+    assert int(second.headers["retry-after"]) > 0
+    assert second.json()["type"] == "urn:vaultrag:problem:rate-limited"
+
+    clock[0] += 60.0  # one full token back at 1/minute
+    third = rest.get(f"/v1/{PROJECT}/overview", headers=AUTH)
+    assert third.status_code == 200
+
+
+def test_no_plaintext_key_appears_in_the_store_or_the_logs(vault: Path) -> None:
+    import structlog
+
+    service = build_service(vault)
+    store = FakeKeyStore()
+    store.create_api_key(
+        key_id=KEY_ID,
+        name="t",
+        key_hash=hash_secret(KEY_SECRET),
+        scopes={PROJECT: "admin"},
+        rate_limit=1_000_000,
+    )
+    row = store.get_api_key(KEY_ID)
+    assert row is not None
+    assert KEY_SECRET not in row.key_hash  # argon2 output, not a reversible encoding
+
+    rest = TestClient(create_app(service, api_keys=KeyAuthenticator(store)))
+    with structlog.testing.capture_logs() as captured:
+        wrong = rest.get("/v1/projects", headers={"Authorization": f"Bearer {KEY_ID}.wrong-secret"})
+    assert wrong.status_code == 401
+    blob = json.dumps(captured)
+    assert "wrong-secret" not in blob
+    assert KEY_SECRET not in blob
+
+
+def test_key_requests_are_counted_in_metrics_by_id(vault: Path) -> None:
+    from vaultrag.metrics import reset_metrics
+
+    reset_metrics()
+    rest = client_for(build_service(vault))
+    rest.get("/v1/projects", headers=AUTH)
+    rest.get("/v1/projects", headers=AUTH)
+    metrics_response = rest.get("/metrics", headers=AUTH)
+    assert f'vaultrag_key_requests_total{{key_id="{KEY_ID}"}}' in metrics_response.text
 
 
 # ---------------------------------------------------------------------------

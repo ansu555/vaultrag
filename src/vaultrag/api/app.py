@@ -17,9 +17,10 @@ from __future__ import annotations
 from fastapi import FastAPI, Response
 
 from vaultrag import __version__
-from vaultrag.api.deps import RequiresKey, install_auth_handler, mint_key
+from vaultrag.api.deps import RequiresKey, install_auth_handler
 from vaultrag.api.errors import install_error_handlers
 from vaultrag.api.routes import HealthResponse, router
+from vaultrag.auth import KeyAuthenticator
 from vaultrag.logging import get_logger
 from vaultrag.metrics import registry, set_build_info
 from vaultrag.service import VaultRAGService
@@ -31,7 +32,8 @@ Cited-snippet retrieval over one or more Obsidian vaults — the REST twin of Va
 MCP tools, over the same service core. Responses are **snippets, not answers**: the
 caller is expected to be the LLM.
 
-Every `/v1` route and `/metrics` requires `Authorization: Bearer <key>`. Errors are
+Every `/v1` route and `/metrics` requires `Authorization: Bearer <key>` (P3 Stage 5: an
+argon2-hashed, per-project-scoped, rate-limited key — see `vaultrag key add`). Errors are
 RFC 7807 `application/problem+json`.
 """
 
@@ -39,20 +41,16 @@ RFC 7807 `application/problem+json`.
 def create_app(
     service: VaultRAGService,
     *,
-    api_key: str | None = None,
+    api_keys: KeyAuthenticator,
 ) -> FastAPI:
-    """Build the ASGI app for ``service``.
+    """Build the ASGI app for ``service``, authenticated by ``api_keys``.
 
-    ``api_key`` is the bootstrap key every authenticated route checks. ``None`` or empty
-    mints an ephemeral one and logs it — the HTTP transport is never keyless
-    (``../Rag/reference/reference-security-model.md``), but a missing key is a
-    configuration gap, not a reason to refuse to boot. The caller (the ``serve`` command)
-    is what prints it where an operator will see it; returning it on the app's state keeps
-    this function free of stdout concerns and lets a test read it back.
+    Key material itself is never on this object: ``api_keys`` looks a presented key up in
+    the ``api_keys`` table and verifies it per request, so revoking a key takes effect on
+    the very next request rather than requiring an app rebuild. The caller (the ``serve``
+    command) owns bootstrapping the first key and printing it — this function only wires
+    the authenticator in, the same "no stdout concerns here" split Stage 4 drew.
     """
-    key = api_key or mint_key()
-    minted = not api_key
-
     app = FastAPI(
         title="VaultRAG",
         version=__version__,
@@ -63,8 +61,7 @@ def create_app(
         openapi_url="/openapi.json",
     )
     app.state.service = service
-    app.state.api_key = key
-    app.state.key_was_minted = minted
+    app.state.api_keys = api_keys
 
     install_error_handlers(app)
     install_auth_handler(app)
@@ -114,7 +111,6 @@ def create_app(
     log.info(
         "api.app_built",
         projects=[p.project_id for p in service.projects],
-        key_minted=minted,
         writable=service.has_writes,
         graph=service.has_graph,
     )

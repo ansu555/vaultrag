@@ -446,13 +446,6 @@ class Settings(BaseSettings):
         default=8000,
         description="Port for `serve`.",
     )
-    api_key: str = Field(
-        default="",
-        description="Bearer key required on every /v1 route and /metrics. Empty means "
-        "`serve` mints an ephemeral one at startup and prints it — the HTTP transport is "
-        "never keyless (reference-security-model), it just doesn't refuse to boot. P3 "
-        "Stage 5 replaces this single key with hashed, scoped, rate-limited keys.",
-    )
     startup_drift_check: bool = Field(
         default=True,
         description="Refuse to start when the manifest and the vector store disagree about "
@@ -478,6 +471,27 @@ class Settings(BaseSettings):
                 "VAULTRAG_RERANK_ENABLED was replaced by VAULTRAG_RERANK_MODE "
                 f"(never|auto|always) — unset it and use VAULTRAG_RERANK_MODE={wanted}, "
                 "or 'auto' to let the fusion margin decide per query."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_retired_api_key_env(self) -> Settings:
+        """Fail loudly if the retired Stage 4 ``VAULTRAG_API_KEY`` is still set.
+
+        Same trap as :meth:`_reject_retired_rerank_env`, one field over: pydantic-settings
+        silently ignores env vars matching no field, so an operator's compose file or
+        shell profile carrying a Stage 4 ``VAULTRAG_API_KEY`` would otherwise do nothing —
+        no error, no auth, and a key that looks configured but authenticates nobody. P3
+        Stage 5 replaced the single shared key with the ``api_keys`` table; the equivalent
+        setting now is ``vaultrag key add``, which has no env-var form because keys are
+        per-key rows, not one process-wide setting.
+        """
+        if os.environ.get("VAULTRAG_API_KEY") is not None:
+            raise ValueError(
+                "VAULTRAG_API_KEY was replaced by the api_keys table (P3 Stage 5) — unset "
+                "it and run `vaultrag key add` to mint a real, scoped key. An empty "
+                "api_keys table still gets one admin key minted and printed at `serve` "
+                "startup, so unsetting it does not leave the server keyless."
             )
         return self
 

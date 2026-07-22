@@ -8,15 +8,79 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P3 IN PROGRESS — Stages 1, 2, 3 and 4 all DONE (2026-07-22); Stage 5 (api
-keys/scopes/rate limits) NOT started.** P2 is COMPLETE (all 7 stages + the 4-bug audit).
-**Stages 2 and 3 are both merged to `main` (PR #15 `03bce8f`, PR #16 `c938875`) — Anik
-merged both himself.** Stage 4 sits on branch **`feat/p3-stage4-serve`**, unpushed. Plan at
-`../Rag/projects/vaultrag/p3-step-plan.md`.
+- **Phase:** **P3 IN PROGRESS — Stages 1-5 all DONE (2026-07-23); Stage 6 (Docker image +
+compose profiles) NOT started.** P2 is COMPLETE (all 7 stages + the 4-bug audit).
+**Stages 2, 3 and 4 are all merged to `main`** (PR #15 `03bce8f`, PR #16 `c938875`, PR #17
+`ece4d4d`) — **Anik merged Stage 4 himself while this session was mid-Stage-5**, the fourth
+time in a row this log went stale within the session that wrote it (check `git`/`gh` before
+believing this file, always). Stage 5 was rebased onto `origin/main` after the fact — it
+started stacked on `feat/p3-stage4-serve`, correctly, since that was the only place its
+dependencies (`service.py`/`composition.py`) existed at the time, and became one clean
+commit on `main` once Stage 4 landed there. Branch **`feat/p3-stage5-api-keys`**, force-pushed
+(Anik's explicit call — see the session log for why a force-push was needed at all: the
+branch had already appeared on `origin` mid-session from a source this session did not
+initiate and could not identify — Cursor's extension hosts were active on this repo at the
+time, which is the leading suspect). No PR opened (push only when asked; opening one was not).
+Plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
+- **P3 STAGE 5 (API keys, scopes, rate limits) COMPLETE 2026-07-23.** **Green: 897 tests
+(+46), ruff, mypy (68 src files), gate unmoved 1.000/0.892/0.920.** New `auth.py` —
+argon2-hashed `id.secret` keys, per-project `read < write < admin` scopes, in-process
+token-bucket rate limits, `vaultrag key add|list|revoke`. Replaces Stage 4's single
+bootstrap key outright (`Settings.api_key` removed; `VAULTRAG_API_KEY` now fails loudly,
+same shape as the retired `VAULTRAG_RERANK_ENABLED` guard) rather than layering the real
+model beside it.
+  - **The enforcement point held exactly as Stage 4 built it for.** `api/deps.py`'s
+  `require_key` — router-wide, so a new route is authenticated by default — got a new body
+  (DB lookup + argon2 verify + rate limit) and a new sibling, `require_scope(level)`, which
+  each route now also declares (`RequiresRead`/`RequiresWrite`/`RequiresAdmin`). No route's
+  wiring changed shape; Decision 4 predicted exactly this.
+  - **The real design call wasn't the crypto, it was what a scope table should say about a
+  project it doesn't mention.** A key with no entry for `X` can't tell "X exists, you can't
+  see it" from "X doesn't exist" from the scopes map alone. Settled on the more honest of
+  two defensible answers: `require_scope` checks whether `X` is in the *served* set
+  (`request.app.state.service.projects`) before consulting the key's scopes — a real,
+  unscoped project 403s (`insufficient-scope`), a nonexistent one falls through to the
+  service's own `UnknownProject` 404, identical to what MCP already answers for the same
+  typo under a strictly weaker trust model. Verified by mutation: neutering that branch
+  killed exactly the 3 tests written for it (`test_a_key_scoped_to_one_project_cannot_reach
+  _a_different_served_project` + the read/write-scope adversarial pair), nothing else.
+  - **`list_projects` over REST is filtered to the caller's scopes; the MCP tool is not.**
+  MCP has no keys to filter by (stdio inherits local-user trust for everything, always).
+  REST is the first transport with a narrower caller — returning every served project to an
+  unscoped key would be the "narrow, never widen" tenancy rule violated at discovery
+  instead of at search. The Stage 4 parity test for this tool now explicitly compares
+  against an **admin-everywhere** key, which is the honest scope of the parity claim once
+  REST can legitimately answer less than MCP for the same call.
+  - **Two more mutations confirmed load-bearing, not just written:** neutering
+  `verify_secret`'s call site (accept any secret) killed `test_authenticate_rejects_a_wrong
+  _secret` + `test_no_plaintext_key_appears_in_the_store_or_the_logs`; neutering the
+  rate-limit branch killed all 3 rate-limit tests (2 unit, 1 live-clock HTTP). 8 mutations
+  run this stage, 8 killed, 0 survivors.
+  - **Verified live, not just in tests:** `vaultrag serve` against the real `vaultrag-design`
+  index — admin key lists/searches/writes-refused-correctly, read key 403s on notes and
+  reindex with `insufficient-scope`, revoking the admin key mid-session 401s its *very
+  next* request (no restart, no cache to invalidate), `/metrics` shows
+  `vaultrag_key_requests_total{key_id=...}` per key, no plaintext secret anywhere in
+  `state/vaultrag.db` (checked with `strings`). Query log inherited the REST search with
+  zero Stage 5 code, same as Stage 4 — Stage 3's placement keeps paying for itself.
+  - **Two vault notes written** (status `proposed`):
+  `agent-inbox/key-scopes-and-rate-limit-design-calls.md` (six under-specified calls: key
+  format, one-level-not-a-set scopes, the any-project bar for project-less routes, the
+  `list_projects` filter, the 403-vs-404 tenancy-typo distinction, rate-limit units) — the
+  403-vs-404 one is the one worth reading first, the same way Stage 4 flagged its
+  `/metrics`-key contradiction as the one worth reading first.
+  - **Dependency weight, measured before committing:** `argon2-cffi` is **+2 packages /
+  ~120 KB** — `cffi`/`pycparser` were already resolved transitively (qdrant-client's grpc
+  stack), so only argon2 itself (28 KB) and its cffi bindings (90 KB) are new. Base
+  dependency, not an extra: no lighter option hashes secrets correctly (bcrypt truncates
+  past 72 bytes; PBKDF2 has no memory-hardness).
+  - **Box back to its starting state:** both dogfood keys revoked, the one dogfood
+  `query_log` row deleted, `api_keys` table empty again (as Stage 4 left it, just with the
+  table now real instead of absent), server stopped, only `vaultrag-design` registered.
 - **P3 STAGE 4 (`serve` — FastAPI `/v1`, `ROLE` switch, `/metrics` mounted) COMPLETE
 2026-07-22.** **Green: 851 tests (+62), ruff, mypy (67 src files), gate unmoved
 1.000/0.892/0.920.** **Decision 4 implemented as recommended** (single bootstrap key from
-env, required on every route but `/healthz`; Stage 5 grows it in place).
+env, required on every route but `/healthz`; Stage 5 grows it in place — done, see above).
   - **The stage's real content was a refactor the plan did not name.** "A thin wrapper over
   the same core" was true of retrieval and false of everything else — parent-resolver
   wiring, compact mode, the query-log policy, vault containment, `overview`'s caps and
@@ -287,26 +351,31 @@ Write path: gated `NoteWriter` → git commit → synchronous `ingest_path`. Swa
 `Embedder`/`Reranker`/`VectorStore`/`MetaStore`/`SparseEmbedder`/`ParentResolver` protocols.
 **Green: `ruff`, `ruff format`, `mypy src` (41 files), `pytest` (315 tests).** Per-module detail
 lives in the code, `MEMORY-p1.md` (P1), and `MEMORY-p0.md` (P0).
-- **What's next: P3 STAGE 5 (API keys, scopes, rate limits — tenancy hardening)**
-at `../Rag/projects/vaultrag/p3-step-plan.md`. Scope: `reference-security-model.md`'s auth
-model on top of Stage 4 — `api_keys` table, **argon2 at rest**, per-project scopes crossed
-with read|write|admin, per-key token buckets, `vaultrag key add|list|revoke`. **The
-enforcement point already exists**: `api/deps.py`'s `require_key` is attached to the router
-as a whole (so a new endpoint is authenticated by default), which means Stage 5 replaces the
-*body* of one function rather than touching every route. Its verify block is the adversarial
-set — a key scoped to A cannot reach B by any route, path param, body filter, or wildcard.
+- **What's next: P3 STAGE 6 (Docker image + compose profiles — Grafana/Prometheus,
+Langfuse, alerts)** at `../Rag/projects/vaultrag/p3-step-plan.md`. Nothing blocks it. Its
+verify is the DR drill run for real (fresh volumes → clone vault → compose up → reindex →
+search) and a measured RSS number against the note's 3-4 GB claim, plus Decision 5
+(base/formats image split) which already has a recommendation, just needs ratifying.
+**Branch state:** Stage 4 merged to `main` mid-Stage-5 (PR #17); Stage 5
+(`feat/p3-stage5-api-keys`) was rebased onto `origin/main` after the fact and is now one
+clean commit ahead of it, force-pushed, no PR opened yet. Branch Stage 6 off `main` once
+Stage 5 is merged (or off `feat/p3-stage5-api-keys` if it starts before that, the same
+call this session made for Stage 5 itself).
   **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7) and
-  (5) Docker base/formats split (Stage 6). Decisions 2, 3 and 4 are **settled/implemented**.
-  Five `agent-inbox/` notes await a ruling:
+  (5) Docker base/formats split (Stage 6, recommendation given). Decisions 2, 3 and 4 are
+  **settled/implemented**.
+  Six `agent-inbox/` notes await a ruling:
   `compression-similarity-is-lexical-not-vector.md` (Stage 1), `overview-tool-shape.md`
   (Stage 2), `query-log-stores-text-opt-in.md` (Stage 3 — its **`top_score` section flags a
-  supersession that went beyond what was ratified**), and two from Stage 4:
+  supersession that went beyond what was ratified**), two from Stage 4:
   `serve-transport-design-calls.md` (the `/metrics`-needs-a-key call is the one that
   reinterprets a `reference/` note, and the `POST /v1/projects` 501 is the one endpoint not
-  built) and `step-plans-outrank-the-design-notes-they-mention.md` (**the one worth reading
-  first — it is a measured retrieval-quality finding, and it says the gate corpus is missing
-  a document shape, not just eight golden cases**). **Dogfooding:** the `vaultrag` MCP server has
-  been run
+  built) and `step-plans-outrank-the-design-notes-they-mention.md` (a measured
+  retrieval-quality finding — the gate corpus is missing a document shape, not just eight
+  golden cases), and one from Stage 5: `key-scopes-and-rate-limit-design-calls.md`
+  (**read this one's §5 first — the 403-vs-404 call for an out-of-scope vs. nonexistent
+  project is the sharpest judgment call in the stage**). **Dogfooding:** the `vaultrag` MCP
+  server has been run
   against the live `vaultrag-design` index in prior sessions — use `search`/`open` against
   `../Rag` while building and treat bad retrieval as a real bug report (repo `CLAUDE.md` §1). To
   (re)build the index: ensure `ollama serve` + `docker compose up -d qdrant` are up, then
@@ -345,7 +414,101 @@ Prepend newest first. Template:
 
 ## Session log
 
-### 2026-07-22 (latest) — P3 Stage 4: `serve`, and the extraction that made parity structural
+### 2026-07-23 (latest) — P3 Stage 5: API keys, and the 403-vs-404 call scopes forced
+
+- **Did:** Anik: *"if all the bugs are resolve then move to next stage."* Verified rather
+than trusted this log again — this time it checked out: `git status` showed
+`feat/p3-stage4-serve` clean, up to date with its remote, and MEMORY.md's own record of
+851 tests / ruff / mypy / gate PASS reproduced exactly on a fresh run before touching any
+code. Both bugs the handoff named (the vacuous parity test, the drift check that made
+`vaultrag mcp` require a live Qdrant) were already fixed and covered by tests, not just
+claimed fixed. Stage 4 is still unmerged (no PR), so branched Stage 5 off it rather than
+off `main`, since Stage 5's code depends on `service.py`/`composition.py`.
+- **The crypto and the scope model were the easy 80%; the hard 20% was what a scope table
+should say about a project it was never told about.** A key with no entry for project `X`
+can't distinguish "X exists, you can't see it" from "X doesn't exist" from the map alone.
+Settled on the more honest of two defensible answers: check whether `X` is actually served
+(`request.app.state.service.projects`, the same set `VaultRAGService.select()` enforces
+against) *before* consulting the key's scopes. A real project the key can't reach 403s
+(`insufficient-scope`); a project that plain doesn't exist falls through to the service's
+own `UnknownProject` 404 — identical to what MCP already answers for the same typo, under
+a *weaker* trust model (no keys at all). The alternative (403 for anything absent from the
+map, uniformly) is simpler but turns "no such project" into "you can't see this project"
+for an operator's typo, which is a worse answer bought for a confidentiality property nothing
+else on this surface holds anyway (`GET /v1/projects` already reveals the served-id list to
+any sufficiently-scoped key, and MCP's refusals already name it).
+- **`list_projects` breaks Stage 4's parity claim, and that is correct, not a regression.**
+MCP has no keys to filter by — stdio is local-user trust for everything, always, and
+returns every served project. REST is the first transport with a caller narrower than
+"whoever started this process," so returning every served project to an unscoped key would
+be the tenancy rule ("narrow, never widen") violated at *discovery* instead of at *search*.
+Filtered the REST response to `p.id in key.scopes`; rewrote the Stage-4 parity test for
+this tool to compare against an **admin-everywhere** key specifically, which is the honest
+scope of what "parity" can mean once REST is allowed to legitimately answer with less than
+MCP for the identical call.
+- **Enforcement point held exactly as Decision 4 predicted.** `api/deps.py`'s `require_key`
+kept its position (router-wide, so a new route is authenticated by default) and only its
+body changed — DB lookup by the key's public `id` half, argon2-verify the secret half,
+check a per-key token bucket. One new sibling, `require_scope(level)`, which every route
+now also declares (`RequiresRead`/`RequiresWrite`/`RequiresAdmin`). No route's wiring
+pattern changed shape.
+- **Mutation-verified, 8 for 8.** Neutered the per-project scope check (killed the 3 tests
+written for cross-project and read/write-scope refusal, nothing else); neutered the
+any-project check for `{project}`-less routes (killed exactly the `list_projects`/
+`register_project` scope tests); neutered `verify_secret`'s call site (killed the wrong-key
+test **and** the no-plaintext-in-logs test, which only fires because a wrong secret is what
+generates the log line it checks); neutered the rate-limit branch (killed all 3 rate-limit
+tests — 2 unit-level with an injectable clock, 1 live over HTTP). Zero survivors, each
+mutation reverted immediately after confirming the kill.
+- **`VAULTRAG_API_KEY` is retired outright, not kept as a fallback.** Stage 4's single
+bootstrap key model is gone; an operator's compose file or shell profile still setting it
+now fails loudly at startup rather than silently doing nothing (pydantic-settings ignores
+env vars matching no field) — the same guard shape as the existing
+`VAULTRAG_RERANK_ENABLED` → `VAULTRAG_RERANK_MODE` retirement from P2, the second time this
+exact trap has been worth naming instead of hoping nobody hits it. The **bootstrap
+property** carries forward unchanged in spirit: an empty `api_keys` table still mints one
+admin-everywhere key at `serve` startup and prints it once, so the HTTP transport is never
+keyless on a fresh box — it is just a real, hashed, stored key now instead of a bare
+env-var string comparison.
+- **Verified live against the real `vaultrag-design` index**, not only against fakes:
+started `vaultrag serve` for real, minted an admin key and a read-only key via the CLI,
+confirmed 401 with no key / 200 for admin `list_projects` / a real hybrid search / 403
+`insufficient-scope` for the read key on both `notes` and `reindex` / 401 immediately after
+revoking the admin key mid-session (no restart) / the `key_requests_total{key_id=...}`
+series on `/metrics` / no plaintext secret anywhere in `state/vaultrag.db` (checked with
+`strings`). The query log picked up the REST search with zero Stage 5 code, same free ride
+Stage 4 got — Stage 3's placement keeps paying for itself a second time.
+- **Verified:** 897 tests (+46: 35 in new `test_auth.py`, ~9 adversarial scope/rate-limit/
+revocation tests in `test_api.py`, 2 metrics), ruff, mypy (68 source files), **gate PASS
+1.000 / 0.892 / 0.920 (unmoved — this stage touches no retrieval code)**. **Box back to its
+starting state:** both dogfood keys revoked, the one dogfood `query_log` row deleted
+by hand (the CLI's `--prune` is retention-based, not a full clear, so a direct `DELETE`
+was the honest tool for "remove my probe"), server stopped, only `vaultrag-design`
+registered.
+- **Files:** `auth.py` (new), `store/{base,sqlite}.py` (`api_keys` DDL + CRUD),
+`api/{deps,app,routes,errors,__init__}.py`, `composition.py` (`build_stack(auth=...)`),
+`cli.py` (`key add|list|revoke`, `serve` wiring), `config.py` (`api_key` field removed +
+retirement guard), `metrics.py` (`key_requests_total`), `pyproject.toml` (`argon2-cffi`);
+tests: `test_auth.py` (new), `fakes.py` (`FakeKeyStore`), `test_api.py`, `test_cli.py`,
+`test_metrics.py`; vault: `agent-inbox/key-scopes-and-rate-limit-design-calls.md` (new),
+`projects/vaultrag/p3-step-plan.md` (Stage 5 log).
+- **Next / handoff:** **Stage 6 (Docker image + compose profiles).** Nothing blocks it.
+The one thing worth Anik's eyes before it: **the §5 (403-vs-404) section of
+`agent-inbox/key-scopes-and-rate-limit-design-calls.md`** — it is the sharpest judgment
+call this stage made and the one most likely to be worth a second opinion.
+**Mid-session, Anik merged Stage 4 to `main` (PR #17) while Stage 5 was being built on top
+of it** — the fourth time in a row a prior handoff went stale within the hour it was
+written (check `git`/`gh`, not this file, every time). Stage 5 was rebased onto
+`origin/main` and force-pushed (Anik's call, asked for explicitly rather than assumed) once
+Stage 4 landed there — it is now one clean commit ahead of `main`, matching every prior
+stage's shape. **A second, unrelated surprise:** `feat/p3-stage5-api-keys` appeared on
+`origin` mid-session before this session ever ran `git push` — Cursor's extension hosts
+were active on this repo at the time and are the leading suspect, but the mechanism was
+never confirmed. Flagged to Anik rather than silently worked around; worth him checking
+whether some tool on this box auto-publishes branches, since the next stage could hit the
+same thing and it is worth knowing the cause rather than the workaround.
+
+### 2026-07-22 — P3 Stage 4: `serve`, and the extraction that made parity structural
 
 - **Did:** Anik: *"if all the bug are resolve then move to next to stage."* Verified first
 rather than trusting this log — and it was stale again: **Anik had already merged Stage 3 as

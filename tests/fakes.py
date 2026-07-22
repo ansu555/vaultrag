@@ -13,10 +13,12 @@ conformance tests in ``test_index.py`` pin down for the real implementations.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
 from vaultrag.index.base import ScoredChunk, SearchFilters, SparseVector, VectorStoreError
 from vaultrag.models import Chunk, Document
 from vaultrag.retrieval import ParentSection
+from vaultrag.store.base import ApiKeyRow
 
 PROJECT = "vaultrag-design"
 
@@ -179,6 +181,52 @@ class DownVectorStore(FakeVectorStore):
 
     def query(self, **kwargs: object) -> list[ScoredChunk]:  # type: ignore[override]
         raise VectorStoreError("cannot reach Qdrant (is it running? `docker compose up -d qdrant`)")
+
+
+class FakeKeyStore:
+    """In-memory ``auth.KeyStore`` — no filesystem, no real database.
+
+    Satisfies the same narrow protocol :class:`~vaultrag.store.sqlite.SQLiteMetaStore`
+    implements for real (``auth.KeyAuthenticator`` only ever calls these five methods), so
+    a test can stand up a key store in a line instead of opening a SQLite file it then has
+    to close.
+    """
+
+    def __init__(self) -> None:
+        self._rows: dict[str, ApiKeyRow] = {}
+
+    def create_api_key(
+        self,
+        *,
+        key_id: str,
+        name: str | None,
+        key_hash: str,
+        scopes: Mapping[str, str],
+        rate_limit: int,
+    ) -> None:
+        self._rows[key_id] = ApiKeyRow(
+            id=key_id,
+            name=name,
+            key_hash=key_hash,
+            scopes=dict(scopes),
+            rate_limit=rate_limit,
+            created_ts=0,
+            last_used=None,
+        )
+
+    def get_api_key(self, key_id: str) -> ApiKeyRow | None:
+        return self._rows.get(key_id)
+
+    def list_api_keys(self) -> list[ApiKeyRow]:
+        return list(self._rows.values())
+
+    def delete_api_key(self, key_id: str) -> bool:
+        return self._rows.pop(key_id, None) is not None
+
+    def touch_api_key(self, key_id: str, *, used_ts: int) -> None:
+        row = self._rows.get(key_id)
+        if row is not None:
+            self._rows[key_id] = replace(row, last_used=used_ts)
 
 
 def make_hit(

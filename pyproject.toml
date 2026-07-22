@@ -7,6 +7,13 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Anik" }]
 dependencies = [
+    # Real key hashing (P3 Stage 5), replacing Stage 4's compare_digest bootstrap.
+    # Weighed before committing, the way FastAPI/Docling/prometheus-client were:
+    # +2 packages / ~120 KB (argon2 28 KB, its cffi bindings 90 KB) — cffi and pycparser
+    # were already resolved transitively (qdrant-client's grpc stack), so they cost
+    # nothing new. No credible lighter option hashes passwords correctly: bcrypt truncates
+    # input past 72 bytes and PBKDF2 has no memory-hardness, so this is the base, not an extra.
+    "argon2-cffi>=25.1.0",
     "blake3>=1.0.9",
     # The REST transport (P3 Stage 4). Weighed before committing, the way Docling and
     # prometheus-client were: FastAPI adds **1 package / 904 KB** and nothing else,
