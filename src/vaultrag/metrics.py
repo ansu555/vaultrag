@@ -157,6 +157,7 @@ class _Metrics:
     rerank_decisions: Counter
     write_ops: Counter
     write_refused: Counter
+    index_drift: Gauge
 
 
 def _build() -> _Metrics:
@@ -258,6 +259,15 @@ def _build() -> _Metrics:
     for reason in WRITE_REFUSAL_REASONS:
         write_refused.labels(reason=reason)
 
+    index_drift = Gauge(
+        "vaultrag_index_drift_chunks",
+        "Manifest chunk count minus vector-store point count, per project. Zero is "
+        "healthy; positive means the vector store is missing chunks SQLite records "
+        "(reindex will skip them — see consistency.py); negative means orphaned points.",
+        ["project"],
+        registry=registry,
+    )
+
     return _Metrics(
         registry=registry,
         build_info=build_info,
@@ -272,6 +282,7 @@ def _build() -> _Metrics:
         rerank_decisions=rerank_decisions,
         write_ops=write_ops,
         write_refused=write_refused,
+        index_drift=index_drift,
     )
 
 
@@ -306,6 +317,17 @@ def set_build_info(version: str) -> None:
     _M.build_info.labels(version=version).set(1)
 
 
+def set_index_drift(chunks: int, *, project: str) -> None:
+    """Publish one project's manifest-vs-vector disagreement (P3 Stage 4).
+
+    A gauge rather than a counter because drift is a *state*, not an event: it is repaired
+    by ``reindex --force`` and the series must fall back to zero when it is. Set at startup
+    by the drift check and after each reindex, which is as often as the number can change
+    without something else already having logged.
+    """
+    _M.index_drift.labels(project=project).set(chunks)
+
+
 def init_project_labels(project_id: str) -> None:
     """Pre-initialise every ``project``-labelled series for one tenant, at zero.
 
@@ -326,6 +348,10 @@ def init_project_labels(project_id: str) -> None:
         _M.write_ops.labels(action=action, project=project_id)
     _M.searches.labels(project=project_id)
     _M.searches_empty.labels(project=project_id)
+    # Zero is the healthy value *and* a real measurement, so it must be present from the
+    # first scrape: an absent drift series and a drift of 0 mean opposite things, and the
+    # startup check publishes the true number moments later anyway.
+    _M.index_drift.labels(project=project_id).set(0)
 
 
 def record_ingest_lag(seconds: float, *, source: str, project: str) -> None:

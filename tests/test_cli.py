@@ -740,3 +740,142 @@ def test_queries_prune_applies_the_retention_caps(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "pruned" in result.output
+
+
+# ---------------------------------------------------------------------------
+# serve (P3 Stage 4) — the ROLE switch, the bind, the bootstrap key
+# ---------------------------------------------------------------------------
+def _serve_env(tmp_path: Path) -> dict[str, str]:
+    return {
+        "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+        "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+    }
+
+
+def _stub_uvicorn(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Capture what ``serve`` would have bound, without binding it."""
+    import uvicorn
+
+    bound: list[dict[str, Any]] = []
+
+    def _run(app_: Any, **kwargs: Any) -> None:
+        bound.append({"app": app_, **kwargs})
+
+    monkeypatch.setattr(uvicorn, "run", _run)
+    return bound
+
+
+def test_serve_binds_loopback_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """reference-security-model: bind 127.0.0.1 by default. A default that reached the
+    network would be a security decision made by omission."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    bound = _stub_uvicorn(monkeypatch)
+    result = runner.invoke(
+        app, ["serve", "--project", "p", "--vault", str(vault)], env=_serve_env(tmp_path)
+    )
+    assert result.exit_code == 0, result.output
+    assert bound[0]["host"] == "127.0.0.1"
+    assert bound[0]["port"] == 8000
+
+
+def test_serve_warns_when_bound_wider_than_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not a refusal — an operator behind Tailscale has a real reason — but never silent."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _stub_uvicorn(monkeypatch)
+    result = runner.invoke(
+        app,
+        ["serve", "--project", "p", "--vault", str(vault), "--host", "0.0.0.0"],
+        env=_serve_env(tmp_path),
+    )
+    assert result.exit_code == 0, result.output
+    assert "warning" in result.output
+    assert "Tailscale" in result.output
+
+
+def test_serve_mints_and_prints_a_key_when_none_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 4: the HTTP transport is never keyless, but a missing key is a
+    configuration gap rather than a reason to refuse to boot."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    bound = _stub_uvicorn(monkeypatch)
+    result = runner.invoke(
+        app, ["serve", "--project", "p", "--vault", str(vault)], env=_serve_env(tmp_path)
+    )
+    assert result.exit_code == 0, result.output
+    assert "API key" in result.output
+    assert "VAULTRAG_API_KEY" in result.output
+    assert bound[0]["app"].state.api_key in result.output
+
+
+def test_serve_uses_the_configured_key_and_never_prints_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured key is the operator's secret; echoing it to stdout would put it in
+    every terminal scrollback and CI log that ever started the server."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    bound = _stub_uvicorn(monkeypatch)
+    result = runner.invoke(
+        app,
+        ["serve", "--project", "p", "--vault", str(vault)],
+        env={**_serve_env(tmp_path), "VAULTRAG_API_KEY": "configured-secret-key"},
+    )
+    assert result.exit_code == 0, result.output
+    assert bound[0]["app"].state.api_key == "configured-secret-key"
+    assert bound[0]["app"].state.key_was_minted is False
+    assert "configured-secret-key" not in result.output
+
+
+def test_serve_refuses_a_vault_path_that_is_not_a_directory(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["serve", "--project", "p", "--vault", str(tmp_path / "nope")],
+        env=_serve_env(tmp_path),
+    )
+    assert result.exit_code == 1
+    assert "not a directory" in result.output
+
+
+def test_serve_indexer_role_without_a_watcher_says_use_reindex(tmp_path: Path) -> None:
+    """An indexer with no watcher has nothing to do after startup; blocking forever would
+    look like it was working."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = runner.invoke(
+        app,
+        ["serve", "--project", "p", "--vault", str(vault), "--role", "indexer", "--no-watch"],
+        env=_serve_env(tmp_path),
+    )
+    assert result.exit_code == 1
+    assert "vaultrag reindex" in result.output
+
+
+def test_serve_role_comes_from_the_environment_for_the_container_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reference-docker-compose: one image, two containers, told apart by VAULTRAG_ROLE.
+    The flag exists for a person; the env var is what compose sets."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    bound = _stub_uvicorn(monkeypatch)
+    result = runner.invoke(
+        app,
+        ["serve", "--project", "p", "--vault", str(vault), "--no-watch"],
+        env={**_serve_env(tmp_path), "VAULTRAG_ROLE": "indexer"},
+    )
+    assert result.exit_code == 1
+    assert "vaultrag reindex" in result.output
+    assert not bound, "the indexer role must not bind an HTTP port"
+
+
+def test_serve_help_names_both_roles() -> None:
+    result = runner.invoke(app, ["serve", "--help"])
+    assert result.exit_code == 0
+    assert "api" in result.output
+    assert "indexer" in result.output

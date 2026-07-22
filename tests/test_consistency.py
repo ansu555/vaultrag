@@ -309,3 +309,111 @@ def test_force_is_idempotent(
 
     assert vector_store.count(PROJECT) == 3
     assert store.chunk_count(PROJECT) == 3
+
+
+# ---------------------------------------------------------------------------
+# The startup gate (P3 Stage 4) — the P2 carry-over closed
+# ---------------------------------------------------------------------------
+def _stack(
+    tmp_path: Path,
+    store: SQLiteMetaStore | None,
+    vector_store: object,
+    *,
+    project: str = PROJECT,
+) -> object:
+    """A ServedStack with just the fields the drift check reads."""
+    from vaultrag.composition import ServedStack
+    from vaultrag.config import Settings
+
+    settings = Settings(project_id=project, vault_path=tmp_path, state_dir=tmp_path / "state")
+    return ServedStack(
+        service=None,  # type: ignore[arg-type]  # the check never touches it
+        settings=[settings],
+        vector_store=vector_store,  # type: ignore[arg-type]
+        store=store,
+    )
+
+
+def test_a_drifted_index_refuses_to_start(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    """The whole point of the gate: a long-running role must not serve stale results.
+
+    The drift is created the way the live incident created it — index, then wipe the
+    vector store while SQLite keeps its manifest.
+    """
+    from vaultrag.composition import check_startup_drift
+    from vaultrag.consistency import DriftError
+
+    vault = write_vault(tmp_path, {"one.md": ONE_SECTION_NOTE, "two.md": TWO_SECTION_NOTE})
+    run(vault, store, vector_store, embedder)
+    vector_store.delete_by_project(PROJECT)
+
+    with pytest.raises(DriftError) as excinfo:
+        check_startup_drift(_stack(tmp_path, store, vector_store))  # type: ignore[arg-type]
+    message = str(excinfo.value)
+    assert "reindex --force" in message  # names the repair, not just the problem
+    assert "--allow-drift" in message  # and the escape hatch
+
+
+def test_allow_drift_still_measures_it(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    """Refusing to *fail* on drift is an operator's call; refusing to *measure* it is not."""
+    from vaultrag.composition import check_startup_drift
+    from vaultrag.metrics import registry
+
+    vault = write_vault(tmp_path, {"one.md": ONE_SECTION_NOTE})
+    run(vault, store, vector_store, embedder)
+    vector_store.delete_by_project(PROJECT)
+
+    drifted = check_startup_drift(_stack(tmp_path, store, vector_store), enabled=False)  # type: ignore[arg-type]
+    assert [d.project_id for d in drifted] == [PROJECT]
+    gauge = registry().get_sample_value("vaultrag_index_drift_chunks", {"project": PROJECT})
+    assert gauge is not None and gauge > 0
+
+
+def test_a_healthy_index_starts_and_publishes_zero(
+    tmp_path: Path, store: SQLiteMetaStore, vector_store: QdrantVectorStore, embedder: FakeEmbedder
+) -> None:
+    """Zero is a real measurement, and must be published — an absent series and a drift of
+    zero mean opposite things to whoever is reading the dashboard."""
+    from vaultrag.composition import check_startup_drift
+    from vaultrag.metrics import registry
+
+    vault = write_vault(tmp_path, {"one.md": ONE_SECTION_NOTE})
+    run(vault, store, vector_store, embedder)
+
+    assert check_startup_drift(_stack(tmp_path, store, vector_store)) == []  # type: ignore[arg-type]
+    assert registry().get_sample_value("vaultrag_index_drift_chunks", {"project": PROJECT}) == 0.0
+
+
+def test_an_unreachable_vector_store_is_not_drift_and_does_not_block_startup(
+    tmp_path: Path, store: SQLiteMetaStore
+) -> None:
+    """A down Qdrant must not turn into a refusal to launch.
+
+    Before this gate existed, a read-only ``vaultrag mcp`` came up instantly whether or not
+    Qdrant was running, and a down backend surfaced as an actionable per-call error. The
+    gate guards against the *opposite* problem — drift is dangerous because it is silent —
+    so trading a loud, recoverable failure for a dead agent session would be a bad swap.
+    """
+    from vaultrag.composition import check_startup_drift
+    from vaultrag.index.base import VectorStoreError
+
+    class _Down:
+        def count(self, project_id: str | None = None) -> int:
+            raise VectorStoreError("count on 'chunks' failed: [Errno 61] Connection refused")
+
+    assert check_startup_drift(_stack(tmp_path, store, _Down())) == []  # type: ignore[arg-type]
+
+
+def test_no_metadata_store_means_nothing_to_check(tmp_path: Path) -> None:
+    """A read-only role over an index this process cannot see has no manifest to compare."""
+    from vaultrag.composition import check_startup_drift
+
+    class _Unused:
+        def count(self, project_id: str | None = None) -> int:
+            raise AssertionError("must not be consulted without a manifest")
+
+    assert check_startup_drift(_stack(tmp_path, None, _Unused())) == []  # type: ignore[arg-type]
