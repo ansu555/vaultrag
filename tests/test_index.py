@@ -299,6 +299,42 @@ def test_delete_by_doc_cannot_reach_across_projects(store: QdrantVectorStore) ->
     assert store.count() == 1
 
 
+def test_delete_by_project_removes_one_tenant_entirely(store: QdrantVectorStore) -> None:
+    """The vector half of deregistering a project (P3 Stage 2).
+
+    Found by dogfooding, not by a fixture: `vaultrag project rm` cascaded SQLite and left
+    243 real points behind, because the two derived caches are lost independently and only
+    the composition root holds both.
+    """
+    mine = [make_chunk(ix=i) for i in range(3)]
+    theirs = [make_chunk(ix=0, project_id=OTHER_PROJECT)]
+    store.upsert_chunks(mine, vectors_for(mine), embed_model="fake-model")
+    store.upsert_chunks(theirs, vectors_for(theirs), embed_model="fake-model")
+
+    store.delete_by_project(PROJECT)
+    assert store.count(PROJECT) == 0
+    assert store.count(OTHER_PROJECT) == 1  # the neighbour is untouched
+
+
+def test_delete_by_project_spanning_several_documents(store: QdrantVectorStore) -> None:
+    """Deregistration is not per-document: every doc of the tenant goes, in one call."""
+    a = [make_chunk(ix=0, path="a.md"), make_chunk(ix=1, path="a.md")]
+    b = [make_chunk(ix=0, path="b.md")]
+    store.upsert_chunks(a + b, vectors_for(a + b), embed_model="fake-model")
+    assert store.count(PROJECT) == 3
+    store.delete_by_project(PROJECT)
+    assert store.count(PROJECT) == 0
+
+
+def test_delete_by_project_of_an_unknown_project_is_not_an_error(
+    store: QdrantVectorStore,
+) -> None:
+    chunks = [make_chunk()]
+    store.upsert_chunks(chunks, vectors_for(chunks), embed_model="fake-model")
+    store.delete_by_project("never-registered")
+    assert store.count() == 1
+
+
 def test_count_is_scoped_by_project(store: QdrantVectorStore) -> None:
     mine = [make_chunk(ix=0)]
     theirs = [make_chunk(ix=0, project_id=OTHER_PROJECT)]

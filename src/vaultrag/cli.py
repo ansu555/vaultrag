@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
@@ -62,11 +64,11 @@ from vaultrag.index.sparse import Bm25Embedder
 from vaultrag.indexer.pipeline import IngestContext, reindex_vault
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.logging import configure_logging, get_logger
-from vaultrag.mcp import build_mcp_server
-from vaultrag.metrics import set_build_info, start_metrics_server
+from vaultrag.mcp import ServedProject, build_mcp_server
+from vaultrag.metrics import init_project_labels, set_build_info, start_metrics_server
 from vaultrag.parsing.image import load_image_parser
 from vaultrag.parsing.pdf import load_pdf_parser
-from vaultrag.projects import ProjectRegistry
+from vaultrag.projects import ProjectRegistry, UnknownProjectError
 from vaultrag.retrieval import (
     compress_params_for,
     graph_params_for,
@@ -103,6 +105,32 @@ def _root(
     """VaultRAG CLI."""
 
 
+@contextmanager
+def _registry(base: Settings) -> Iterator[ProjectRegistry | None]:
+    """Yield a registry over the shared state db, or ``None`` when there isn't one to read.
+
+    Two ways to get ``None``, both deliberate. **No db file:** a read-only
+    ``mcp --project X --vault Y`` must not conjure an empty state db just to discover the
+    project isn't registered (the same invariant the graph reader keeps) — and with no db
+    there are no registered projects anyway. **An unopenable db** (unwritable state dir, a
+    corrupt file): fall through silently so the *command's* own guarded store-open reports
+    the real error with a message, rather than this helper raising a traceback out of
+    argument resolution.
+    """
+    if not base.db_path.is_file():
+        yield None
+        return
+    try:
+        store = SQLiteMetaStore.from_settings(base)
+    except (OSError, sqlite3.Error):
+        yield None
+        return
+    try:
+        yield ProjectRegistry(store, base)
+    finally:
+        store.close()
+
+
 def _resolve_settings(project: str | None, vault: Path | None) -> Settings:
     """Resolve the :class:`Settings` a command runs under, via the project registry.
 
@@ -111,26 +139,13 @@ def _resolve_settings(project: str | None, vault: Path | None) -> Settings:
     ``--project`` keeps the P0 single-project shorthand (base settings with the id set), and
     an explicit ``--vault`` always wins — run a registered project against a different tree,
     or point at a vault before registering it.
-
-    Registry lookup opens a throwaway store on the shared db; if that open fails (unwritable
-    state dir, etc.) it falls back to the shorthand so the *command's* own guarded store-open
-    reports the real error with a message, not a traceback here.
     """
     base = load_settings()
     resolved: Settings | None = None
-    # Only consult the registry if a db already exists: a read-only `mcp --project X --vault Y`
-    # must not conjure an empty state db just to discover the project isn't registered (the
-    # same invariant the graph reader keeps), and with no db there are no registered projects.
-    if project is not None and base.db_path.is_file():
-        try:
-            store = SQLiteMetaStore.from_settings(base)
-            try:
-                if store.get_project(project) is not None:
-                    resolved = ProjectRegistry(store, base).resolve(project)
-            finally:
-                store.close()
-        except (OSError, sqlite3.Error):
-            resolved = None  # let the command's guarded open surface the error
+    if project is not None:
+        with _registry(base) as registry:
+            if registry is not None and registry.get(project) is not None:
+                resolved = registry.resolve(project)
 
     settings = resolved or base
     updates: dict[str, object] = {}
@@ -139,6 +154,49 @@ def _resolve_settings(project: str | None, vault: Path | None) -> Settings:
     if vault is not None:
         updates["vault_path"] = vault  # explicit --vault overrides the registry
     return settings.model_copy(update=updates) if updates else settings
+
+
+def _resolve_served_settings(projects: list[str] | None, vault: Path | None) -> list[Settings]:
+    """Resolve the set of projects one ``vaultrag mcp`` process serves (P3 Stage 2).
+
+    Three cases, in the order they are checked:
+
+    * **``--project`` given (once or several times)** — serve exactly those. More than one
+      must all be registered, because there is no per-project vault path to fall back on;
+      one keeps the P0 shorthand.
+    * **no ``--project``, projects registered** — serve *all* of them. This is the case the
+      stage exists for: ``claude mcp add vaultrag -- uv run vaultrag mcp`` picks up every
+      vault the operator registered, and adding a project later needs no re-registration of
+      the MCP server.
+    * **no ``--project``, nothing registered** — the P0 single-project path, base settings
+      as-is (with ``--vault`` applied if given).
+
+    ``--vault`` names one tree, so it is only meaningful for a single project; combining it
+    with several is a contradiction rather than a thing to guess at.
+    """
+    base = load_settings()
+    ids = list(projects or [])
+    if vault is not None and len(ids) > 1:
+        raise typer.BadParameter(
+            "--vault names one tree and cannot apply to several --project values; "
+            "register each project with `vaultrag project add` instead"
+        )
+    if not ids and vault is None:
+        with _registry(base) as registry:
+            ids = [row.id for row in registry.list()] if registry is not None else []
+    if len(ids) <= 1:
+        return [_resolve_settings(ids[0] if ids else None, vault)]
+
+    with _registry(base) as registry:
+        if registry is None:
+            raise typer.BadParameter(
+                "serving several projects needs the registry, and no state database exists "
+                "yet — run `vaultrag project add <id> --vault <path>` first"
+            )
+        try:
+            return [registry.resolve(pid) for pid in ids]
+        except UnknownProjectError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
 
 def _start_metrics(settings: Settings, *, requested: bool) -> bool:
@@ -344,7 +402,12 @@ def watch(
 @app.command()
 def mcp(
     project: Annotated[
-        str | None, typer.Option("--project", help="Project/tenant scope to serve.")
+        list[str] | None,
+        typer.Option(
+            "--project",
+            help="Project/tenant to serve; repeat to serve several. Omit to serve every "
+            "registered project (P3 Stage 2).",
+        ),
     ] = None,
     vault: Annotated[
         Path | None, typer.Option("--vault", help="Path to the vault `open` reads from.")
@@ -353,7 +416,7 @@ def mcp(
         bool,
         typer.Option(
             "--watch",
-            help="Also live-watch the vault in a background daemon thread (opt-in; "
+            help="Also live-watch the vault(s) in background daemon threads (opt-in; "
             "solo dogfooding). Off by default — serve/indexer own the watcher.",
         ),
     ] = False,
@@ -380,21 +443,28 @@ def mcp(
 
     stdout is the JSON-RPC channel, so nothing here may print to it — logs go to
     stderr (see ``vaultrag.logging``) and the FastMCP banner is disabled. Register
-    with: ``claude mcp add vaultrag -- uv run vaultrag mcp --project X``.
+    with: ``claude mcp add vaultrag -- uv run vaultrag mcp`` (every registered project), or
+    ``… mcp --project X`` for one.
     """
-    settings = _resolve_settings(project, vault)
-    configure_logging(settings.log_level)
+    served_settings = _resolve_served_settings(project, vault)
+    # Shared infrastructure is reserved per-project (projects._RESERVED_SETTINGS), so the
+    # first project's view of it is every project's view of it.
+    base = served_settings[0]
+    configure_logging(base.log_level)
     log = get_logger("vaultrag.cli")
 
-    project_id = settings.project_id
-    vault_path = settings.vault_path
-    if not vault_path.is_dir():
-        typer.echo(f"mcp failed: vault path is not a directory: {vault_path}", err=True)
-        raise typer.Exit(code=1)
+    for settings in served_settings:
+        if not settings.vault_path.is_dir():
+            typer.echo(
+                f"mcp failed: vault path for project {settings.project_id!r} is not a "
+                f"directory: {settings.vault_path}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
 
     # No typer.echo here, unlike `watch`: stdout is the JSON-RPC channel and a stray line
     # corrupts the stream. The bind is announced by structlog on stderr instead.
-    _start_metrics(settings, requested=metrics)
+    _start_metrics(base, requested=metrics)
 
     # By default search reads only Qdrant and open reads only the vault, and neither client
     # connects at construction time, so a read-only server comes up instantly (a down
@@ -402,129 +472,155 @@ def mcp(
     # write tools (write_note/…) and --watch both drive the single-file pipeline, and graph
     # expand + `related` read the link graph — all of them want the SQLite store, so it is
     # opened once and shared (the write/watch paths additionally reuse the raw embedder).
-    write_enabled = write and settings.writeback_enabled
-    vault_root = vault_path.resolve()
+    #
+    # What is built once vs per project mirrors ServedProject's own split: the vector store,
+    # sparse embedder, reranker and metadata store are already project-scoped on every call,
+    # while a vault root, a writer and an embedder belong to exactly one tenant.
     vector_store: QdrantVectorStore | None = None
-    embedder: OllamaEmbedder | None = None
     store: SQLiteMetaStore | None = None
-    watcher: VaultWatcher | None = None
+    embedders: list[OllamaEmbedder] = []
+    watchers: list[VaultWatcher] = []
     try:
         try:
-            vector_store = QdrantVectorStore.from_settings(settings)
-            embedder = OllamaEmbedder.from_settings(settings)
+            vector_store = QdrantVectorStore.from_settings(base)
             # Built at startup so the (possibly first-run) model download blocks here,
             # visibly, not mid-query. load_reranker never raises: a fetch/load failure
             # degrades to a no-op reranker so the server still serves (rerank-off).
             reranker = load_reranker(
-                mode=settings.rerank_mode,
-                repo_id=settings.rerank_model,
-                model_file=settings.rerank_model_file,
+                mode=base.rerank_mode,
+                repo_id=base.rerank_model,
+                model_file=base.rerank_model_file,
             )
-            # Obsidian display name for citation URIs (stage 8) + write-back note links:
-            # configured value, else the vault directory name (a vault named after its folder).
-            resolved_vault_name = settings.vault_name or vault_root.name
 
-            # One store, shared by write-back, --watch and the graph features (SQLite
-            # serializes its own writes; opened check_same_thread=False for exactly this
-            # multi-thread reuse). The write/watch paths *create* it — they own the manifest
-            # and jobs tables. The graph is only a reader, so it attaches to an existing DB
-            # and never conjures one: a read-only server pointed at a state dir with no
-            # index would otherwise leave an empty database behind, and an index that was
-            # never built has no graph to serve anyway.
-            graph_enabled = settings.graph_expand_enabled and settings.db_path.is_file()
-            if write_enabled or watch or graph_enabled:
-                store = SQLiteMetaStore.from_settings(settings)
+            # One store for every tenant — it is one db with `project_id` on every row
+            # (payload-partitioned tenancy, [[multi-tenant-architecture]]). SQLite serializes
+            # its own writes and is opened check_same_thread=False for exactly this
+            # multi-thread reuse. The write/watch paths *create* it — they own the manifest
+            # and jobs tables. The graph/overview readers only attach to an existing DB and
+            # never conjure one: a read-only server pointed at a state dir with no index
+            # would otherwise leave an empty database behind, and an index that was never
+            # built has no graph to serve anyway.
+            any_write = any(write and s.writeback_enabled for s in served_settings)
+            any_read_store = base.db_path.is_file() and any(
+                s.graph_expand_enabled for s in served_settings
+            )
+            if any_write or watch or any_read_store:
+                store = SQLiteMetaStore.from_settings(base)
 
             # Only the paths that *ingest* need it (write-back, --watch); a read-only
             # server never converts anything, so don't pay for the parser it won't use.
-            ingests = write_enabled or watch
+            ingests = any_write or watch
             pdf_parser = load_pdf_parser() if ingests else None
-            image_parser = load_image_parser(enabled=settings.ocr_enabled) if ingests else None
 
-            writer: NoteWriter | None = None
-            if write_enabled:
-                assert store is not None  # opened just above when write_enabled
-                writer = NoteWriter(
-                    IngestContext(
-                        project_id=project_id,
+            served: list[ServedProject] = []
+            for settings in served_settings:
+                vault_root = settings.vault_path.resolve()
+                write_enabled = write and settings.writeback_enabled
+                # Obsidian display name for citation URIs (stage 8) + write-back note links:
+                # configured value, else the vault directory name.
+                vault_name = settings.vault_name or vault_root.name
+                # Per project: the embedding model is a per-project setting
+                # ([[multi-tenant-architecture]]), so each tenant queries through its own.
+                embedder = OllamaEmbedder.from_settings(settings)
+                embedders.append(embedder)
+                image_parser = load_image_parser(enabled=settings.ocr_enabled) if ingests else None
+                # Built only when something will drive it: a read-only server has no store
+                # to put in one, and constructing a half-valid context to discard is how a
+                # None slips into the write path later.
+                ctx: IngestContext | None = None
+                if store is not None and (write_enabled or watch):
+                    ctx = IngestContext(
+                        project_id=settings.project_id,
                         vault_path=vault_root,
                         store=store,
                         vector_store=vector_store,
                         embedder=embedder,
                         pdf_parser=pdf_parser,
                         image_parser=image_parser,
-                    ),
-                    author=settings.writeback_author,
-                    allow_roots=settings.writeback_allow_roots,
-                    max_bytes=settings.writeback_max_bytes,
-                    max_writes_per_minute=settings.writeback_max_writes_per_minute,
-                    git_enabled=settings.writeback_git_enabled,
-                    vault_name=resolved_vault_name,
+                    )
+                writer: NoteWriter | None = None
+                if write_enabled:
+                    assert ctx is not None  # any_write opened the store above
+                    writer = NoteWriter(
+                        ctx,
+                        author=settings.writeback_author,
+                        allow_roots=settings.writeback_allow_roots,
+                        max_bytes=settings.writeback_max_bytes,
+                        max_writes_per_minute=settings.writeback_max_writes_per_minute,
+                        git_enabled=settings.writeback_git_enabled,
+                        vault_name=vault_name,
+                    )
+                served.append(
+                    ServedProject(
+                        project_id=settings.project_id,
+                        vault_root=vault_root,
+                        embedder=QueryEmbedder(embedder),
+                        vault_name=vault_name,
+                        writer=writer,
+                        default_k=settings.default_top_k,
+                        default_budget_tokens=settings.budget_tokens,
+                        rerank_params=rerank_params_for(settings),
+                        parent_swap_enabled=settings.parent_swap_enabled,
+                        parent_max_tokens=settings.parent_max_tokens,
+                        graph_params=graph_params_for(settings),
+                        # Stage 6 + the `related` tool: one flag drives both, so there is no
+                        # half-on state where `related` answers from a graph that search
+                        # ignores. `store` can be non-None purely for write-back/--watch,
+                        # hence the second term.
+                        graph_enabled=settings.graph_expand_enabled,
+                        compress_params=compress_params_for(settings),
+                    )
                 )
+                init_project_labels(settings.project_id)
+                if watch:
+                    # The observer + dispatcher are daemon threads that die with this stdio
+                    # process; stop() in the finally drains them on a clean detach. One
+                    # watcher per served vault — they share the store and the vector store,
+                    # and each owns its own debounce/worker pool.
+                    assert ctx is not None  # `watch` opened the store above
+                    watcher = VaultWatcher(
+                        ctx,
+                        debounce_seconds=settings.watch_debounce_seconds,
+                        workers=settings.watch_workers,
+                    )
+                    watchers.append(watcher)
+                    watcher.start()
 
             server = build_mcp_server(
-                project_id=project_id,
-                vault_path=vault_path,
+                projects=served,
                 vector_store=vector_store,
-                embedder=QueryEmbedder(embedder),
                 sparse=Bm25Embedder(),
-                default_k=settings.default_top_k,
-                default_budget_tokens=settings.budget_tokens,
                 reranker=reranker,
-                rerank_params=rerank_params_for(settings),
-                parent_swap_enabled=settings.parent_swap_enabled,
-                parent_max_tokens=settings.parent_max_tokens,
-                # Stage 6 + the `related` tool: one flag drives both, so there is no half-on
-                # state where `related` answers from a graph that search ignores. `store`
-                # can be non-None here purely for write-back/--watch, hence the second term.
-                graph_store=store if settings.graph_expand_enabled else None,
-                graph_params=graph_params_for(settings),
-                compress_params=compress_params_for(settings),
-                vault_name=resolved_vault_name,
-                writer=writer,
+                graph_store=store if any(p.graph_enabled for p in served) else None,
+                meta_store=store,
             )
-            if watch:
-                # The observer + dispatcher are daemon threads that die with this stdio
-                # process; stop() in the finally drains them on a clean detach.
-                assert store is not None  # opened above when watch is set
-                watcher = VaultWatcher(
-                    IngestContext(
-                        project_id=project_id,
-                        vault_path=vault_root,
-                        store=store,
-                        vector_store=vector_store,
-                        embedder=embedder,
-                        pdf_parser=pdf_parser,
-                        image_parser=image_parser,
-                    ),
-                    debounce_seconds=settings.watch_debounce_seconds,
-                    workers=settings.watch_workers,
-                )
-                watcher.start()
         # ValueError = misconfiguration (e.g. VAULTRAG_EMBED_DIMS <= 0); OSError = a
         # client that resolves/binds something at construction; sqlite3.Error = an
         # unopenable write/watch store. Either way the fix is the operator's, so fail with a
         # readable line rather than a stdio traceback.
         except (ValueError, OSError, sqlite3.Error) as exc:
-            log.error("mcp.failed", project=project_id, error=str(exc))
+            log.error(
+                "mcp.failed",
+                projects=[s.project_id for s in served_settings],
+                error=str(exc),
+            )
             typer.echo(f"mcp failed: {exc}", err=True)
             raise typer.Exit(code=1) from exc
         log.info(
             "mcp.serve",
-            project=project_id,
-            vault=str(vault_path),
+            projects=[s.project_id for s in served_settings],
             transport="stdio",
             watching=watch,
-            writing=write_enabled,
+            writing=[p.project_id for p in served if p.writer is not None],
         )
         try:
             server.run(transport="stdio", show_banner=False)  # blocks until client detaches
         except KeyboardInterrupt:
-            log.info("mcp.stopped", project=project_id)
+            log.info("mcp.stopped", projects=[s.project_id for s in served_settings])
     finally:
-        if watcher is not None:
+        for watcher in watchers:
             watcher.stop()
-        for closer in (embedder, vector_store, store):
+        for closer in (*embedders, vector_store, store):
             if closer is not None:
                 closer.close()
 
@@ -633,17 +729,54 @@ def project_show(
 @project_app.command("rm")
 def project_rm(
     project_id: Annotated[str, typer.Argument(help="Project id to remove.")],
+    keep_vectors: Annotated[
+        bool,
+        typer.Option(
+            "--keep-vectors",
+            help="Leave this project's points in the vector store (they become orphaned). "
+            "For recovering a mistaken removal; not a normal operation.",
+        ),
+    ] = False,
 ) -> None:
-    """Remove a project and cascade its index rows. The vault on disk is untouched."""
+    """Remove a project and cascade its index rows + vectors. The vault on disk is untouched.
+
+    **Both** derived caches are cleared, because they are lost independently and only the
+    composition root holds them both. Clearing SQLite alone was the original behaviour and it
+    is a bug found by dogfooding: the vectors outlive the documents, and re-registering the
+    same id would make stale chunks searchable with no ``documents`` row behind them.
+
+    The vector delete runs **first**: if it fails, the project is still registered and the
+    command can simply be re-run. The other order would deregister a project whose vectors
+    are still live and no longer reachable through the registry to clean up.
+    """
+    base = load_settings()
     store, reg = _open_registry()
+    vector_store: QdrantVectorStore | None = None
     try:
-        if reg.remove(project_id):
-            typer.echo(f"removed {project_id} (index rows cascaded; vault on disk untouched)")
-        else:
+        if reg.get(project_id) is None:
             typer.echo(f"no such project: {project_id}", err=True)
             raise typer.Exit(code=1)
+        if not keep_vectors:
+            try:
+                vector_store = QdrantVectorStore.from_settings(base)
+                vector_store.delete_by_project(project_id)
+            except (VectorStoreError, OSError, ValueError) as exc:
+                typer.echo(
+                    f"removing {project_id} failed: could not clear its vectors ({exc}). "
+                    f"The project is still registered — fix the vector store and retry, or "
+                    f"use --keep-vectors to deregister it anyway.",
+                    err=True,
+                )
+                raise typer.Exit(code=1) from exc
+        reg.remove(project_id)
+        kept = " (vectors kept, now orphaned)" if keep_vectors else ""
+        typer.echo(
+            f"removed {project_id} (index rows + vectors cascaded; vault on disk untouched){kept}"
+        )
     finally:
-        store.close()
+        for closer in (vector_store, store):
+            if closer is not None:
+                closer.close()
 
 
 @app.command()

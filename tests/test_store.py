@@ -182,3 +182,73 @@ def test_embed_cache(store: SQLiteMetaStore) -> None:
     store.put_cached_vector("qwen3", 1024, "h0", b"\xff")
     assert store.get_cached_vectors("qwen3", 1024, ["h0"]) == {"h0": b"\xff"}
     assert store.get_cached_vectors("qwen3", 1024, []) == {}
+
+
+# ---------------------------------------------------------------------------
+# folder_counts — `overview`'s vault map (P3 Stage 2)
+# ---------------------------------------------------------------------------
+def _at(store: SQLiteMetaStore, *paths: str) -> None:
+    for path in paths:
+        store.upsert_document(
+            PROJECT, DocumentMetadata(path=path, title=path, hash=f"blake3:{path}", tags=[])
+        )
+
+
+def test_folder_counts_folds_to_two_segments_and_counts(store: SQLiteMetaStore) -> None:
+    """Depth 2 keeps ``projects/vaultrag`` distinct from ``projects/other`` — the one
+    distinction that matters in a vault holding several projects, and the reason depth 1
+    was rejected (``../Rag/agent-inbox/overview-tool-shape.md``)."""
+    _at(
+        store,
+        "projects/vaultrag/a.md",
+        "projects/vaultrag/b.md",
+        "projects/other/c.md",
+        "decisions/d.md",
+    )
+    assert store.folder_counts(PROJECT) == [
+        ("projects/vaultrag", 2),
+        ("decisions", 1),
+        ("projects/other", 1),
+    ]
+
+
+def test_folder_counts_puts_a_top_level_note_at_the_vault_root(store: SQLiteMetaStore) -> None:
+    """A note with no folder belongs to ``''`` rather than being dropped or given its own
+    filename as a folder."""
+    _at(store, "README.md", "decisions/d.md")
+    assert dict(store.folder_counts(PROJECT))[""] == 1
+
+
+def test_folder_counts_truncates_a_path_deeper_than_the_fold(store: SQLiteMetaStore) -> None:
+    _at(store, "a/b/c/d/e.md")
+    assert store.folder_counts(PROJECT) == [("a/b", 1)]
+    assert store.folder_counts(PROJECT, depth=1) == [("a", 1)]
+    assert store.folder_counts(PROJECT, depth=4) == [("a/b/c/d", 1)]
+
+
+def test_folder_counts_orders_by_mass_then_path(store: SQLiteMetaStore) -> None:
+    """Descending count first so the shape of the vault leads; ties alphabetical so the
+    output is stable rather than insertion-ordered."""
+    _at(store, "zeta/1.md", "alpha/1.md", "alpha/2.md", "beta/1.md")
+    assert store.folder_counts(PROJECT) == [("alpha", 2), ("beta", 1), ("zeta", 1)]
+
+
+def test_folder_counts_respects_its_limit(store: SQLiteMetaStore) -> None:
+    _at(store, *[f"f{i}/n.md" for i in range(10)])
+    assert len(store.folder_counts(PROJECT, limit=3)) == 3
+
+
+def test_folder_counts_rejects_a_depth_below_one(store: SQLiteMetaStore) -> None:
+    """Depth 0 would fold every note to the root — a map with one entry is not a map."""
+    with pytest.raises(ValueError, match="depth must be >= 1"):
+        store.folder_counts(PROJECT, depth=0)
+
+
+def test_folder_counts_are_scoped_to_one_project(store: SQLiteMetaStore) -> None:
+    store.upsert_project("other", name="other", vault_path="/elsewhere")
+    _at(store, "mine/a.md")
+    store.upsert_document(
+        "other", DocumentMetadata(path="theirs/b.md", title="b", hash="blake3:b", tags=[])
+    )
+    assert store.folder_counts(PROJECT) == [("mine", 1)]
+    assert store.folder_counts("other") == [("theirs", 1)]

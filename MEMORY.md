@@ -8,44 +8,82 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P3 IN PROGRESS — Stage 1 DONE; Stage 2 (multi-project registry) FOUNDATION
-DONE, not yet complete (2026-07-22).** P2 is COMPLETE (all 7 stages + the 4-bug audit).
-**On branch `feat/p3-stage2-registry`, uncommitted.** See the Stage-2 bullet directly below
-for what landed and what remains; plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
-- **P3 STAGE 2 FOUNDATION (the `projects` registry becomes real) DONE 2026-07-22 — the rest of
-Stage 2 is still open.** Until now a project was a *string* (`--project X --vault Y`, one tenant
-per process); the `projects` table existed but nothing resolved through it. **Landed + green
-(682 tests, +13; ruff; mypy 59; gate unmoved 1.000/0.892/0.920):**
-(1) **store** — `list_projects()`, `delete_project()` (cascades one tenant's docs→chunks/tags/
-doc_keys/links + index_state via FK, deletes its `jobs` explicitly since they carry a bare
-`project_id` with no FK, leaves the shared `embed_cache` and every other tenant intact),
-`document_count()`, `top_tags()` (the two `overview` aggregates), all added to the `MetaStore`
-protocol too. (2) `**projects.py**` (new) — `ProjectRegistry` (add/list/get/remove/**resolve**)
-  - `UnknownProjectError`. `resolve(project)` overlays the row's `vault_path`/`project_id` and its
-  `settings` JSON onto the process base `Settings` via `Settings(**{**base.model_dump(), …})`
-  (re-validates/coerces types); **shared infra is reserved** (`state_dir`, `qdrant_url/collection`
-  can't be per-project — that's what keeps N tenants in one db + one payload-partitioned
-  collection), and an unknown/reserved override key **fails loudly** rather than being stored-but-
-  ignored. (3) **CLI** — `vaultrag project add|list|rm|show` subcommand group (`--set key=value`,
-  JSON-parsed), and `reindex`/`watch`/`mcp` now resolve `--project` through the registry via a new
-  `_resolve_settings()` so `**--vault` is optional for a registered project** (explicit `--vault`
-  still wins; an unregistered id keeps the P0 shorthand). **The bug the read-only tests caught:**
-  `_resolve_settings` must **not** open/create the SQLite db just to check the registry — a
-  read-only `mcp --project X --vault Y` must never conjure an empty state db (same invariant the
-  graph reader keeps), so it consults the registry **only when `db_path.is_file()`** (no db ⇒ no
-  registered projects anyway). **Pre-Stage-2 sanity check RESOLVED** (the plan asked to confirm
-  before Stage 2): a multi-project write is **N independent git commits, not a new transactional
-  problem** — one project = one vault dir = one git repo (`multi-tenant-architecture.md`), and the
-  shared SQLite/Qdrant state is already per-row/per-point and `project_id`-scoped.
-  **STILL OPEN in Stage 2 (the larger, higher-risk half — next session):** the **`list_projects`
-  - `overview` MCP tools** (`overview`'s shape — tree depth / tag count / token budget — is the one
-  genuine design call, and per the plan it's a **vault note**, not an improvisation); the
-  **one-process-serves-N** refactor (per-call `project` arg on search/open/related/write switching
-  vault_root/vault_name/writer — the vector/graph stores are already `project_id`-scoped per call,
-  so the per-project pieces are vault_root + writer) **with the adversarial cross-tenant test the
-  plan mandates** (extend P2's decoy-tenant test so the decoy is a *registered* project, and prove
-  `open` resolves against the **right** vault root); the `**project` metrics label** (+ its
-  `test_metrics` allowlist update, now that it's bounded).
+- **Phase:** **P3 IN PROGRESS — Stages 1 and 2 both DONE (2026-07-22). Next: Stage 3
+(query_log + mining CLI).** P2 is COMPLETE (all 7 stages + the 4-bug audit). Plan at
+`../Rag/projects/vaultrag/p3-step-plan.md`.
+- **P3 STAGE 2 (multi-project registry) COMPLETE 2026-07-22 — one process now serves N
+projects.** The foundation (registry CRUD + settings resolution + `vaultrag project add|list|
+rm|show`) landed first and is **merged to main** (PR #14, `5c8b4f2`); this session finished the
+second, higher-risk half. **Green: 734 tests (+52), ruff, mypy (59), gate unmoved
+1.000/0.892/0.920.**
+  - **`build_mcp_server` now takes `projects: Sequence[ServedProject]`** instead of a
+  process-wide `project_id`/`vault_path`/`writer`. `ServedProject` bundles what is genuinely
+  per-tenant — `vault_root` (resolved in `__post_init__`; containment compares against it),
+  `writer`, `embedder`, `vault_name`, and every retrieval knob — while the vector store, sparse
+  embedder, reranker and metadata store stay **shared**, because those are already
+  `project_id`-scoped on every call. **One `_select(project)` closure is the single enforcement
+  point** and every tool routes through it; the first draft had `overview` doing its own lookup
+  and that was rewritten, because a second enforcement point *is* the tenancy hole.
+  - **`project` is now a per-call argument on `search`/`open`/`related`/`overview` and all three
+  write tools.** With one served project it stays optional (P0 behaviour byte-for-byte); with
+  several it is **required** — no implicit default, because a forgotten argument silently
+  querying the wrong vault is the one failure multi-tenancy must not have.
+  - **New tools: `list_projects()`** (always registered — it is how an agent learns the `project`
+  string) and **`overview(project?)`** (registered only with a metadata store, same rule as
+  `related`).
+  - **CLI: `vaultrag mcp` with no `--project` now serves every registered project**;
+  `--project` repeats to serve a subset; `--project X --vault Y` keeps the P0 shorthand.
+  `--vault` with several projects is refused rather than guessed.
+  - **`project` metrics label** on `searches_total`, `searches_empty_total`, `ingests_total`,
+  `write_ops_total`, `ingest_lag_seconds` — plus `init_project_labels()`, the deferred half of
+  `_build`'s pre-initialisation (label values are unknown until a process is told what to serve,
+  so composition roots announce each project at startup and an idle tenant still reads 0, not
+  absent). `test_metrics`'s cardinality allowlist was updated **with** it, per the plan.
+  **Deliberately NOT on `search_latency`** (8 stages × 18 buckets × N tenants buys the least —
+  stage latency is dominated by shared components — and costs the most); pinned by a test, since
+  "we chose not to" is invisible in code.
+  - **Verification is the point of this stage, so it is adversarial:** new
+  `tests/test_multiproject.py` (27 tests) runs **one** server over **two registered projects**
+  sharing one SQLite db and one Qdrant collection, made **maximally confusable** — same relative
+  paths, same titles, same chunk text, same dense vector. Two deliberate mutations were run to
+  prove it isn't vacuous: making `_select` ignore its argument killed **16 of 25**, and the
+  subtler one the plan names (`open` resolving against a construction-time root) killed exactly
+  the 2 tests written for it.
+  - **A second, worse bug — found by DOGFOODING, not by any test: `project rm` cascaded
+  SQLite and left every vector behind.** Registering this repo as a throwaway second project
+  and removing it left **243 orphaned Qdrant points** with no `documents` row. Not just wasted
+  space: **re-registering the same id makes stale chunks immediately searchable**, which is the
+  precise drift `consistency.check_drift` exists to detect after the fact. Neither cache is
+  wrong on its own — `MetaStore.delete_project` cannot reach Qdrant (wrong layer), and nothing
+  told the **composition root** it had to clear both. Fixed: new
+  `VectorStore.delete_by_project()` (tenant-scoped filter, like every other operation) +
+  `project rm` now clears both, **vectors first** so a failure leaves the project registered and
+  the command re-runnable (the other order strands live vectors with nothing left in the
+  registry to clean them up), plus `--keep-vectors` as an explicit opt-out for a broken vector
+  store. Verified on the real 243: → 0, neighbour's 213 untouched. **The lesson worth keeping:
+  the plan's verify said "registry deletion cascades one project's rows" and the foundation's
+  tests asserted exactly that — they were green while half the deletion was missing, because
+  "rows" silently meant SQLite. A cascade test that only checks the store it was written
+  against is not a cascade test.**
+  - **One real bug found while writing it, in `projects.py`, not in the new code:
+  `embed_dims` was per-project-overridable and must not be.** The shared collection is created
+  with one dense vector width, so a project overriding it would upsert vectors the collection
+  cannot hold — failing at index time, far from the setting that caused it. Now reserved.
+  `embed_model` **stays** overridable (per-project embedding models are
+  `multi-tenant-architecture.md`'s explicit design) because a different model at the *same* width
+  is safe: each project's vectors are only ever compared against its own. A model at a different
+  width needs that note's documented scale path — promotion to its own collection — not a
+  settings key.
+  - **The design call the plan reserved for the vault is written up:**
+  `../Rag/agent-inbox/overview-tool-shape.md` (status `proposed`). `overview` returns a
+  **depth-2 counted folder map + top-20 tags + note count — a map, never a file listing**, both
+  lists bounded by a constant so response cost is flat in vault size, and **no `budget_tokens`
+  argument** (a budget param would imply the response could need one). Depth 2 was *measured*,
+  not guessed: this design vault's 63 notes fold to **7 folder entries** at depth 2 — the whole
+  taxonomy — while depth 1 would collapse `projects/vaultrag` into `projects` and lose the only
+  distinction that matters in a multi-project vault. Arch §14's "hygiene analytics via overview"
+  (orphans/hubs/unresolved) was deliberately **not** built: that is a report for a vault author,
+  not orientation for a fresh session.
 - **P3 STAGE 1 (deterministic stage-7 compressor) DONE 2026-07-22.** New
 `retrieval/compress.py` replaces P0's greedy `pack_budget` in the pipeline with the four
 `context-compression.md` steps: **near-dupe drop → MMR (λ=0.7) → per-doc-capped greedy pack
@@ -140,25 +178,35 @@ Write path: gated `NoteWriter` → git commit → synchronous `ingest_path`. Swa
 `Embedder`/`Reranker`/`VectorStore`/`MetaStore`/`SparseEmbedder`/`ParentResolver` protocols.
 **Green: `ruff`, `ruff format`, `mypy src` (41 files), `pytest` (315 tests).** Per-module detail
 lives in the code, `MEMORY-p1.md` (P1), and `MEMORY-p0.md` (P0).
-- **What's next: FINISH P3 Stage 2** at `../Rag/projects/vaultrag/p3-step-plan.md` — the registry
-**foundation is DONE** (see the Stage-2 bullet above), the **remaining half** is: `list_projects`
-  - `overview` MCP tools (write `overview`'s shape as a vault note first — the plan says its
-  tree-depth/tag-count/token-budget is a design decision, not an improvisation); the
-  one-process-serves-N MCP refactor (per-call `project` on search/open/related/write) **with the
-  adversarial cross-tenant test** (extend P2's decoy test so the decoy is a *registered* project;
-  prove `open` reads the right vault root); and the `project` metrics label + its `test_metrics`
-  allowlist update. The vector/graph stores are already `project_id`-scoped per call, so the
-  per-project pieces to thread are `vault_root` + `NoteWriter`. **Work is on branch
-  `feat/p3-stage2-registry` (uncommitted) — commit when Anik asks.**
+- **What's next: P3 STAGE 3 (`query_log` + the mining loop)** at
+`../Rag/projects/vaultrag/p3-step-plan.md`. Scope: the `query_log` table recorded **in the core
+pipeline, not the MCP layer** (so Stage 4's REST surface inherits it rather than growing a second
+divergent copy), `vaultrag queries` (zero-hit / slowest / most-frequent + export of zero-hit and
+low-score queries as golden-set candidates), retention pruned on write, and optionally
+`rate_result`. **Stage 3 hits Decision 2 on day one and it is still unsettled — it needs Anik or
+a superseding vault note before the table's DDL is written:** `reference-database-schema.md`
+defines the row as `q_hash` (no text) and eleven lines later calls the table the source that turns
+zero-hit queries into golden-set candidates — **a hash cannot become a golden-set query.** The
+recommendation on the table is an opt-in `query_text` column (default on for local/stdio, kill
+switch for multi-tenant HTTP), on the grounds that CLAUDE.md §5's rule governs the **log stream**,
+which stays absolute. Note this now supersedes a *reference* note, so it belongs in
+`agent-inbox/`. Stage 3 also inherits a ready-made `project` label — the query log is per-tenant
+and the metrics for it already are.
   **Decisions still open for Anik:** (1) `answer` mode build-at-all, (2) `query_log` text column
-  (supersedes a reference schema), (4) `serve` bootstrap key, (5) Docker base/formats split — none
-  block Stage 2. **Dogfooding:** the `vaultrag` MCP server has been run
+  (**blocks Stage 3**), (4) `serve` bootstrap key, (5) Docker base/formats split. Plus two
+  `agent-inbox/` notes awaiting a ruling: `compression-similarity-is-lexical-not-vector.md`
+  (Stage 1) and `overview-tool-shape.md` (Stage 2). **Dogfooding:** the `vaultrag` MCP server has
+  been run
   against the live `vaultrag-design` index in prior sessions — use `search`/`open` against
   `../Rag` while building and treat bad retrieval as a real bug report (repo `CLAUDE.md` §1). To
   (re)build the index: ensure `ollama serve` + `docker compose up -d qdrant` are up, then
-  `uv run vaultrag reindex --project vaultrag-design --vault ../Rag`. Paths are machine-specific
-  — this box is `/Users/anik/Desktop/{vaultrag,Rag}` (macOS); (re)add the server with
-  `claude mcp add vaultrag -- uv run --directory <repo> vaultrag mcp --project vaultrag-design --vault <vault>` (remove with `claude mcp remove vaultrag -s local`).
+  `uv run vaultrag reindex --project vaultrag-design`. Paths are machine-specific
+  — this box is `/Users/anik/Desktop/{vaultrag,Rag}` (macOS). **As of Stage 2 the registry
+  supplies the vault path and one server covers every project**, so registration is now:
+  `vaultrag project add vaultrag-design --vault ../Rag`, then
+  `claude mcp add vaultrag -- uv run --directory <repo> vaultrag mcp`
+  (no `--project`/`--vault`; remove with `claude mcp remove vaultrag -s local`). Both projects on
+  this box are registered: `vaultrag-design` → `../Rag` and `vaultrag-code` → this repo.
 - **Design source of truth:** `../Rag` (Obsidian vault). Grep it before designing; see
 `CLAUDE.md` §1.
 - **Open questions / for Anik:**
@@ -186,6 +234,73 @@ Prepend newest first. Template:
 ---
 
 ## Session log
+
+### 2026-07-22 (latest) — P3 Stage 2 finished: one process serves N projects
+
+- **Did:** Anik: *"continue the rest of Stage 2; if 1 and 2 are complete move to the next
+stage."* First re-established ground truth rather than trusting this log — and the log was
+**stale**: it said the Stage-2 foundation was "uncommitted on branch `feat/p3-stage2-registry`",
+but Anik had already merged it (PR #14, `5c8b4f2`) and the tree was clean. Then built the second
+half. Full detail in the Stage-2 bullet above; the parts worth reading here are the judgement
+calls.
+- **`overview`'s shape went to the vault first, as the plan required.** Its one-line spec ("folder
+tree + top tags + note count") is genuinely under-determined in the three ways the plan predicted,
+and each has a wrong answer that defeats the tool: a full file listing is the context dump
+`search` exists to replace. Settled as a **map, not an index** — counts never paths, every list
+capped by a constant so cost is flat in vault size, no `budget_tokens` (its presence would imply
+the response could need one). **Depth 2 is measured**: this vault's 63 notes fold to 7 entries,
+which is its entire taxonomy. `../Rag/agent-inbox/overview-tool-shape.md`, status `proposed`.
+- **The refactor's real content is where state lives, not the tool signatures.** `ServedProject`
+splits per-tenant (vault root, writer, embedder, retrieval knobs) from shared (vector store,
+sparse, reranker, metadata store) — the shared half being exactly the things already
+`project_id`-scoped per call. The bug this prevents is not a missing Qdrant filter (unconditional
+`must` since P0) but a **vault root captured once at construction** while `project` varies per
+call, which would make `open(path, project="alpha")` read beta's file.
+- **A second enforcement point is the hole.** The first draft had `overview` resolving `project`
+itself instead of going through `_select`. Rewritten to take the closure like every other tool —
+there is now exactly one place that decides which projects a caller may reach.
+- **Verification is adversarial and was mutation-checked, because a tenancy test that passes for
+the wrong reason is worse than none.** `tests/test_multiproject.py`: one server, two *registered*
+projects (extending P2's hand-inserted decoy as the plan asks), same paths/titles/text/vectors so
+only the filter can separate them. Mutation 1 (`_select` ignores its argument) killed **16/25**;
+mutation 2 (`open` uses a construction-time root) killed exactly its 2 tests. Both restored.
+- **Found and fixed a real defect in the *foundation*, not the new code: `embed_dims` was
+per-project-overridable.** One shared collection has one vector width, so that override fails at
+index time far from its cause. Reserved. `embed_model` stays overridable on purpose — same width,
+different model is safe because a project's vectors are only compared against its own.
+- **Dogfooding earned its keep — it found the one bug the tests could not.** Registering this
+repo as a throwaway second project, running the real two-project server against live
+Qdrant+Ollama, and then removing it exposed the `project rm` vector orphan (243 points; see the
+Stage-2 bullet). The live run also confirmed the thing that matters most: `open("CLAUDE.md")`
+returns **genuinely different files** under `vaultrag-design` vs `vaultrag-code`, and omitting
+`project` refuses with both ids named.
+- **A second dogfood finding, deliberately NOT fixed — flagged instead (CLAUDE.md §1: flag
+divergence, don't silently diverge).** `overview(vaultrag-code)` came back led by
+`.venv/lib` (41 notes) and `.pytest_cache`, because `_ALWAYS_PRUNE_DIRS` is
+`{.git, .obsidian, .trash, .smart-env, node_modules}` — deliberately *Obsidian-vault* shaped,
+and a code repo is not a vault. Whether `.venv`/`__pycache__`/`.pytest_cache` should join that
+set, or belong in the shipped `.ragignore` example, or whether "don't point it at a repo" is
+the right answer, is a **design call for the vault**, not a quiet edit mid-stage. Worth noting
+the positive read too: `overview` made a scan-scope mistake obvious in one call, which is
+evidence it does the job the design note claims.
+- **Verified:** 741 tests (+59 this session: 27 multiproject, 12 mcp overview/list_projects, 7
+store `folder_counts`, 12 CLI resolution + `project rm` cascade, 3 `delete_by_project`, plus
+metrics), ruff, mypy (59), **gate PASS 1.000 / 0.892 / 0.920 (unmoved)**. The box is back to its
+starting state: only `vaultrag-design` registered, 61 docs / 213 points.
+- **Files:** `mcp/server.py` (the refactor + 2 new tools), `cli.py` (`_registry`,
+`_resolve_served_settings`, N-project `mcp`, `project rm` two-cache cascade), `metrics.py`
+(+`init_project_labels`), `models.py` (`ProjectSummary`/`OverviewResult`/`FolderCount`/
+`TagCount`), `projects.py` (`embed_dims` reserved), `index/{base,qdrant}.py`
+(`delete_by_project`), `store/{base,sqlite}.py` (`folder_counts`), `retrieval/pipeline.py`,
+`indexer/watch.py`, `writeback/writer.py` (metric call sites); tests:
+`test_multiproject.py` (new), `test_mcp.py`, `test_metrics.py`, `test_store.py`, `test_index.py`,
+`test_cli.py`; vault: `agent-inbox/overview-tool-shape.md` (new).
+- **Next / handoff:** **Stage 3 (`query_log`)** — but read Decision 2 first: it **blocks the
+DDL**, because the reference schema stores `q_hash` and simultaneously calls the table the
+golden-set mining source, and a hash cannot become a query. That needs a superseding
+`agent-inbox/` note before code. Two Stage-1/2 notes are still awaiting Anik's ruling
+(`compression-similarity-is-lexical-not-vector.md`, `overview-tool-shape.md`); neither blocks
+Stage 3.
 
 ### 2026-07-22 (later) — P3 Stage 1: the real stage-7 compressor
 

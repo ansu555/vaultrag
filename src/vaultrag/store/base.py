@@ -210,6 +210,16 @@ class MetaStore(Protocol):
     def top_tags(self, project_id: str, limit: int = 20) -> list[tuple[str, int]]:
         """The project's most-used tags with counts, most-frequent first — ``overview``."""
 
+    def folder_counts(
+        self, project_id: str, depth: int = 2, limit: int = 50
+    ) -> list[tuple[str, int]]:
+        """Notes per folder, folded to ``depth`` segments — ``overview``'s vault map.
+
+        Counts, not paths: a folder with a number is a pointer to a ``search`` filter,
+        where a list of filenames is a worse substitute for ``search`` itself
+        (``../Rag/agent-inbox/overview-tool-shape.md``).
+        """
+
     def delete_document(self, project_id: str, path: str) -> None:
         """Delete a document and cascade its chunks + tags."""
 

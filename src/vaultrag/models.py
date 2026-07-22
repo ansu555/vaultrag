@@ -321,6 +321,55 @@ class OpenResult(_Base):
 
 
 # ---------------------------------------------------------------------------
+# Discovery + orientation (P3 Stage 2 — one process serves N projects)
+# ---------------------------------------------------------------------------
+class ProjectSummary(_Base):
+    """One entry of the ``list_projects`` response — a project this server can answer for.
+
+    Deliberately thin: its whole job is to let an agent pick the right ``project`` string
+    for a subsequent call and know roughly what is behind it. ``notes`` is ``None`` when the
+    server has no metadata store to count with (a vector-store-only deployment), which is
+    honestly different from a project with zero notes.
+    """
+
+    id: str
+    name: str
+    notes: int | None = None
+    writable: bool = False  # whether the write tools accept this project
+
+
+class FolderCount(_Base):
+    """One folder of ``overview``'s vault map. ``path`` is ``''`` for the vault root."""
+
+    path: str
+    notes: int
+
+
+class TagCount(_Base):
+    """One tag of ``overview``'s tag map, counted over prefix-expanded tags."""
+
+    tag: str
+    notes: int
+
+
+class OverviewResult(_Base):
+    """The ``overview`` response: a project's shape, as counts rather than paths.
+
+    A map, not an index — see ``../Rag/agent-inbox/overview-tool-shape.md``. Both lists are
+    bounded by a constant rather than by vault size, so the response's token cost stays flat
+    as a vault grows; ``truncated`` says a cap actually bit. Every entry is directly usable
+    as a ``search`` filter, which is the point of returning them at all.
+    """
+
+    project: str
+    name: str
+    notes: int
+    folders: list[FolderCount] = Field(default_factory=list)
+    tags: list[TagCount] = Field(default_factory=list)
+    truncated: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Write contract (write-back Stage 5 — the memory loop close)
 # ---------------------------------------------------------------------------
 class WriteResult(_Base):

@@ -121,9 +121,11 @@ def _observed[**P](
         except WriteRefused as exc:
             record_write_refused(str(exc.reason))
             raise
-        record_write(result.action)
+        record_write(result.action, project=self._ctx.project_id)
         if result.indexed:
-            record_ingest_lag(time.perf_counter() - started, source="writeback")
+            record_ingest_lag(
+                time.perf_counter() - started, source="writeback", project=self._ctx.project_id
+            )
         return result
 
     return wrapper

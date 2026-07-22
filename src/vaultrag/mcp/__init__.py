@@ -7,6 +7,11 @@
 
 from __future__ import annotations
 
-from vaultrag.mcp.server import SearchFiltersParam, build_mcp_server
+from vaultrag.mcp.server import (
+    OverviewStore,
+    SearchFiltersParam,
+    ServedProject,
+    build_mcp_server,
+)
 
-__all__ = ["SearchFiltersParam", "build_mcp_server"]
+__all__ = ["OverviewStore", "SearchFiltersParam", "ServedProject", "build_mcp_server"]

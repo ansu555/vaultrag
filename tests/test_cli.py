@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 from typer.testing import CliRunner
 
 from vaultrag import __version__
 from vaultrag.cli import app
 from vaultrag.embedding.ollama import OllamaEmbedder
+from vaultrag.index.base import VectorStoreError
 from vaultrag.index.qdrant import QdrantVectorStore
 from vaultrag.indexer.watch import VaultWatcher
 from vaultrag.store.sqlite import SQLiteMetaStore
@@ -331,7 +332,9 @@ def test_mcp_serves_read_only_without_a_state_db_and_omits_related(
     )
     assert result.exit_code == 0, result.output
     assert not (tmp_path / "state" / "vaultrag.db").exists()
-    assert tools == [["open", "search"]]
+    # `list_projects` is unconditional (discovery); `overview` needs the metadata store
+    # this path deliberately does not open, so it is absent alongside `related`.
+    assert tools == [["list_projects", "open", "search"]]
 
 
 def test_mcp_registers_related_when_a_state_db_already_exists(
@@ -353,4 +356,287 @@ def test_mcp_registers_related_when_a_state_db_already_exists(
         },
     )
     assert result.exit_code == 0, result.output
-    assert tools == [["open", "related", "search"]]
+    assert tools == [["list_projects", "open", "overview", "related", "search"]]
+
+
+# ---------------------------------------------------------------------------
+# `mcp` serving N projects (P3 Stage 2)
+#
+# What is pinned here is the *resolution* layer — which projects one process ends up
+# serving for a given argv — because that is where a mistake is silent: serving the wrong
+# set looks like a working server that answers about the wrong vault.
+# ---------------------------------------------------------------------------
+def _unwrapped(output: str) -> str:
+    """Collapse Rich's box drawing + word wrapping to one line of plain text."""
+    stripped = "".join(c for c in output if c not in "│╭╮╰╯─")
+    return " ".join(stripped.split())
+
+
+def _register(state_dir: Path, **projects: Path) -> None:
+    """Register projects directly through the store, as `vaultrag project add` would."""
+    store = SQLiteMetaStore(state_dir / "vaultrag.db")
+    for pid, vault in projects.items():
+        store.upsert_project(pid, name=pid, vault_path=str(vault))
+    store.close()
+
+
+def _served(tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Run `mcp` with `run()` stubbed, returning the project ids it came up serving."""
+    seen: list[list[str]] = []
+
+    def _capture(self: FastMCP, **kwargs: Any) -> None:
+        # The instructions string names the served scope; the tool set is identical
+        # regardless, so the projects are read off the server's own description.
+        seen.append(sorted(_project_ids(self)))
+
+    monkeypatch.setattr(FastMCP, "run", _capture)
+    result = runner.invoke(
+        app,
+        argv,
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    return seen[0]
+
+
+def _project_ids(server: FastMCP) -> list[str]:
+    """Ask the running server which projects it serves, through its own tool."""
+
+    async def _run() -> list[str]:
+        async with Client(server) as client:
+            got = await client.call_tool("list_projects", {})
+            assert got.structured_content is not None
+            return [row["id"] for row in got.structured_content["result"]]
+
+    return asyncio.run(_run())
+
+
+def test_mcp_with_no_project_serves_every_registered_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the stage exists for: `claude mcp add vaultrag -- uv run vaultrag mcp`
+    picks up every registered vault, so adding a project later needs no re-registration
+    of the MCP server itself."""
+    alpha, beta = tmp_path / "a", tmp_path / "b"
+    alpha.mkdir()
+    beta.mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", alpha=alpha, beta=beta)
+    assert _served(tmp_path, ["mcp", "--no-write"], monkeypatch) == ["alpha", "beta"]
+
+
+def test_mcp_with_one_project_serves_only_that_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Narrowing must stay possible — a registry with N projects does not force serving N."""
+    alpha, beta = tmp_path / "a", tmp_path / "b"
+    alpha.mkdir()
+    beta.mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", alpha=alpha, beta=beta)
+    assert _served(tmp_path, ["mcp", "--project", "alpha", "--no-write"], monkeypatch) == ["alpha"]
+
+
+def test_mcp_project_flag_repeats_to_serve_a_subset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("a", "b", "c"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", alpha=tmp_path / "a", beta=tmp_path / "b", gamma=tmp_path / "c")
+    served = _served(
+        tmp_path, ["mcp", "--project", "alpha", "--project", "gamma", "--no-write"], monkeypatch
+    )
+    assert served == ["alpha", "gamma"]
+
+
+def test_mcp_keeps_the_unregistered_single_project_shorthand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0's `--project X --vault Y` must keep working with nothing registered — and must
+    still not conjure a state db just to discover the registry is empty."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    served = _served(
+        tmp_path, ["mcp", "--project", "adhoc", "--vault", str(vault), "--no-write"], monkeypatch
+    )
+    assert served == ["adhoc"]
+    assert not (tmp_path / "state" / "vaultrag.db").exists()
+
+
+def test_mcp_refuses_vault_with_several_projects(tmp_path: Path) -> None:
+    """`--vault` names one tree; pairing it with several projects is a contradiction, and
+    guessing which one it meant is how a tenant ends up pointed at the wrong vault."""
+    result = runner.invoke(
+        app,
+        ["mcp", "--project", "a", "--project", "b", "--vault", str(tmp_path)],
+        env={"VAULTRAG_STATE_DIR": str(tmp_path / "state")},
+    )
+    assert result.exit_code != 0
+    assert "cannot apply to several" in _unwrapped(result.output)
+
+
+def test_mcp_names_an_unregistered_project_in_a_multi_project_run(tmp_path: Path) -> None:
+    """With several ids there is no vault path to fall back on, so an unregistered one is
+    an error naming the fix, not a silent fallback to the process-wide vault."""
+    alpha = tmp_path / "a"
+    alpha.mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", alpha=alpha)
+    result = runner.invoke(
+        app,
+        ["mcp", "--project", "alpha", "--project", "ghost"],
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code != 0
+    # Rich word-wraps inside its error box, so match on the unwrapped text: the point is
+    # that the message names the fix, not that it fits a terminal width.
+    assert "is not registered" in _unwrapped(result.output)
+    assert "vaultrag project add" in _unwrapped(result.output)
+
+
+def test_mcp_reports_which_projects_vault_path_is_broken(tmp_path: Path) -> None:
+    """With N tenants, "vault path is not a directory" is useless without the tenant."""
+    alpha = tmp_path / "a"
+    alpha.mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", alpha=alpha)
+    alpha.rmdir()  # registered, then removed underneath the deployment
+    result = runner.invoke(
+        app,
+        ["mcp"],
+        env={
+            "VAULTRAG_STATE_DIR": str(tmp_path / "state"),
+            "VAULTRAG_QDRANT_URL": "http://127.0.0.1:1",
+        },
+    )
+    assert result.exit_code == 1
+    assert "project 'alpha'" in result.output
+
+
+# ---------------------------------------------------------------------------
+# `project rm` clears BOTH derived caches (P3 Stage 2, found by dogfooding)
+# ---------------------------------------------------------------------------
+def test_project_rm_clears_the_vector_store_as_well_as_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this pins: deregistering cascaded SQLite and left the vectors behind.
+
+    Orphaned points are not merely wasted space — re-registering the same id makes stale
+    chunks searchable with no `documents` row behind them, which is precisely the drift
+    `consistency.check_drift` exists to detect after the fact.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", doomed=vault)
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        QdrantVectorStore, "from_settings", classmethod(lambda cls, s: _FakeVectors(deleted))
+    )
+
+    result = runner.invoke(
+        app,
+        ["project", "rm", "doomed"],
+        env={"VAULTRAG_STATE_DIR": str(tmp_path / "state")},
+    )
+    assert result.exit_code == 0, result.output
+    assert deleted == ["doomed"], "the vector half of the cascade must run"
+    store = SQLiteMetaStore(tmp_path / "state" / "vaultrag.db")
+    assert store.get_project("doomed") is None
+    store.close()
+
+
+def test_project_rm_keeps_the_project_registered_when_the_vector_delete_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering, not just presence: vectors go first, so a failure leaves the project
+    registered and the command re-runnable. Deregistering first would strand live vectors
+    with nothing in the registry left to clean them up."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", doomed=vault)
+    monkeypatch.setattr(
+        QdrantVectorStore, "from_settings", classmethod(lambda cls, s: _FailingVectors())
+    )
+
+    result = runner.invoke(
+        app,
+        ["project", "rm", "doomed"],
+        env={"VAULTRAG_STATE_DIR": str(tmp_path / "state")},
+    )
+    assert result.exit_code == 1
+    assert "still registered" in _unwrapped(result.output)
+    store = SQLiteMetaStore(tmp_path / "state" / "vaultrag.db")
+    assert store.get_project("doomed") is not None, "a failed cascade must not deregister"
+    store.close()
+
+
+def test_project_rm_keep_vectors_is_an_explicit_opt_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape hatch exists for a broken vector store, and says what it leaves behind."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state", doomed=vault)
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        QdrantVectorStore, "from_settings", classmethod(lambda cls, s: _FakeVectors(deleted))
+    )
+
+    result = runner.invoke(
+        app,
+        ["project", "rm", "doomed", "--keep-vectors"],
+        env={"VAULTRAG_STATE_DIR": str(tmp_path / "state")},
+    )
+    assert result.exit_code == 0, result.output
+    assert deleted == []
+    assert "orphaned" in _unwrapped(result.output)
+
+
+def test_project_rm_of_an_unknown_project_touches_no_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existence is checked before anything is deleted anywhere."""
+    (tmp_path / "state").mkdir()
+    _register(tmp_path / "state")
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        QdrantVectorStore, "from_settings", classmethod(lambda cls, s: _FakeVectors(deleted))
+    )
+    result = runner.invoke(
+        app,
+        ["project", "rm", "ghost"],
+        env={"VAULTRAG_STATE_DIR": str(tmp_path / "state")},
+    )
+    assert result.exit_code == 1
+    assert deleted == []
+
+
+class _FakeVectors:
+    """Records `delete_by_project` calls; never touches a real Qdrant."""
+
+    def __init__(self, deleted: list[str]) -> None:
+        self._deleted = deleted
+
+    def delete_by_project(self, project_id: str) -> None:
+        self._deleted.append(project_id)
+
+    def close(self) -> None:
+        pass
+
+
+class _FailingVectors:
+    def delete_by_project(self, project_id: str) -> None:
+        raise VectorStoreError("qdrant is down")
+
+    def close(self) -> None:
+        pass
