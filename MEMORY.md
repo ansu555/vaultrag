@@ -482,7 +482,40 @@ Prepend newest first. Template:
 
 ## Session log
 
-### 2026-07-23 (latest) — P3 Stage 6: the deployment, and two bugs only running it could find
+### 2026-07-23 (latest) — the documentation set (`docs/`), no code changed
+
+- **Did:** Anik asked for a full user + system-design documentation set. Wrote **`docs/` (15
+files)** plus a rewritten root **`README.md`**. **No source, test, config or deploy file was
+touched** — suite still 923 green, gate still `1.000 / 0.892 / 0.920 PASS` (both re-run at
+the end to confirm the published numbers, not to assert them).
+- **Structure:** `docs/README.md` is the index. *Using it* — `getting-started.md`,
+`cli-reference.md`, `mcp-tools.md`, `rest-api.md`, `configuration.md`. *Understanding it* —
+`architecture.md`, `indexing.md`, `retrieval.md`, `design-decisions.md`, `benchmarks.md`.
+*Running it* — `operations.md`, `security.md`, `troubleshooting.md`, `development.md`,
+`resources.md`. 23 Mermaid diagrams (system context, the end-to-end RAG pipeline, deployment
+topology, tenancy, the write-back gauntlet, three sequence diagrams).
+- **Sourced from the code and the measurement record, not from the vault's prose.** Every
+number is one that was actually run (gate, rerank A/B, `graph_boost` sweep, compress
+dogfood, the 100k-point footprint, the DR drill, mutation counts); every CLI flag and env
+var came from `--help` and `config.py`. The `docs/` set therefore states what the code does
+*today*, and cites `../Rag` for why.
+- **`benchmarks.md` carries a "Known gaps" section on purpose** — SQLite never exercised past
+67 real docs, no load test, no GPU numbers, and the **long-cross-cutting-document retrieval
+failure the Meridian corpus cannot see by construction**. That last one is the most
+important line in the set; a docs page that only lists strengths is marketing.
+- **Verified, not assumed:** a link checker (GitHub's own slug rules) resolved **every**
+internal link and anchor across all 17 files — it caught 3 bad anchors, now fixed. Mermaid
+labels were scanned for unquoted specials; two `|` characters inside node labels (which
+would have parsed as edge-label delimiters) and four `-.text.->` dotted links missing their
+spaces were corrected.
+- **Two small facts corrected while writing:** the repo has **33** test modules (not 34), and
+there is **no `LICENSE` file** — `pyproject.toml` declares MIT but nothing backs it. Worth
+adding.
+- **Next / handoff:** unchanged — P3 Stage 7 (`answer` mode) is the only stage left, and
+Decision 1 still recommends **not** building it. If Anik agrees, P3 is complete. The docs
+describe `answer` mode as designed-but-deliberately-unbuilt, which stays true either way.
+
+### 2026-07-23 — P3 Stage 6: the deployment, and two bugs only running it could find
 
 - **Did:** Anik: *"impliment next stage."* Checked `git`/`gh` before believing this file, and
 it was stale again — **Anik had merged Stage 5 as PR #18 (`879b311`)**, so the handoff's
