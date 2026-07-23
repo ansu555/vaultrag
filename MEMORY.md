@@ -13,9 +13,15 @@ mode) remains, and Decision 1 recommends NOT building it — if Anik agrees, P3 
 complete.** P2 is COMPLETE (all 7 stages + the 4-bug audit). **Stages 2-5 are all merged to
 `main`** (PR #15 `03bce8f`, PR #16 `c938875`, PR #17 `ece4d4d`, PR #18 `879b311` — Anik
 merged Stage 5 himself after that session wrote its handoff, the *fifth* time running this
-file went stale; check `git`/`gh` before believing it, always). Stage 6 is on branch
-**`feat/p3-stage6-docker`**, branched cleanly off `origin/main`, **committed, unpushed, no
-PR** (CLAUDE.md: push only when asked). Plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
+file went stale; check `git`/`gh` before believing it, always). **Stage 6 (`9adc625`) is on
+`main` too, but it got there by a direct push, NOT a PR** — see the session log; **there is
+no PR #19 and there cannot be one** (the branch is 0 commits ahead of `main`, so GitHub
+refuses the empty comparison). Anik's call, asked and answered: leave `main` as it stands
+rather than rewrite it to manufacture a PR record. `feat/p3-stage6-docker` is pushed and
+points at the same commit. **CI green on `main` for `9adc625`: all 4 required checks + eval,
+including the new `docker build (base image)` job — so the Dockerfile builds on amd64 CI,
+not just the arm64 box it was developed on.** Plan at
+`../Rag/projects/vaultrag/p3-step-plan.md`.
 - **P3 STAGE 6 (Docker image + compose profiles) COMPLETE 2026-07-23.** **Green: 923 tests
 (+26), ruff, ruff format, mypy (68 src files), gate unmoved 1.000/0.892/0.920.** New
 `Dockerfile` (two tags from one build arg — Decision 5 as recommended), `docker-compose.yml`
@@ -414,10 +420,10 @@ Stage 6 landing is exactly the deadline that decision named.** Its argument: eve
 consumer is Claude Code, i.e. already an LLM; building it now yields a second synthesis
 layer, a new hallucination surface and a prompt-injection target that exists only to be
 maintained. **If Anik agrees, P3 is complete and the next move is a P4 plan**, not a stage.
-**Branch state:** Stage 5 merged to `main` (PR #18, `879b311`); Stage 6 is on
-`feat/p3-stage6-docker`, branched off `origin/main`, committed, **unpushed, no PR** — but
-Anik has merged the last four stages himself mid-session, so **check `main` before believing
-that**.
+**Branch state:** Stage 5 merged to `main` (PR #18, `879b311`); **Stage 6 (`9adc625`) is
+also on `main`, by a direct push rather than a PR** — CI green, no PR exists and none can be
+opened. **`main` is the only branch that matters now; both feature branches are merged
+ancestors of it.**
   **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7 — the live
   one), plus the **new** Stage 6 call: **should the `langfuse` profile be built at all**
   (recommendation: no, defer to P4, build the `Tracer` producer first —
@@ -562,9 +568,21 @@ cancelling it. **If Anik agrees, P3 is complete and the next move is a P4 plan, 
 stage.** Two things want his eyes first: **§3 of
 `agent-inbox/docker-deployment-design-calls.md`** (the `langfuse` profile not built — the one
 place this stage is narrower than its plan) and **§1** (the measured footprint, which
-supersedes an unmeasured 3-4 GB in *two* `reference/` notes). Stage 6 is committed on
-`feat/p3-stage6-docker`, **unpushed, no PR** — but Anik has merged the last four stages
-himself mid-session, so check `main` first.
+supersedes an unmeasured 3-4 GB in *two* `reference/` notes).
+- **THE ONE OPERATIONAL THING TO CHASE — something on this box pushes to `origin` without
+being asked, and this time it pushed straight to `main`.** Anik then asked for a merge + PR;
+`git fetch` showed `9adc625` **already on `origin/main`** although this session never ran
+`git push`. `git reflog show origin/main` records `update by push` (written by a local
+`git push`, not a fetch), the repo carries `branch.*.vscode-merge-base` keys (VS Code/Cursor
+git integration), and `enforce_admins: false` on the protection rule is why a direct push to
+a protected `main` was allowed at all. **This is the second sighting** — Stage 5 saw the same
+class of event (a branch appearing on `origin` mid-session, Cursor's extension hosts the
+leading suspect, mechanism never confirmed). Consequence this time: **no PR is possible**,
+since the branch is 0 commits ahead of `main`. Anik was given the choice and chose to leave
+`main` alone rather than force-push it to manufacture a PR record — correct, but it means
+Stage 6 has no PR unlike #14-#18. **Worth actually finding the cause before P4:** either
+identify and disable whatever auto-pushes, or set `enforce_admins: true` so a direct push to
+`main` is refused and the PR flow is the only way in.
 
 ### 2026-07-23 — P3 Stage 5: API keys, and the 403-vs-404 call scopes forced
 
