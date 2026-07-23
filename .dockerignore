@@ -1,0 +1,33 @@
+# Keep the build context small and keep host state out of the image. `state/` matters most:
+# it is a *derived cache* holding a SQLite db and embed cache for this box's paths, and
+# baking it into an image would ship one machine's index to every container (CLAUDE.md §6 —
+# the index is derived, the vault is truth).
+state/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+.git/
+.github/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Tests are not installed into the image; the merge gate runs them on the host.
+tests/
+
+# Docs and deploy configs are mounted or read by other containers, never by this one.
+deploy/
+MEMORY*.md
+CLAUDE.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Never in a build context: an .env here would be copied into a layer.
+.env
+.env.*
+.DS_Store

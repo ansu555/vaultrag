@@ -8,20 +8,78 @@ This is a log, not a design doc — durable design lives in the vault at `../Rag
 
 ## Current state
 
-- **Phase:** **P3 IN PROGRESS — Stages 1-5 all DONE (2026-07-23); Stage 6 (Docker image +
-compose profiles) NOT started.** P2 is COMPLETE (all 7 stages + the 4-bug audit).
-**Stages 2, 3 and 4 are all merged to `main`** (PR #15 `03bce8f`, PR #16 `c938875`, PR #17
-`ece4d4d`) — **Anik merged Stage 4 himself while this session was mid-Stage-5**, the fourth
-time in a row this log went stale within the session that wrote it (check `git`/`gh` before
-believing this file, always). Stage 5 was rebased onto `origin/main` after the fact — it
-started stacked on `feat/p3-stage4-serve`, correctly, since that was the only place its
-dependencies (`service.py`/`composition.py`) existed at the time, and became one clean
-commit on `main` once Stage 4 landed there. Branch **`feat/p3-stage5-api-keys`**, force-pushed
-(Anik's explicit call — see the session log for why a force-push was needed at all: the
-branch had already appeared on `origin` mid-session from a source this session did not
-initiate and could not identify — Cursor's extension hosts were active on this repo at the
-time, which is the leading suspect). No PR opened (push only when asked; opening one was not).
-Plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
+- **Phase:** **P3 — Stages 1-6 all DONE (Stage 6 on 2026-07-23). Only Stage 7 (`answer`
+mode) remains, and Decision 1 recommends NOT building it — if Anik agrees, P3 is
+complete.** P2 is COMPLETE (all 7 stages + the 4-bug audit). **Stages 2-5 are all merged to
+`main`** (PR #15 `03bce8f`, PR #16 `c938875`, PR #17 `ece4d4d`, PR #18 `879b311` — Anik
+merged Stage 5 himself after that session wrote its handoff, the *fifth* time running this
+file went stale; check `git`/`gh` before believing it, always). Stage 6 is on branch
+**`feat/p3-stage6-docker`**, branched cleanly off `origin/main`, **committed, unpushed, no
+PR** (CLAUDE.md: push only when asked). Plan at `../Rag/projects/vaultrag/p3-step-plan.md`.
+- **P3 STAGE 6 (Docker image + compose profiles) COMPLETE 2026-07-23.** **Green: 923 tests
+(+26), ruff, ruff format, mypy (68 src files), gate unmoved 1.000/0.892/0.920.** New
+`Dockerfile` (two tags from one build arg — Decision 5 as recommended), `docker-compose.yml`
+grown to the three services + an `observability` profile (Prometheus + Alertmanager +
+Grafana), `deploy/` (scrape config, 5 alert rules, alertmanager route, provisioned dashboard
+JSON), `.dockerignore`, rewritten README, a CI job that builds the base image, and
+`tests/test_deploy.py`. **The `langfuse` profile is deliberately NOT built** — see below.
+  - **All three parts of the stage's verify were RUN, not asserted.**
+    - **DR drill, for real:** fresh volumes → `git clone` the vault → `docker compose up` →
+    `reindex` → search. **67 docs → 261 chunks in 326 s** on CPU through host Ollama; search
+    returned correct **cited** results (`obsidian://` + line ranges). Write-back also worked
+    through the container (rw mount + `git` in the image + auto-commit `committed: true` +
+    synchronous reindex). **"DR = reindex" is now proven end to end for the first time.**
+    - **Footprint measured at 100,260 Qdrant points (collection `green`):** api **144 MiB** +
+    indexer **130 MiB** + qdrant **453 MiB** = **727 MiB** containers, **+1 070 MiB** host
+    Ollama = **≈1.8 GiB at the shipped default**. The reranker alone is **+1 068 MiB** (the
+    largest single component, and OFF by default — so `rerank_mode` is a *memory* decision as
+    much as a latency one). **The vault's 3-4 GB claim holds as an upper bound and overstates
+    the default by ~2×.** Qdrant's RSS **falls ~280 MiB once indexing settles** (dense is
+    `on_disk` + int8 `always_ram`), so **size the box against the ingest peak, not idle**.
+    **Tenancy held at 100k** — a `dr-vault` search with 100 000 foreign-tenant points in the
+    same collection returned only `dr-vault` docs. **Not measured:** the 100k points are
+    synthetic, and **SQLite was never taken past 67 real docs**.
+    - **One alert fired deliberately:** stopping the indexer trips `VaultRAGRoleDown` →
+    Prometheus `firing` → Alertmanager `active`, routed to the webhook receiver; it cleared
+    when the indexer came back. **Not ingest lag, as the plan guessed** — an indexer that is
+    *gone* stops producing lag observations entirely, so lag is the wrong detector for it.
+  - **The dashboard verify was split in two, because only one half is eyeballable.**
+  `tests/test_deploy.py` (21 tests) resolves **every `vaultrag_*` name and every label** in
+  the dashboard JSON + alert rules against the **live registry**, and the scrape config
+  against the compose services and `Settings.metrics_port`. A live script then ran **every
+  panel expression against the running Prometheus: 16/16 returned data, 5/5 rules loaded and
+  evaluated.** A panel querying a renamed metric renders an empty graph forever and looks
+  exactly like a healthy system — "open Grafana and look" was never a defence.
+  - **TWO REAL BUGS, both found by running it rather than by a test.** (1) **`serve` fell
+  back to the current directory.** With nothing registered, the P0 shorthand makes
+  `vault_path=.` — in the container `/app`, VaultRAG's own install tree — so the first
+  `docker compose up` had the api announce a project rooted at its own source and the indexer
+  **crash-loop recursively inotify-watching its own `.venv`**. `serve` now refuses and names
+  `vaultrag project add` (`mcp` keeps the shorthand, pinned). **No existing test could have
+  caught it: every `serve` test hands it a vault, because one that did not would have looked
+  like a broken test.** (2) **Neither role exported metrics at all** — `_start_metrics` was
+  only called by `watch`/`mcp`, so the **indexer had no metrics surface whatsoever**, and it
+  is the sole producer of the ingest series: the ingest half of the dashboard would have been
+  permanently empty and **two of the five alerts could never have fired**.
+  - **Mutation-verified, 6 for 6, 0 survivors:** four against `test_deploy.py` (typo a metric
+  name → 2 kills; typo a legend label → 1; move the ingest-lag threshold off a bucket edge →
+  2; publish a port on all interfaces → 1) and two against the new code (drop the
+  unconfigured-serve refusal → 1; drop the exporter start → 1).
+  - **One vault note written** (status `proposed`):
+  `agent-inbox/docker-deployment-design-calls.md` — 8 sections. **§3 is the one to read
+  first: the `langfuse` profile is deliberately not built.** Nothing in VaultRAG emits a
+  trace (no `Tracer` seam, no spans, no SDK), self-hosting Langfuse needs Postgres +
+  ClickHouse + Redis + object storage — **four more containers than the 1.8 GiB system they
+  would observe** — and the precedent is P2 Stage 6's VLM pass and Stage 3's `rate_result`.
+  Recommend deferring to P4 and **building the producer (`Tracer` protocol) first**. §1's
+  measurements should graduate into `reference-docker-compose.md`/`cost-model.md`, which
+  state an unmeasured 3-4 GB; §4 is a behaviour change to a shipped command; §8 flags that
+  Stage 5's print-once bootstrap key is fragile under container recreation (observed live —
+  a key existed whose secret was in a destroyed container's log; recovery is `key add`).
+  - **Box back to its starting state:** DR stack and all its volumes removed, the cloned
+  vault deleted, the original `vaultrag-qdrant` back up on its own volume with **281 points,
+  green** — exactly as at session start. The one thing left behind on purpose is the built
+  `vaultrag:latest` image (757 MB), which is the stage's artifact.
 - **P3 STAGE 5 (API keys, scopes, rate limits) COMPLETE 2026-07-23.** **Green: 897 tests
 (+46), ruff, mypy (68 src files), gate unmoved 1.000/0.892/0.920.** New `auth.py` —
 argon2-hashed `id.secret` keys, per-project `read < write < admin` scopes, in-process
@@ -351,20 +409,21 @@ Write path: gated `NoteWriter` → git commit → synchronous `ingest_path`. Swa
 `Embedder`/`Reranker`/`VectorStore`/`MetaStore`/`SparseEmbedder`/`ParentResolver` protocols.
 **Green: `ruff`, `ruff format`, `mypy src` (41 files), `pytest` (315 tests).** Per-module detail
 lives in the code, `MEMORY-p1.md` (P1), and `MEMORY-p0.md` (P0).
-- **What's next: P3 STAGE 6 (Docker image + compose profiles — Grafana/Prometheus,
-Langfuse, alerts)** at `../Rag/projects/vaultrag/p3-step-plan.md`. Nothing blocks it. Its
-verify is the DR drill run for real (fresh volumes → clone vault → compose up → reindex →
-search) and a measured RSS number against the note's 3-4 GB claim, plus Decision 5
-(base/formats image split) which already has a recommendation, just needs ratifying.
-**Branch state:** Stage 4 merged to `main` mid-Stage-5 (PR #17); Stage 5
-(`feat/p3-stage5-api-keys`) was rebased onto `origin/main` after the fact and is now one
-clean commit ahead of it, force-pushed, no PR opened yet. Branch Stage 6 off `main` once
-Stage 5 is merged (or off `feat/p3-stage5-api-keys` if it starts before that, the same
-call this session made for Stage 5 itself).
-  **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7) and
-  (5) Docker base/formats split (Stage 6, recommendation given). Decisions 2, 3 and 4 are
+- **What's next: P3 STAGE 7 (`answer` mode) — which Decision 1 recommends NOT building, and
+Stage 6 landing is exactly the deadline that decision named.** Its argument: every current
+consumer is Claude Code, i.e. already an LLM; building it now yields a second synthesis
+layer, a new hallucination surface and a prompt-injection target that exists only to be
+maintained. **If Anik agrees, P3 is complete and the next move is a P4 plan**, not a stage.
+**Branch state:** Stage 5 merged to `main` (PR #18, `879b311`); Stage 6 is on
+`feat/p3-stage6-docker`, branched off `origin/main`, committed, **unpushed, no PR** — but
+Anik has merged the last four stages himself mid-session, so **check `main` before believing
+that**.
+  **Decisions still open for Anik:** (1) `answer` mode build-at-all (Stage 7 — the live
+  one), plus the **new** Stage 6 call: **should the `langfuse` profile be built at all**
+  (recommendation: no, defer to P4, build the `Tracer` producer first —
+  `agent-inbox/docker-deployment-design-calls.md` §3). Decisions 2, 3, 4 and 5 are
   **settled/implemented**.
-  Six `agent-inbox/` notes await a ruling:
+  Seven `agent-inbox/` notes await a ruling:
   `compression-similarity-is-lexical-not-vector.md` (Stage 1), `overview-tool-shape.md`
   (Stage 2), `query-log-stores-text-opt-in.md` (Stage 3 — its **`top_score` section flags a
   supersession that went beyond what was ratified**), two from Stage 4:
@@ -374,7 +433,10 @@ call this session made for Stage 5 itself).
   retrieval-quality finding — the gate corpus is missing a document shape, not just eight
   golden cases), and one from Stage 5: `key-scopes-and-rate-limit-design-calls.md`
   (**read this one's §5 first — the 403-vs-404 call for an out-of-scope vs. nonexistent
-  project is the sharpest judgment call in the stage**). **Dogfooding:** the `vaultrag` MCP
+  project is the sharpest judgment call in the stage**), and one from Stage 6:
+  `docker-deployment-design-calls.md` (**§3 first — the `langfuse` profile not built; §1's
+  measured footprint supersedes an unmeasured number in two `reference/` notes**).
+  **Dogfooding:** the `vaultrag` MCP
   server has been run
   against the live `vaultrag-design` index in prior sessions — use `search`/`open` against
   `../Rag` while building and treat bad retrieval as a real bug report (repo `CLAUDE.md` §1). To
@@ -414,7 +476,97 @@ Prepend newest first. Template:
 
 ## Session log
 
-### 2026-07-23 (latest) — P3 Stage 5: API keys, and the 403-vs-404 call scopes forced
+### 2026-07-23 (latest) — P3 Stage 6: the deployment, and two bugs only running it could find
+
+- **Did:** Anik: *"impliment next stage."* Checked `git`/`gh` before believing this file, and
+it was stale again — **Anik had merged Stage 5 as PR #18 (`879b311`)**, so the handoff's
+"unpushed, no PR" was wrong (fifth time running). Branched `feat/p3-stage6-docker` off
+`origin/main`, confirmed green (923-baseline suite, gate PASS), then built the deployment.
+- **The stage is mostly config, and config is exactly where "looked checked, wasn't"
+lives.** A Grafana panel querying a renamed metric renders an empty graph forever and is
+indistinguishable from a healthy system; an alert rule on a metric that moved never fires.
+So `tests/test_deploy.py` parses the dashboard JSON and the alert rules and resolves **every
+`vaultrag_*` name and every label** against the **live registry**, the scrape config against
+the compose service names and `Settings.metrics_port`, and the compose file against the
+security posture (every published port loopback-bound, the keyless exporter never
+published). Then a live script ran **every panel expression against the running Prometheus:
+16/16 returned data, 5/5 rules loaded and evaluated.**
+- **The DR drill found the bug the whole exercise was worth.** First `docker compose up` on
+fresh volumes: the api announced a project rooted at `/app` — VaultRAG's own install tree —
+and the indexer crash-looped with `[Errno 2]` while **recursively inotify-watching its own
+`.venv`**. Root cause: `_resolve_served_settings`'s last case is the P0 shorthand
+(`vault_path=.`), which is right for `mcp` (a human runs it from inside a vault) and wrong
+for `serve` (nobody does). `serve` now refuses and names `vaultrag project add`; `mcp` keeps
+the shorthand, pinned by its own test. **No existing test could have caught this — every
+`serve` test hands it a vault, because one that did not would have looked like a broken
+test.** The bug lived precisely in the case nobody would think to write down.
+- **A second gap, found by asking what Prometheus would actually scrape: neither role
+exported metrics at all.** `_start_metrics` was only wired into `watch` and `mcp`. For `api`
+that was survivable (`/metrics` is mounted). For `indexer` it was fatal to the whole
+observability story — the indexer is the **sole** producer of `ingest_lag_seconds`,
+`jobs_queue_depth`, `jobs_dead_total` and `ingests_total`, and it has no HTTP surface, so the
+ingest half of the dashboard would have been permanently empty and **two of the five alerts
+could never have fired**. Both roles now start the keyless exporter.
+- **The 3-4 GB claim is measured for the first time, and it is conservative.** Loaded Qdrant
+to **100,260 points** (synthetic — embedding 100k real chunks is hours, and random vectors
+are the *pessimistic* case for HNSW) and let it settle to `green`: **727 MiB of containers +
+1 070 MiB of host Ollama ≈ 1.8 GiB at the shipped default**. The reranker, measured alone, is
+**+1 068 MiB** — the largest single component in the system and **off by default**, which
+makes `rerank_mode` a memory decision nobody has written down. Qdrant's RSS **fell ~280 MiB
+once indexing settled** (dense is `on_disk` with int8 `always_ram`), so **the number to size
+a box against is the ingest peak, not idle** — a machine sized to the idle figure OOMs on its
+first full reindex. **Said plainly in the note: SQLite was never taken past 67 real docs**,
+so the metadata store is the one component still unmeasured at scale.
+- **Tenancy held at 100k**, unplanned but free: with 100 000 foreign-tenant points sharing
+the collection, a `dr-vault` search returned only `dr-vault` documents. Payload-partitioned
+tenancy has now been exercised at ~385× the tenant's own size, not just against a sibling.
+- **Fired an alert deliberately, and the plan's guess about which one was wrong.** Stopping
+the indexer trips `VaultRAGRoleDown`, not ingest lag — an indexer that is *gone* stops
+producing lag observations entirely, so lag is exactly the wrong detector for it. Verified
+the whole chain: Prometheus `firing` → Alertmanager `active` → routed to the webhook
+receiver, and cleared when the indexer came back.
+- **One deliverable deliberately NOT built: the `langfuse` profile.** Nothing in VaultRAG
+emits a trace — no `Tracer` seam, no spans, no SDK — so the profile would stand up a
+*consumer with no producer*: a service that comes up, looks healthy, and shows an empty
+project forever. Self-hosting Langfuse also needs Postgres + ClickHouse + Redis + object
+storage, **four more containers than the 1.8 GiB system they would observe**. The precedent
+is P2 Stage 6's VLM pass and Stage 3's `rate_result`, both left off *and unbuilt*. Written up
+with a recommendation (defer to P4; build the `Tracer` producer first — the seam is the
+work, the consumer is trivial) rather than shipped dark. **Flagging it as the one place this
+stage is narrower than its plan.**
+- **Mutation-verified, 6 for 6, 0 survivors.** Four against the new config tests (typo a
+metric name in the dashboard → 2 kills; typo a `{{stage}}` legend → 1; move the ingest-lag
+threshold off a real bucket edge → 2; publish a port on all interfaces → 1) and two against
+the new code (drop the unconfigured-serve refusal → 1; drop the exporter start → 1). Each
+reverted immediately after confirming the kill.
+- **Verified:** 923 tests (+26: 21 `test_deploy.py`, 5 `test_cli.py`), ruff, ruff format,
+mypy (68 src files), **gate PASS 1.000 / 0.892 / 0.920 (unmoved — this stage touches no
+retrieval code)**. Live: base image builds (**757 MB**), entrypoint runs, DR drill end to
+end, write-back through the container (rw mount + `git` in the image + real commit hash),
+observability profile up with all four scrape targets healthy. **Box back to its starting
+state:** DR stack and every one of its volumes removed, the cloned vault deleted, the
+original `vaultrag-qdrant` back on its own volume with **281 points, green** — exactly as at
+session start. Left behind on purpose: the built `vaultrag:latest` image, the stage's
+artifact.
+- **Files:** `Dockerfile` (new), `.dockerignore` (new), `docker-compose.yml` (3 services +
+`observability` profile), `deploy/{prometheus,alerts,alertmanager}.yml` (new),
+`deploy/grafana/{provisioning/…,dashboards/vaultrag.json}` (new), `README.md` (rewritten —
+deployment, two tags, DR, observability), `.github/workflows/checks.yml` (docker build job),
+`src/vaultrag/cli.py` (`_refuse_an_unconfigured_serve`, `serve --metrics`, exporter in both
+roles); tests: `tests/test_deploy.py` (new), `tests/test_cli.py`; vault:
+`agent-inbox/docker-deployment-design-calls.md` (new),
+`projects/vaultrag/p3-step-plan.md` (Stage 6 log).
+- **Next / handoff:** **Stage 7 (`answer` mode) is the only stage left, and Decision 1
+recommends not building it** — Stage 6 landing is the exact deadline that decision named for
+cancelling it. **If Anik agrees, P3 is complete and the next move is a P4 plan, not a
+stage.** Two things want his eyes first: **§3 of
+`agent-inbox/docker-deployment-design-calls.md`** (the `langfuse` profile not built — the one
+place this stage is narrower than its plan) and **§1** (the measured footprint, which
+supersedes an unmeasured 3-4 GB in *two* `reference/` notes). Stage 6 is committed on
+`feat/p3-stage6-docker`, **unpushed, no PR** — but Anik has merged the last four stages
+himself mid-session, so check `main` first.
+
+### 2026-07-23 — P3 Stage 5: API keys, and the 403-vs-404 call scopes forced
 
 - **Did:** Anik: *"if all the bugs are resolve then move to next stage."* Verified rather
 than trusted this log again — this time it checked out: `git status` showed

@@ -1,0 +1,87 @@
+# Prometheus alerting rules (P3 Stage 6).
+#
+# The three ../Rag/projects/vaultrag/monitoring-observability.md names — dead jobs > 0,
+# ingest lag > 5 min, search p95 > 1 s — plus two the P2/P3 metrics made cheap and that a
+# single-box operator has no other way to notice: a role that stopped, and index drift.
+#
+# Every expression here is checked against the live registry by tests/test_deploy.py: a
+# rule querying a metric or label that does not exist would sit silently un-firing forever,
+# which is the "looked checked, wasn't" failure this repo keeps finding.
+
+groups:
+  - name: vaultrag
+    rules:
+      # --- the three from monitoring-observability -------------------------------
+      - alert: VaultRAGDeadJobs
+        # A counter, so `> 0` would latch until the process restarts and could not
+        # re-fire for a second incident. `increase(...)` asks the question the note
+        # actually means: has anything died *recently*.
+        expr: increase(vaultrag_jobs_dead_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingest jobs are dying ({{ $value | printf \"%.0f\" }} in 15m)"
+          description: >-
+            A path exhausted its retries and was parked dead, so the vault and the index
+            now disagree about it. `vaultrag reindex --force` after fixing the cause.
+
+      - alert: VaultRAGIngestLagHigh
+        # p95 rather than max: one pathological 300-page PDF should not page an operator,
+        # a systematically slow ingest pipeline should.
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le, project) (rate(vaultrag_ingest_lag_seconds_bucket[10m]))
+          ) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingest lag p95 over 5 min for {{ $labels.project }}"
+          description: >-
+            Edits are taking more than 5 minutes to become searchable. This is the SLO that
+            matters (monitoring-observability): a stale index answers confidently.
+
+      - alert: VaultRAGSearchLatencyHigh
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(vaultrag_search_latency_seconds_bucket{stage="total"}[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Search p95 over 1s"
+          description: >-
+            End-to-end search p95 is above 1 s. Break it down by stage on the dashboard —
+            `embed` points at Ollama, `rerank` at the cross-encoder, `fetch` at Qdrant.
+
+      # --- two more the single-box shape makes worth having ----------------------
+      - alert: VaultRAGRoleDown
+        # The indexer has no port and no dashboard of its own; without this, an indexer
+        # that died looks exactly like a vault nobody edited.
+        expr: up{job="vaultrag"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "vaultrag {{ $labels.role }} is not being scraped"
+          description: >-
+            The {{ $labels.role }} container is down or its metrics exporter is not
+            bound. With no indexer, edits stop reaching the index silently.
+
+      - alert: VaultRAGIndexDrift
+        # A gauge, and a state rather than an event: it stays set until `reindex --force`
+        # clears it, which is exactly the shape an alert should have here.
+        expr: vaultrag_index_drift_chunks != 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Index drift on {{ $labels.project }} ({{ $value }} chunks)"
+          description: >-
+            The manifest and the vector store disagree. Positive means Qdrant is missing
+            chunks SQLite records — search answers from a fraction of the vault and looks
+            fine doing it. `vaultrag reindex --project {{ $labels.project }} --force`.

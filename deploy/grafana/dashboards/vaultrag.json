@@ -1,0 +1,376 @@
+{
+  "uid": "vaultrag-overview",
+  "title": "VaultRAG",
+  "description": "The one dashboard monitoring-observability.md asks for: ingest health, search latency by stage, zero-hit rate, top projects — plus every other series vaultrag/metrics.py exports, so a panel is never the reason a number goes unnoticed. Every vaultrag_* metric referenced here is asserted to exist by tests/test_deploy.py.",
+  "tags": ["vaultrag"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "project",
+        "label": "Project",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+        "query": "label_values(vaultrag_searches_total, project)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Fleet",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Roles up",
+      "description": "The indexer has no port and no UI; without this panel a dead indexer looks exactly like a vault nobody edited.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 } } },
+            { "type": "value", "options": { "1": { "text": "up", "color": "green", "index": 1 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "up{job=\"vaultrag\"}",
+          "legendFormat": "{{role}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Index drift (chunks)",
+      "description": "Manifest chunk count minus vector-store points, per project. Non-zero means search is answering from a fraction of the vault and looking fine doing it — `vaultrag reindex --force` clears it.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 4, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "vaultrag_index_drift_chunks{project=~\"$project\"}",
+          "legendFormat": "{{project}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 3,
+      "title": "Build",
+      "description": "Which version each role is running. Two roles on different versions is a half-finished deploy.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 7, "x": 9, "y": 1 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true },
+      "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true, "Value": true, "__name__": true, "job": true } } }],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "vaultrag_build_info",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "Authenticated requests by key",
+      "description": "Per-key HTTP volume (the key id, never the key). A key that starts doing something new is visible here before it is visible anywhere else.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum by (key_id) (rate(vaultrag_key_requests_total[$__rate_interval]))",
+          "legendFormat": "{{key_id}}"
+        }
+      ]
+    },
+
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Search",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 10,
+      "title": "Searches/s",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum(rate(vaultrag_searches_total{project=~\"$project\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 11,
+      "title": "Zero-hit ratio",
+      "description": "Searches that returned no snippets. Note the P3 Stage 3 finding: a hybrid retriever ranks *something* first for almost everything, so this is a floor on retrieval failure, not a measure of it — `vaultrag queries --report worst` is the real instrument.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.05 }, { "color": "red", "value": 0.2 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum(rate(vaultrag_searches_empty_total{project=~\"$project\"}[$__rate_interval])) / sum(rate(vaultrag_searches_total{project=~\"$project\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 12,
+      "title": "Search latency p95 by stage",
+      "description": "The pipeline, stage by stage. `embed` points at Ollama, `fetch` at Qdrant, `rerank` at the cross-encoder, `total` is what the caller feels.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 9, "w": 16, "x": 8, "y": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "showPoints": "never", "lineWidth": 2 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "total" }, "properties": [{ "id": "custom.lineWidth", "value": 3 }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(vaultrag_search_latency_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 13,
+      "title": "Top projects by search rate",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "showPoints": "never", "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "topk(5, sum by (project) (rate(vaultrag_searches_total[$__rate_interval])))",
+          "legendFormat": "{{project}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 14,
+      "title": "Rerank decisions",
+      "description": "`skipped` is auto-mode's fusion-dominance fast path, not a failure. All-skipped with mode=auto means the margin threshold is too generous.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 20, "showPoints": "never", "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum by (decision) (rate(vaultrag_rerank_decisions_total[$__rate_interval]))",
+          "legendFormat": "{{decision}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 15,
+      "title": "Embed cache hit ratio",
+      "description": "Cache keyed (model, dims, chunk_hash). A collapse here after a reindex means the key changed — usually an embedding model or dims change, which is a full re-embed.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.9 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum(rate(vaultrag_embed_cache_lookups_total{result=\"hit\"}[$__rate_interval])) / sum(rate(vaultrag_embed_cache_lookups_total[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 16,
+      "title": "Write-back",
+      "description": "Writes that reached the vault, by action, against writes a guardrail refused, by reason. A rising refusal line is an agent repeatedly trying something the containment rules forbid.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum by (action) (rate(vaultrag_write_ops_total{project=~\"$project\"}[$__rate_interval]))",
+          "legendFormat": "ok: {{action}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum by (reason) (rate(vaultrag_write_refused_total[$__rate_interval]))",
+          "legendFormat": "refused: {{reason}}"
+        }
+      ]
+    },
+
+    {
+      "type": "row",
+      "id": 102,
+      "title": "Ingest health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 20,
+      "title": "Queue depth",
+      "description": "Paths debounce-pending plus in-flight. Sustained non-zero means the watcher is behind the vault.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum(vaultrag_jobs_queue_depth)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 21,
+      "title": "Dead jobs (15m)",
+      "description": "Paths that exhausted their retries. Anything above zero means the vault and the index disagree about a file and nothing will fix it on its own.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum(increase(vaultrag_jobs_dead_total[15m]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 22,
+      "title": "Ingest lag p95 (edit → searchable)",
+      "description": "The SLO that matters (monitoring-observability). Split by ingest route: `watch` is the file watcher, `writeback` is an agent's own write coming back around.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 9, "w": 16, "x": 8, "y": 22 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 0, "showPoints": "never", "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 300 }] }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le, source, project) (rate(vaultrag_ingest_lag_seconds_bucket{project=~\"$project\"}[$__rate_interval])))",
+          "legendFormat": "{{project}} / {{source}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 23,
+      "title": "Ingests by outcome",
+      "description": "`unchanged` dominating is the manifest doing its job. `skipped` is .ragignore, the secret guard, or an unsupported format.",
+      "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 27 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 20, "showPoints": "never", "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "vaultrag-prometheus" },
+          "expr": "sum by (status) (rate(vaultrag_ingests_total{project=~\"$project\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    }
+  ]
+}

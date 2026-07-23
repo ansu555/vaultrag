@@ -1,0 +1,16 @@
+# The dashboard is a file in git, not a thing someone built in the UI and forgot to export.
+# `allowUiUpdates: false` keeps it that way: edits in Grafana are for exploring, and the
+# committed JSON is what a fresh box gets.
+apiVersion: 1
+
+providers:
+  - name: vaultrag
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

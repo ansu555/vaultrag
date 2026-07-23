@@ -1,0 +1,36 @@
+# Alertmanager route for the `observability` profile (P3 Stage 6).
+#
+# monitoring-observability.md says "even if it's just ntfy/Telegram" — so this is one
+# webhook receiver and nothing else.
+#
+# `__WEBHOOK_URL__` is substituted at container start from VAULTRAG_ALERT_WEBHOOK (see the
+# alertmanager service in docker-compose.yml). Alertmanager does not expand environment
+# variables in its own config, and a config with a literal `${VAR}` in it fails to parse —
+# so the substitution is done before alertmanager reads the file rather than pretended at.
+#
+# The default is a dead local address on purpose: a route that shipped somewhere real out
+# of the box would publish this box's operational state the moment the profile came up. To
+# actually get notified, set
+#   VAULTRAG_ALERT_WEBHOOK=https://ntfy.sh/<your-random-topic>
+# ntfy accepts Alertmanager's webhook payload directly. Telegram works the same way through
+# a small bridge, or swap this receiver for alertmanager's native `telegram_configs`.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: vaultrag-webhook
+  # Group by alertname so five drifted projects are one notification, not five.
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  # Long, deliberately: these alerts describe states an operator fixes in minutes-to-hours
+  # (a reindex, a restart), and a 4-hour re-notify is the difference between a reminder and
+  # a reason to mute the topic.
+  repeat_interval: 4h
+
+receivers:
+  - name: vaultrag-webhook
+    webhook_configs:
+      - url: __WEBHOOK_URL__
+        send_resolved: true

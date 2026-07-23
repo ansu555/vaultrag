@@ -1,0 +1,13 @@
+# Provisioned, not clicked: the dashboard JSON beside this file references the datasource
+# by the fixed uid below, so a hand-added datasource with a random uid would leave every
+# panel showing "datasource not found".
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: vaultrag-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

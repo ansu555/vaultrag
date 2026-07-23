@@ -123,3 +123,39 @@ jobs:
       # and re-running 634 tests against a heavier dependency set buys nothing.
       - name: Run the format suites
         run: uv run pytest tests/test_pdf.py tests/test_image.py -rs
+
+  # `tests/test_deploy.py` checks that the compose file, scrape config, dashboard and alert
+  # rules agree with the code — but nothing in the test suite can tell whether the image
+  # still *builds*. Without this job a broken Dockerfile is found by whoever deploys next,
+  # which on a single-box system is the same person, at the worst possible time.
+  #
+  # Base tag only. The `formats` build pulls torch (~2.5 GB) for a Docling import assertion
+  # that the `formats` pytest job above already covers on the same dependency set; paying
+  # that download on every PR to re-verify one import is the trade P2 Decision 3 already
+  # made in the other direction.
+  docker:
+    name: docker build (base image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the base image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: vaultrag:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image is only useful if the entrypoint runs. `--help` exercises the whole CLI
+      # import graph (every subcommand module) without needing Qdrant or Ollama, so a
+      # missing runtime dependency fails here rather than at `docker compose up`.
+      - name: The entrypoint runs
+        run: docker run --rm vaultrag:ci --help
+
+      - name: The compose file is valid against the built image
+        run: docker compose --profile observability config >/dev/null

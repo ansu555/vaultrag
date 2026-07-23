@@ -895,3 +895,103 @@ def test_serve_help_names_both_roles() -> None:
     assert result.exit_code == 0
     assert "api" in result.output
     assert "indexer" in result.output
+
+
+# ---------------------------------------------------------------------------
+# serve (P3 Stage 6) — the unconfigured-deployment refusal, and the exporter
+# ---------------------------------------------------------------------------
+def test_serve_refuses_when_nothing_names_a_vault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by the Stage 6 DR drill, not by a test — because every other test hands
+    ``serve`` a vault, and one that did not would have looked like a broken test.
+
+    ``_resolve_served_settings``'s last case is the P0 shorthand: nothing registered and no
+    flags means base settings, i.e. ``vault_path=.``. Right for ``mcp``, which a human runs
+    from inside a vault. Wrong for ``serve``: in the shipped container cwd is ``/app``, so
+    a first ``docker compose up`` had the api announce a project rooted at VaultRAG's own
+    source tree and the indexer crash-loop recursively watching its own ``.venv``.
+    """
+    monkeypatch.chdir(tmp_path)
+    bound = _stub_uvicorn(monkeypatch)
+    result = runner.invoke(app, ["serve"], env=_serve_env(tmp_path))
+    assert result.exit_code == 1
+    assert "no project is registered" in result.output
+    assert "vaultrag project add" in result.output
+    assert not bound, "an unconfigured serve must not bind a port"
+
+
+def test_serve_still_honours_an_explicit_vault_path_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal is about *nothing* naming a vault, not about the registry specifically.
+    ``VAULTRAG_VAULT_PATH`` is an operator naming one, so it stays a valid way to deploy —
+    which is why the check reads ``model_fields_set`` rather than comparing to the default.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.chdir(tmp_path)
+    bound = _stub_uvicorn(monkeypatch)
+    result = runner.invoke(
+        app, ["serve"], env={**_serve_env(tmp_path), "VAULTRAG_VAULT_PATH": str(vault)}
+    )
+    assert result.exit_code == 0, result.output
+    assert bound, "an explicitly-configured serve must still start"
+
+
+def test_serve_does_not_refuse_once_a_project_is_registered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compose flow's self-healing property: register a project and the crash-looping
+    containers come up on their next restart, with no further operator action."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    env = _serve_env(tmp_path)
+    added = runner.invoke(app, ["project", "add", "p", "--vault", str(vault)], env=env)
+    assert added.exit_code == 0, added.output
+
+    monkeypatch.chdir(tmp_path)
+    bound = _stub_uvicorn(monkeypatch)
+    result = runner.invoke(app, ["serve"], env=env)
+    assert result.exit_code == 0, result.output
+    assert bound
+
+
+def test_mcp_keeps_the_cwd_shorthand_that_serve_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal must not leak into ``mcp``. P0's `cd into a vault and run it` path is
+    the whole reason the shorthand exists, and stdio is exactly where cwd is the answer."""
+    monkeypatch.chdir(tmp_path)
+    served: list[str] = []
+    monkeypatch.setattr(
+        "vaultrag.mcp.server.FastMCP.run", lambda self, *a, **k: served.append("ran")
+    )
+    result = runner.invoke(app, ["mcp", "--no-write"], env=_serve_env(tmp_path))
+    assert result.exit_code == 0, result.output
+    assert served == ["ran"]
+
+
+def test_serve_exposes_the_keyless_exporter_the_scrape_config_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The indexer role owns every ingest series and has no HTTP surface of its own, so
+    without the standalone exporter `deploy/prometheus.yml` scrapes nothing from it and
+    two of the five alert rules can never fire (P3 Stage 6).
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    started: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        "vaultrag.cli.start_metrics_server",
+        lambda port, addr: (started.append((port, addr)), True)[1],
+    )
+    _stub_uvicorn(monkeypatch)
+    result = runner.invoke(
+        app,
+        ["serve", "--project", "p", "--vault", str(vault), "--metrics"],
+        env=_serve_env(tmp_path),
+    )
+    assert result.exit_code == 0, result.output
+    assert started == [(9464, "127.0.0.1")]
+    assert "metrics: http://127.0.0.1:9464/metrics" in result.output

@@ -1,0 +1,43 @@
+# Prometheus scrape config for the `observability` compose profile (P3 Stage 6).
+#
+# Two targets, because metrics are per-process and the two roles are two processes: the api
+# container records search/write/key series, the indexer container records ingest/job
+# series. Neither has the other's numbers, so a dashboard panel that assumed one target
+# would be half empty — the `role` label below is what lets a panel say which half it is
+# looking at, and what makes "the indexer is down" visible as `up{role="indexer"} == 0`.
+#
+# Both are scraped on the keyless standalone exporter (VAULTRAG_METRICS_ADDR=0.0.0.0,
+# port 9464 on the compose network, never published to the host). The api's own /metrics
+# on :8000 serves the identical registry but requires a bearer key, so scraping it would
+# mean putting a credential in this file to read numbers that carry no vault content —
+# see ../Rag/agent-inbox/serve-transport-design-calls.md §1.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: vaultrag
+    static_configs:
+      - targets: ["api:9464"]
+        labels:
+          role: api
+      - targets: ["indexer:9464"]
+        labels:
+          role: indexer
+
+  - job_name: qdrant
+    static_configs:
+      - targets: ["qdrant:6333"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

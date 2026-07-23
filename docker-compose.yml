@@ -1,10 +1,55 @@
-# Local single-box stack. P0 needs Qdrant only — the api/indexer services land with the
-# Docker image (P0 polish / P1). Shape: ../Rag/reference/reference-docker-compose.md.
+# VaultRAG — single-box deployment (P3 Stage 6).
+# Shape: ../Rag/reference/reference-docker-compose.md.
 #
-#   docker compose up -d qdrant     # dashboard: http://localhost:6333/dashboard
+#   docker compose up -d                          # qdrant + api + indexer
+#   docker compose --profile observability up -d  # + prometheus, alertmanager, grafana
+#   docker compose up -d qdrant                   # P0 mode: just the vector store
 #
-# The volume holds a derived cache, not a backup: the vault is the source of truth and
-# `vaultrag reindex` rebuilds this from bare markdown (CLAUDE.md §6).
+# Ollama is NOT a service here. It runs on the host so it can use the GPU if there is one
+# (reference-docker-compose: "Ollama on the host uses GPU if present"), and the containers
+# reach it through host.docker.internal.
+#
+# The volumes hold a *derived cache*, not a backup: the vault is the source of truth and
+# `vaultrag reindex` rebuilds all of this from bare markdown (CLAUDE.md §6). The backup is
+# the vault's own git remote.
+#
+# Host-side settings, all optional (put them in a `.env` beside this file):
+#   VAULTRAG_VAULTS_DIR     host directory holding the vaults, mounted at /vaults (./vaults)
+#   VAULTRAG_UID / _GID     uid:gid the containers run as; must own the vault for write-back
+#   VAULTRAG_OLLAMA_URL     override if Ollama is not on the host's default port
+#   VAULTRAG_ALERT_WEBHOOK  where alertmanager POSTs (an ntfy topic, a Telegram bridge, …)
+
+x-vaultrag-common: &vaultrag-common
+  build:
+    context: .
+    args:
+      # Two tags, one Dockerfile (p3-step-plan Decision 5). Set EXTRAS=--extra=pdf for the
+      # `formats` build; the base image skips PDFs cleanly rather than failing on them.
+      EXTRAS: ""
+      UID: ${VAULTRAG_UID:-1000}
+      GID: ${VAULTRAG_GID:-1000}
+  image: vaultrag:latest
+  restart: unless-stopped
+  depends_on:
+    qdrant:
+      condition: service_healthy
+  volumes:
+    # rw because write-back edits the vault and auto-commits to its git repo.
+    - ${VAULTRAG_VAULTS_DIR:-./vaults}:/vaults:rw
+    - state:/state
+  extra_hosts:
+    # Docker Desktop resolves this itself; on Linux this line is what makes it exist.
+    - "host.docker.internal:host-gateway"
+  environment: &vaultrag-env
+    VAULTRAG_OLLAMA_URL: ${VAULTRAG_OLLAMA_URL:-http://host.docker.internal:11434}
+    # The keyless standalone exporter, bound to the compose network and never published to
+    # the host. This is the scrape door: the API's own /metrics requires a bearer key
+    # (agent-inbox/serve-transport-design-calls.md §1), and putting a credential in
+    # prometheus.yml to read numbers that carry no vault content is plumbing for nothing.
+    # Same registry either way — two front doors, one set of numbers.
+    VAULTRAG_METRICS_ENABLED: "true"
+    VAULTRAG_METRICS_ADDR: "0.0.0.0"
+
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -22,5 +67,116 @@ services:
       timeout: 3s
       retries: 5
 
+  api:
+    <<: *vaultrag-common
+    container_name: vaultrag-api
+    command: ["serve", "--role", "api"]
+    environment:
+      <<: *vaultrag-env
+      VAULTRAG_ROLE: api
+      # The loopback default (reference-security-model) would make the port unreachable
+      # even from this network, so the bind is widened *inside* the container and narrowed
+      # again by the loopback-only publish below. Both halves of that decision live here,
+      # typed out, rather than one of them being an invisible image default.
+      VAULTRAG_API_HOST: "0.0.0.0"
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      # /healthz is the one unauthenticated route, and it exists for exactly this caller.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  indexer:
+    <<: *vaultrag-common
+    container_name: vaultrag-indexer
+    command: ["serve", "--role", "indexer"]
+    environment:
+      <<: *vaultrag-env
+      VAULTRAG_ROLE: indexer
+    # No ports. The indexer's only surface is the metrics exporter on the compose network;
+    # it reconciles every served vault at boot and then watches them.
+    #
+    # Both roles open the same SQLite file on the shared `state` volume. That is fine at
+    # this scale — WAL plus a 5 s busy timeout (store/sqlite.py), one writer and one mostly
+    # reader — and it is also precisely the signal
+    # ../Rag/projects/vaultrag/performance-scaling-triggers.md names for the Postgres
+    # migration. Two containers on one file is the last stop before that trigger, not a
+    # steady state to grow into.
+
+  # --- profile: observability -------------------------------------------------
+  # `docker compose --profile observability up -d`. Prometheus scrapes both roles' keyless
+  # exporters; the dashboard and the alert rules are committed under deploy/.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: vaultrag-prometheus
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: vaultrag-alertmanager
+    profiles: [observability]
+    restart: unless-stopped
+    volumes:
+      - ./deploy/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    # Alertmanager expands no environment variables in its own config, and a config
+    # containing a literal `${VAR}` fails to parse — so the one value an operator actually
+    # changes is substituted here, before alertmanager reads the file. The default is a
+    # dead local address on purpose: a route that shipped somewhere real out of the box
+    # would publish this box's operational state the moment the profile came up.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        sed 's|__WEBHOOK_URL__|${VAULTRAG_ALERT_WEBHOOK:-http://127.0.0.1:9/unconfigured}|'
+        /etc/alertmanager/alertmanager.yml > /tmp/alertmanager.yml &&
+        exec /bin/alertmanager --config.file=/tmp/alertmanager.yml
+        --storage.path=/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: vaultrag-grafana
+    profiles: [observability]
+    restart: unless-stopped
+    depends_on: [prometheus]
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    environment:
+      # Loopback-published and inside the same trust boundary as the vault it observes; a
+      # login prompt on a single-box dashboard buys nothing an operator wants to pay for.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: dark
+    ports:
+      - "127.0.0.1:3000:3000"
+
 volumes:
   qdrant_data: {}
+  state: {}
+  prometheus_data: {}
+  alertmanager_data: {}
+  grafana_data: {}

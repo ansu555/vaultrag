@@ -14,9 +14,12 @@ Subcommands:
 * ``key``     — mint/list/revoke API keys for the HTTP transport (P3 Stage 5).
 * ``eval``    — score retrieval against a golden set; the CI gate (P2 Stage 1).
 
-The long-running roles (``watch``, ``mcp``) take ``--metrics`` to expose the standalone
-Prometheus endpoint (P2 Stage 7: :mod:`vaultrag.metrics`); ``serve`` mounts the same
-registry on its own port instead.
+Every long-running command (``watch``, ``mcp``, ``serve`` in both roles) takes
+``--metrics`` to expose the standalone **keyless** Prometheus endpoint (P2 Stage 7:
+:mod:`vaultrag.metrics`). ``serve --role api`` additionally mounts the *same registry* at
+``/metrics`` behind a bearer key — two front doors, one set of numbers. The keyless one is
+what a Prometheus in another container scrapes (see ``deploy/prometheus.yml``); the
+indexer role has no other surface at all, and it owns every ingest series.
 
 ``mcp`` and ``serve`` build their stack through the *same* composition root
 (:func:`~vaultrag.composition.build_stack`) and differ only in which transport they hand
@@ -205,6 +208,50 @@ def _resolve_served_settings(projects: list[str] | None, vault: Path | None) -> 
             raise typer.BadParameter(str(exc)) from exc
 
 
+def _refuse_an_unconfigured_serve(project: list[str] | None, vault: Path | None) -> None:
+    """Refuse ``serve`` when nothing says which vault to serve (P3 Stage 6).
+
+    ``_resolve_served_settings``'s last case is the P0 shorthand: nothing registered and no
+    flags means "serve base settings as-is", i.e. ``project_id=default`` over
+    ``vault_path=.``. That is right for ``mcp`` and ``reindex``, which a human runs *from
+    inside* a vault — cwd is the answer to "which vault".
+
+    It is wrong for ``serve``, which nobody runs that way. In the container the compose file
+    ships, cwd is ``/app`` — VaultRAG's own install tree — so a first ``docker compose up``
+    on an unconfigured box had the api announce a project rooted at its own source and the
+    indexer crash-loop trying to recursively watch its own ``.venv`` (found by the Stage 6
+    DR drill, not by a test: every test supplies a vault, because a test that did not would
+    have looked like a broken test). Indexing site-packages is the *better* of the two
+    outcomes there; the worse one is a vault-shaped cwd getting silently indexed under the
+    id ``default``.
+
+    An explicitly-set ``VAULTRAG_VAULT_PATH``/``VAULTRAG_PROJECT_ID`` is still honoured —
+    that is an operator naming a vault, just not through the registry — which is why this
+    reads ``model_fields_set`` rather than comparing against the default value.
+    """
+    if project or vault is not None:
+        return
+    base = load_settings()
+    if {"vault_path", "project_id"} & base.model_fields_set:
+        return
+    with _registry(base) as registry:
+        if registry is not None and registry.list():
+            return
+    typer.echo(
+        "serve failed: no project is registered and none was named, so there is no vault "
+        "to serve.\n"
+        "  register one:  vaultrag project add <id> --vault <path>\n"
+        # `run --rm`, not `exec`: this refusal is what the api container just exited on, and
+        # `exec` needs a running one. A one-off container shares the same state volume, so
+        # the registration lands where the restarting services will read it.
+        "  in compose:    docker compose run --rm api project add <id> --vault /vaults/<dir>\n"
+        "Unlike `mcp`, `serve` will not fall back to the current directory — in a container "
+        "that is the application's own install tree.",
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
 def _start_metrics(settings: Settings, *, requested: bool) -> bool:
     """Bring up the standalone ``/metrics`` exporter if asked; report whether it bound.
 
@@ -212,7 +259,8 @@ def _start_metrics(settings: Settings, *, requested: bool) -> bool:
     run without editing the environment, and the env var can turn it on for a long-lived
     deployment without editing a command line.
 
-    Only the **long-running** roles (``watch``, ``mcp``) call this. ``reindex`` finishes in
+    Only the **long-running** commands (``watch``, ``mcp``, ``serve``) call this.
+    ``reindex`` finishes in
     seconds, so an exporter there would almost never be scraped before the process exited
     — its work still lands in the counters, it just has no window in which to be read.
     Metrics recording itself is unconditional, so nothing is lost by not exporting here.
@@ -585,6 +633,14 @@ def serve(
             "still measured and logged — only the refusal is waived.",
         ),
     ] = False,
+    metrics: Annotated[
+        bool,
+        typer.Option(
+            "--metrics",
+            help="Also expose the standalone keyless /metrics exporter on "
+            "VAULTRAG_METRICS_PORT (ORs with VAULTRAG_METRICS_ENABLED).",
+        ),
+    ] = False,
 ) -> None:
     """Serve the REST API over HTTP (role=api), or run the indexer (role=indexer).
 
@@ -596,6 +652,7 @@ def serve(
     indexer role runs the boot reconcile and the file watcher, and opens no port beyond
     the optional standalone metrics exporter.
     """
+    _refuse_an_unconfigured_serve(project, vault)
     served_settings = _resolve_served_settings(project, vault)
     base = served_settings[0]
     configure_logging(base.log_level)
@@ -608,6 +665,17 @@ def serve(
     watching = watch if watch is not None else (effective_role is Role.indexer)
 
     _require_vault_dirs(served_settings, command="serve")
+
+    # Both roles, not just `api`. The indexer is the *only* producer of the ingest-lag,
+    # queue-depth and dead-job series — the ingest half of the Grafana dashboard and two of
+    # the three alerts monitoring-observability.md names — and it has no HTTP surface of its
+    # own, so without this it publishes nothing and a dead indexer looks like a quiet vault.
+    # For `api` this is the second front door onto the same registry: keyless and loopback
+    # by default, which is what lets a Prometheus in another container scrape without a
+    # bearer key while /v1 and the mounted /metrics stay behind one
+    # (agent-inbox/serve-transport-design-calls.md §1).
+    if _start_metrics(base, requested=metrics):
+        typer.echo(f"metrics: http://{base.metrics_addr}:{base.metrics_port}/metrics")
 
     project_ids = [s.project_id for s in served_settings]
     try:
