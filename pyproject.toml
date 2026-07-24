@@ -1,11 +1,22 @@
 [project]
 name = "vaultrag"
-version = "0.0.0"
+version = "0.1.0"
 description = "Self-hosted, MCP-first RAG backend over Obsidian vaults."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Anik" }]
+keywords = ["rag", "mcp", "obsidian", "retrieval", "embeddings", "qdrant", "self-hosted"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing :: Indexing",
+]
 dependencies = [
     # Real key hashing (P3 Stage 5), replacing Stage 4's compare_digest bootstrap.
     # Weighed before committing, the way FastAPI/Docling/prometheus-client were:
@@ -51,6 +62,11 @@ dependencies = [
     "uvicorn>=0.30",
     "watchdog>=4.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ansu555/vaultrag"
+Repository = "https://github.com/ansu555/vaultrag"
+Issues = "https://github.com/ansu555/vaultrag/issues"
 
 # Docling pulls ~100 packages including torch — far too heavy for the base install
 # (local-first, principle #2), so PDF support is opt-in: `uv sync --extra pdf`.

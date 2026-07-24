@@ -19,3 +19,12 @@ dist/
 
 # OS / editor
 .DS_Store
+
+# Secrets — never commit credentials (the index/repo is not a secret store)
+token.txt
+*.token
+.env
+.env.*
+*credentials*
+id_rsa*
+*.pem

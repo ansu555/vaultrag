@@ -5,6 +5,10 @@
 **A self-hosted, MCP-first RAG backend that coding agents query instead of loading docs
 into context — and can write back into.**
 
+[![PyPI](https://img.shields.io/pypi/v/vaultrag)](https://pypi.org/project/vaultrag/)
+[![Python](https://img.shields.io/pypi/pyversions/vaultrag)](https://pypi.org/project/vaultrag/)
+[![License: MIT](https://img.shields.io/pypi/l/vaultrag)](LICENSE)
+
 [Getting started](docs/getting-started.md) ·
 [Architecture](docs/architecture.md) ·
 [CLI](docs/cli-reference.md) ·
@@ -22,6 +26,9 @@ instead of reading files, and can persist what it learns as new notes that are
 git-committed and searchable in the same session.
 
 Everything runs locally. No API key is required for anything.
+
+**Install:** `pip install vaultrag` or `uvx vaultrag` — it's [published on PyPI](https://pypi.org/project/vaultrag/).
+The quickstart below runs from a clone, which also gives you the `docker-compose.yml` for Qdrant and the observability stack:
 
 ```bash
 uv sync
@@ -222,7 +229,7 @@ instead of vibes. [Contributing guide →](docs/development.md)
 
 **P3 — production posture.** Stages 1–6 shipped: deterministic stage-7 compression, the
 multi-project registry, the query log and its mining CLI, the REST `/v1` transport, scoped
-API keys, and the Docker deployment.
+API keys, and the Docker deployment. First release — [`vaultrag 0.1.0`](https://pypi.org/project/vaultrag/) — is on PyPI.
 
 See [`MEMORY.md`](MEMORY.md) for exactly where things are, and [`CLAUDE.md`](CLAUDE.md) if
 you are an agent working in this repo.

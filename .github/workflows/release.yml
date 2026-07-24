@@ -1,0 +1,60 @@
+# Build and publish to PyPI on a version tag — no token anywhere.
+#
+# This uses PyPI Trusted Publishing (OIDC): when `id-token: write` is set and no
+# password is supplied, the publish action exchanges a short-lived GitHub identity token
+# for a one-time PyPI upload credential. Nothing is stored in the repo or in Actions
+# secrets, so there is no token to leak or rotate — the failure mode that motivated this
+# workflow instead of a `uv publish --token` step.
+#
+# One-time setup on PyPI (only the account owner can do it), before the first tag:
+#   https://pypi.org/manage/account/publishing/  →  add a pending publisher:
+#     PyPI Project Name: vaultrag
+#     Owner:             ansu555
+#     Repository name:   vaultrag
+#     Workflow name:     release.yml
+#     Environment:       (leave blank)
+# After the first successful publish the project exists and the pending publisher becomes
+# a normal trusted publisher automatically.
+#
+# To cut a release: bump `version` in pyproject.toml, commit, then
+#   git tag v0.1.0 && git push origin v0.1.0
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    name: build + publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for Trusted Publishing. This is the *only* privilege the job needs; it
+      # can mint an OIDC token but cannot read repo secrets or write to the repo.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # A tag is human-typed and the version is in a file; the two drift. Publishing
+      # v0.1.0 from a tree that says 0.1.1 burns the wrong version number on PyPI forever
+      # (uploads are immutable), so refuse the mismatch here rather than discover it live.
+      - name: Tag must match pyproject version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PROJ=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "tag=$TAG  pyproject=$PROJ"
+          test "$TAG" = "$PROJ"
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      # No `with: password:` — absence of a credential is what triggers OIDC. The action
+      # publishes everything in dist/, which is exactly what `uv build` produced above.
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
